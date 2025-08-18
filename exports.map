@@ -1,0 +1,6 @@
+{
+  global:
+    GemmA8W8;
+  local:
+    *;
+};

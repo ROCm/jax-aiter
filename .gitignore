@@ -1,0 +1,73 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+*.dll
+
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+.venv/
+pip-wheel-metadata/
+*.egg-info/
+*.egg
+dist/
+build/
+develop-eggs/
+.eggs/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+.coverage
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Logs and debug.
+*.log
+*.out
+*.err
+
+# IDE / editor configs.
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# JAX build artifacts.
+*.xla
+*.hlo
+*.o
+*.a
+
+# Ignore generated shared libraries (FFI builds)
+*.so
+
+# Project-specific ignores.
+build/
+third_party/
+
+# Python cache.
+__pycache__/
+*.pyo
+*.pyd
+*.pdb
+
+# hipify.
+hipify_output_dict_dump.txt
+
+# Misc.
+.DS_Store
+Thumbs.db
