@@ -11,4 +11,9 @@ echo "Hipifying ${PROJECT_DIR} into ${OUTPUT_DIR} ..."
 python3 "${HIPIFY_CLI}" \
   --project-directory "${PROJECT_DIR}" \
   --output-directory "${OUTPUT_DIR}"
+
+echo "Post-processing hipified files to fix remaining CUDA headers..."
+# (Ruturaj4): hipify isn't correctly converting some hip headers.
+# Fix cuda_bf16.h include that wasn't properly converted.
+find "${OUTPUT_DIR}" -name "*.hip" -exec sed -i 's/#include <cuda_bf16\.h>/#include <hip\/hip_bfloat16.h>/g' {} \;
 echo "Done hipifying."
