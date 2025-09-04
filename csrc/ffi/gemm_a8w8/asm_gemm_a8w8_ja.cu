@@ -15,20 +15,13 @@ namespace ffi = xla::ffi;
 
 namespace jax_aiter {
 
-ffi::Error
-GemmA8W8_Bridge(hipStream_t stream, 
-                ffi::AnyBuffer A,
-                ffi::AnyBuffer B, 
-                ffi::AnyBuffer A_scale,
-                ffi::AnyBuffer B_scale, 
-                ffi::Result<ffi::AnyBuffer> out,
-                ffi::AnyBuffer bias, 
-                int32_t sub_m = 128,
-                int32_t sub_n = 128, 
-                int32_t pad_a = 0, 
-                int32_t pad_b = 0,
-                int32_t pad_c = 0, 
-                int32_t splitK = 0) {
+ffi::Error GemmA8W8_Bridge(hipStream_t stream, ffi::AnyBuffer A,
+                           ffi::AnyBuffer B, ffi::AnyBuffer A_scale,
+                           ffi::AnyBuffer B_scale,
+                           ffi::Result<ffi::AnyBuffer> out, ffi::AnyBuffer bias,
+                           int32_t sub_m = 128, int32_t sub_n = 128,
+                           int32_t pad_a = 0, int32_t pad_b = 0,
+                           int32_t pad_c = 0, int32_t splitK = 0) {
   auto dims_A = A.dimensions();
   auto dims_out = out->dimensions();
   int64_t m = dims_A[0];
@@ -49,8 +42,8 @@ GemmA8W8_Bridge(hipStream_t stream,
   auto out_t = wrap_any_buffer(*out, dev_idx);
   auto bias_t = wrap_any_buffer(bias, dev_idx);
 
-  gemm_a8w8_asm(A_t, B_t, A_scale_t, B_scale_t, out_t, bias_t, 
-                sub_m, sub_n, pad_a, pad_b, pad_c, splitK);
+  gemm_a8w8_asm(A_t, B_t, A_scale_t, B_scale_t, out_t, bias_t, sub_m, sub_n,
+                pad_a, pad_b, pad_c, splitK);
 
   return ffi::Error::Success();
 }
@@ -60,15 +53,15 @@ GemmA8W8_Bridge(hipStream_t stream,
 #pragma GCC visibility push(default)
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    GemmA8W8, jax_aiter::GemmA8W8_Bridge,
+    GemmA8W8JA, jax_aiter::GemmA8W8_Bridge,
     ffi::Ffi::Bind()
         .Ctx<ffi::PlatformStream<hipStream_t>>()
-        .Arg<ffi::AnyBuffer>()   // A: [m, k] (S8)
-        .Arg<ffi::AnyBuffer>()   // B: [n, k] (S8)
-        .Arg<ffi::AnyBuffer>()   // A_scale: [m, 1] (F32)
-        .Arg<ffi::AnyBuffer>()   // B_scale: [1, n] (F32)
-        .Ret<ffi::AnyBuffer>()   // out: [m, n] (BF16)
-        .Arg<ffi::AnyBuffer>()   // bias: [1, n] (F32)
+        .Arg<ffi::AnyBuffer>() // A: [m, k] (S8)
+        .Arg<ffi::AnyBuffer>() // B: [n, k] (S8)
+        .Arg<ffi::AnyBuffer>() // A_scale: [m, 1] (F32)
+        .Arg<ffi::AnyBuffer>() // B_scale: [1, n] (F32)
+        .Ret<ffi::AnyBuffer>() // out: [m, n] (BF16)
+        .Arg<ffi::AnyBuffer>() // bias: [1, n] (F32)
         .Attr<int32_t>("sub_m")
         .Attr<int32_t>("sub_n")
         .Attr<int32_t>("pad_a")

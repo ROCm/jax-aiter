@@ -13,6 +13,9 @@ TORCH_LIBDIR  := $(TORCH_SITE)/lib
 AITER_SRC_DIR := third_party/aiter
 AITER_HIP_DIR := build/hipified_aiter
 AITER_INC     := $(AITER_HIP_DIR)/csrc/include
+CK_TILE_INC   := $(AITER_HIP_DIR)/3rdparty/composable_kernel/example/ck_tile/01_fmha
+CK_TILE_INC2  := $(AITER_HIP_DIR)/aiter/jit/build/ck/example/ck_tile/01_fmha
+CK_TILE_INC3  := $(AITER_HIP_DIR)/3rdparty/composable_kernel/include
 
 TRITON_INC    := $(shell $(PYTHON3) -c \
   'import triton; print(f"{triton.__path__[0]}/backends/nvidia/include")')
@@ -24,13 +27,13 @@ HIPIFIED_MARKER := build/.hipify_done
 
 JAX_AITER_INC := csrc/common
 
-
-CXXFLAGS := -std=c++17 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
+CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
             -I$(JAX_FFI_INC) -I$(PYTHON_INC) \
             -I$(TORCH_SITE) -I$(TORCH_INC) \
             -I$(TORCH_API_INC) -I$(TORCH_API_INC)/install/include \
             -I$(TORCH_SITE)/torch/csrc \
             -I$(TRITON_INC) -I$(AITER_INC) \
+            -I$(CK_TILE_INC) -I$(CK_TILE_INC2) -I$(CK_TILE_INC3) \
             -I$(JAX_AITER_INC) \
             --offload-arch=$(ROCM_ARCH) -v \
             -fvisibility-inlines-hidden \
@@ -75,22 +78,58 @@ OUT_SO := build/bin/libjax_aiter.so
 EXPORTS_MAP := build/exports.map
 
 # Input files
+#   csrc/ffi/gemm_a8w8/asm_gemm_a8w8.cu
 JAX_FFI_SRCS := \
-  csrc/ffi/gemm_a8w8/asm_gemm_a8w8.cu \
-  csrc/ffi/gemm_a8w8/custom_jax.cu
+  csrc/ffi/custom/custom.cu \
+  csrc/ffi/ck_fused_attn_fwd/ck_fused_attn_fwd.cu \
+  csrc/ffi/ck_fused_attn_bwd/ck_fused_attn_bwd.cu \
+  csrc/ffi/asm_mha_fwd/asm_mha_fwd.cu \
+  csrc/ffi/asm_mha_bwd/asm_mha_bwd.cu \
+  csrc/ffi/ck_mha_varlen_fwd/ck_mha_varlen_fwd.cu \
+  csrc/ffi/ck_mha_varlen_bwd/ck_mha_varlen_bwd.cu \
+  csrc/ffi/ck_mha_batch_prefill/ck_mha_batch_prefill.cu \
+  csrc/ffi/asm_mha_varlen_bwd/asm_mha_varlen_bwd.cu
 
 AITER_HIP_SRCS := \
-  build/hipified_aiter/csrc/py_itfs_cu/asm_gemm_a8w8_hip.cu \
-  build/hipified_aiter/csrc/py_itfs_cu/custom.hip \
-  build/hipified_aiter/csrc/kernels/custom_kernels.hip
+  $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_gemm_a8w8.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_cu/custom.hip \
+  $(AITER_HIP_DIR)/csrc/kernels/custom_kernels.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_fwd_kernels.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_bwd_kernels.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_varlen_fwd_kernels.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_varlen_bwd_kernels.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_batch_prefill_kernels.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_mha_varlen_bwd.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_mha_fwd.hip \
+  $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_mha_bwd.hip
 
-# Object files
-OBJS := \
+# JAX AITER Object files.
+JA_OBJS := \
+  build/obj/custom.o \
   build/obj/asm_gemm_a8w8.o \
-  build/obj/custom_jax.o \
-  build/obj/py_itfs_cu/asm_gemm_a8w8_hip.o \
-  build/obj/py_itfs_cu/custom.o \
-  build/obj/kernels/custom_kernels.o
+  build/obj/ck_fused_attn_fwd.o \
+  build/obj/ck_fused_attn_bwd.o \
+  build/obj/asm_mha_fwd.o \
+  build/obj/asm_mha_bwd.o \
+  build/obj/ck_mha_varlen_fwd.o \
+  build/obj/ck_mha_varlen_bwd.o \
+  build/obj/ck_mha_batch_prefill.o \
+  build/obj/asm_mha_varlen_bwd.o
+
+# AITER Link Object files.
+AITER_OBJS := \
+  build/obj/aiter_asm_gemm_a8w8.o \
+  build/obj/aiter_custom.o \
+  build/obj/custom_kernels.o \
+  build/obj/aiter_mha_fwd_kernels.o \
+  build/obj/aiter_mha_bwd_kernels.o \
+  build/obj/aiter_mha_varlen_fwd_kernels.o \
+  build/obj/aiter_mha_varlen_bwd_kernels.o \
+  build/obj/aiter_mha_batch_prefill_kernels.o \
+  build/obj/aiter_asm_mha_varlen_bwd.o \
+  build/obj/aiter_mha_common.o \
+  build/obj/aiter_asm_mha_fwd.o \
+  build/obj/aiter_asm_mha_bwd.o
 
 .PHONY: all lib hipify configure clean
 
@@ -119,26 +158,93 @@ build/obj/asm_gemm_a8w8.o: csrc/ffi/gemm_a8w8/asm_gemm_a8w8.cu \
     | build/obj/  $(HIPIFIED_MARKER)
 	$(HIPCC) $(CXXFLAGS) -c $< -o $@
 
-build/obj/custom_jax.o: csrc/ffi/gemm_a8w8/custom_jax.cu \
+build/obj/custom.o: csrc/ffi/custom/custom.cu \
     | build/obj/  $(HIPIFIED_MARKER)
 	$(HIPCC) $(CXXFLAGS) -c $< -o $@
 
-build/obj/py_itfs_cu/asm_gemm_a8w8_hip.o: \
-    $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_gemm_a8w8_hip.cu \
-    | build/obj/py_itfs_cu/ $(HIPIFIED_MARKER)
+build/obj/ck_fused_attn_fwd.o: csrc/ffi/ck_fused_attn_fwd/ck_fused_attn_fwd.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
 	$(HIPCC) $(CXXFLAGS) -c $< -o $@
 
-build/obj/py_itfs_cu/custom.o: \
-    $(AITER_HIP_DIR)/csrc/py_itfs_cu/custom.hip \
-    | build/obj/py_itfs_cu/ $(HIPIFIED_MARKER)
+build/obj/ck_fused_attn_bwd.o: csrc/ffi/ck_fused_attn_bwd/ck_fused_attn_bwd.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
 	$(HIPCC) $(CXXFLAGS) -c $< -o $@
 
-build/obj/kernels/custom_kernels.o: \
-    $(AITER_HIP_DIR)/csrc/kernels/custom_kernels.hip \
-    | build/obj/kernels/ $(HIPIFIED_MARKER)
+build/obj/asm_mha_fwd.o: csrc/ffi/asm_mha_fwd/asm_mha_fwd.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
 	$(HIPCC) $(CXXFLAGS) -c $< -o $@
 
-$(OUT_SO): $(OBJS) $(EXPORTS_MAP) | build/bin/
+build/obj/asm_mha_bwd.o: csrc/ffi/asm_mha_bwd/asm_mha_bwd.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/ck_mha_varlen_fwd.o: csrc/ffi/ck_mha_varlen_fwd/ck_mha_varlen_fwd.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/ck_mha_varlen_bwd.o: csrc/ffi/ck_mha_varlen_bwd/ck_mha_varlen_bwd.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/ck_mha_batch_prefill.o: csrc/ffi/ck_mha_batch_prefill/ck_mha_batch_prefill.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/asm_mha_varlen_bwd.o: csrc/ffi/asm_mha_varlen_bwd/asm_mha_varlen_bwd.cu \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+# AITER imports.
+
+build/obj/aiter_asm_gemm_a8w8.o: $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_gemm_a8w8.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_custom.o: $(AITER_HIP_DIR)/csrc/py_itfs_cu/custom.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/custom_kernels.o: $(AITER_HIP_DIR)/csrc/kernels/custom_kernels.hip \
+    | build/obj/kernels/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_mha_fwd_kernels.o: $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_fwd_kernels.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_mha_bwd_kernels.o: $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_bwd_kernels.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_mha_varlen_fwd_kernels.o: $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_varlen_fwd_kernels.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_mha_varlen_bwd_kernels.o: $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_varlen_bwd_kernels.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_mha_batch_prefill_kernels.o: $(AITER_HIP_DIR)/csrc/py_itfs_ck/mha_batch_prefill_kernels.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_asm_mha_varlen_bwd.o: $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_mha_varlen_bwd.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_mha_common.o: $(AITER_HIP_DIR)/csrc/kernels/mha_common.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_asm_mha_fwd.o: $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_mha_fwd.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+build/obj/aiter_asm_mha_bwd.o: $(AITER_HIP_DIR)/csrc/py_itfs_cu/asm_mha_bwd.hip \
+    | build/obj/  $(HIPIFIED_MARKER)
+	$(HIPCC) $(CXXFLAGS) -c $< -o $@
+
+$(OUT_SO): $(JA_OBJS) $(AITER_OBJS) $(EXPORTS_MAP) | build/bin/
 	$(HIPCC) -shared -fPIC $(CXXFLAGS) $(LDFLAGS) \
 	  -Wl,--version-script=$(EXPORTS_MAP) \
 	  $(filter-out $(EXPORTS_MAP),$^) -o $@

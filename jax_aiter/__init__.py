@@ -4,5 +4,6 @@
 
 from . import gemm_a8w8
 from . import wv_splitkq
+from . import mha
 
-__all__ = ["gemm_a8w8", "wv_splitkq"]
+__all__ = ["gemm_a8w8", "wv_splitkq", "mha"]

@@ -7,6 +7,14 @@
     WvSplitKQ;
     LLZZ;
     MMCustomGPU;
+    MhaFwd;
+    MhaBwd;
+    FmhaV3Fwd;
+    FmhaV3Bwd;
+    MhaVarlenFwd;
+    MhaVarlenBwd;
+    AsmMhaVarlenBwd;
+    MhaBatchPrefill;
   local:
     *;
 };

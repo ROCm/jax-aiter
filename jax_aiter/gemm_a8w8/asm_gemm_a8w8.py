@@ -18,12 +18,22 @@ from ..ffi.registry import get_lib_handle
 
 log = logging.getLogger("aiter.asm.a8w8")
 
-_LIB = get_lib_handle()
-jax.ffi.register_ffi_target(
-    "asm_gemm_a8w8_bridge",
-    jax.ffi.pycapsule(_LIB.GemmA8W8),
-    platform="ROCM",
-)
+_LIB = None
+_FFI_REGISTERED = False
+
+
+def _ensure_lib_loaded():
+    """Lazy load the library and register FFI target when first needed."""
+    global _LIB, _FFI_REGISTERED
+    if _LIB is None:
+        _LIB = get_lib_handle()
+    if not _FFI_REGISTERED:
+        jax.ffi.register_ffi_target(
+            "asm_gemm_a8w8_bridge",
+            jax.ffi.pycapsule(_LIB.GemmA8W8),
+            platform="ROCM",
+        )
+        _FFI_REGISTERED = True
 
 
 @lru_cache(maxsize=None)
@@ -63,6 +73,9 @@ def gemm_a8w8_ASM(
     dtype=dtypes.bf16,
     check: bool = False,
 ) -> jnp.ndarray | None:
+    # Ensure library is loaded before using
+    _ensure_lib_loaded()
+
     if check:
         assert dtype in [dtypes.bf16], f"{dtype=} not supported"
         assert (

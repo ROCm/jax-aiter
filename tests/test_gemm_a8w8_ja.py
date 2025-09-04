@@ -10,15 +10,15 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
 import pandas as pd
 import argparse
+import numpy as np
 
-# JAX imports
 import jax
 import jax.numpy as jnp
 from jax import dlpack as jax_dlpack
 from torch.utils import dlpack as torch_dlpack
 
-# JAX-side implementations
 import jax_aiter
+from jax_aiter.ja_compat import dtypes as jax_dtypes
 from jax_aiter.gemm_a8w8.asm_gemm_a8w8 import gemm_a8w8_ASM as jax_gemm_a8w8_ASM
 from jax_aiter.wv_splitkq.wv_splitkq import wv_splitkq_fp8 as jax_wv_splitkq_fp8
 
@@ -26,15 +26,15 @@ TEST_NUM_ITERS = 100
 
 
 def _to_jax(t: torch.Tensor) -> jnp.ndarray:
-    # Handle FP8 tensors that DLPack doesn't support
+    # Handle FP8 tensors that DLPack doesn't support.
     dtype_str = str(t.dtype)
     if "float8" in dtype_str or "fp8" in dtype_str:
-        # Convert to float32 first, then to JAX, then cast to the correct FP8 variant
+        # Convert to float32 first, then to JAX, then cast to the correct FP8 variant.
         t_f32 = t.to(torch.float32)
         jax_f32 = jax_dlpack.from_dlpack(t_f32)
         from jax_aiter.ja_compat import dtypes as jax_dtypes
 
-        # Use the specific FP8 dtype that matches the hardware
+        # Use the specific FP8 dtype that matches the hardware.
         return jax_f32.astype(jax_dtypes.get_dtype_fp8())
     return jax_dlpack.from_dlpack(t)
 
@@ -60,18 +60,14 @@ def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf1
 
 @perftest()
 def run_jax_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    # Convert to JAX
     XQ = _to_jax(x)
     WQ = _to_jax(weightshuffle)
     XS = _to_jax(x_scale)
     WS = _to_jax(w_scale)
     B = _to_jax(bias) if bias is not None else None
 
-    # Call JAX implementation
     yj = jax_gemm_a8w8_ASM(XQ, WQ, XS, WS, B, check=True)
-    yj.block_until_ready()
 
-    # Convert back to torch
     return _to_torch(yj)
 
 
@@ -88,17 +84,8 @@ def run_gemm_skinny(
 
 @perftest()
 def run_jax_gemm_skinny(
-    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, cu_count=1
+    XQ, WQ, XS, WS, dtype=dtypes.bf16, cu_count=1
 ):
-    # Convert to JAX
-    XQ = _to_jax(x)
-    WQ = _to_jax(weight)
-    XS = _to_jax(x_scale)
-    WS = _to_jax(w_scale)
-
-    # Convert PyTorch dtype to JAX dtype
-    from jax_aiter.ja_compat import dtypes as jax_dtypes
-
     if dtype == dtypes.bf16:
         jax_out_dtype = jax_dtypes.bf16
     elif dtype == dtypes.fp16:
@@ -106,19 +93,17 @@ def run_jax_gemm_skinny(
     else:
         jax_out_dtype = jax_dtypes.bf16
 
-    # AITER call: aiter.wvSplitKQ(weight[N,K], x[M,K], out[M,N], w_scale, x_scale, cu_count)
-    # Our JAX call should match this exactly: wv_splitkq_fp8(weight, x, w_scale, x_scale, ...)
     yj = jax_wv_splitkq_fp8(
-        WQ, XQ, WS, XS, cu_count=cu_count, dtype=jax_out_dtype, check=False
+        WQ,
+        XQ,
+        WS,
+        XS,
+        cu_count=cu_count,
+        dtype=jax_out_dtype,
     )
     yj.block_until_ready()
 
-    # Convert back to torch
-    out = _to_torch(yj)
-
-    if bias is not None:
-        out = out.to(bias) + bias
-    return out.to(dtype)
+    return yj
 
 
 @benchmark()
@@ -133,7 +118,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
 
-    # Only test operations we support
+    # Only test operations we support.
     avg_b = None
     err_b = None
     avg_c = None
@@ -146,19 +131,19 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     cu_num = device_properties.multi_processor_count
     print(f"CU count: {cu_num}")
 
-    # Test ASM GEMM if supported
+    # Test ASM GEMM if supported.
     if dtype == dtypes.bf16 and quantDtype == dtypes.i8 and bias is not None:
         weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
         bias_f32 = bias.to(dtypes.fp32)
 
-        # PyTorch ASM
+        # aiter ASM.
         d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)
         if d is not None:
             err_d = checkAllclose(a, d, msg="asm: ", rtol=1e-2, atol=1e-2)
         else:
             avg_d = None
 
-        # JAX ASM
+        # JAX ASM.
         try:
             d_jax, avg_d_jax = run_jax_gemm_asm(
                 x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype
@@ -193,20 +178,32 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     x, x_scale = aiter.per_tensor_quant(x, quant_dtype=quantDtype)
     weight, w_scale = aiter.per_tensor_quant(weight, quant_dtype=quantDtype)
     bias = None
-
+    
+    # Ground truth.
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
 
     if m <= 2:
-        # Test WvSplitKQ
+        # aiter WvSplitKQ.
         b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
 
-        # Test JAX WvSplitKQ
+        # Test JAX WvSplitKQ.
         try:
-            b_jax, avg_b_jax = run_jax_gemm_skinny(
-                x, weight, x_scale, w_scale, None, dtype, cu_count
+            # Pre-convert tensors to JAX (exclude from timing).
+            XQ = _to_jax(x)
+            WQ = _to_jax(weight)
+            XS = _to_jax(x_scale)
+            WS = _to_jax(w_scale)
+            yj_jax, avg_b_jax = run_jax_gemm_skinny(
+                XQ, WQ, XS, WS, dtype, np.int32(cu_count)
             )
+            b_jax = _to_torch(yj_jax)
+            if bias is not None:
+                b_jax = b_jax.to(bias) + bias
+            b_jax = b_jax.to(dtype)
 
-            msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, jax_skinny avg: {avg_b_jax:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+            msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, \
+                torch avg: {avg_a:<8.2f} us, aiter avg: {avg_b:<8.2f} us, \
+                ja avg: {avg_b_jax:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
             checkAllclose(a, b, msg="torch vs aiter: " + msg, rtol=1e-2, atol=0.01)
             checkAllclose(a, b_jax, msg="torch vs jax: " + msg, rtol=1e-2, atol=0.01)
             checkAllclose(b, b_jax, msg="aiter vs jax: " + msg, rtol=1e-2, atol=0.01)
@@ -217,15 +214,15 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
 
             traceback.print_exc()
     else:
-        # For larger m, we don't have CK support, so skip
+        # (Ruturaj4): For larger m, we don't have CK support, so skip.
         print(f"Skipping large batch size {m} (no CK support)")
 
 
-# Test cases from original AITER test
+# Test cases from original AITER test.
 l_dtype = ["bf16", "fp16"]
 l_quantDtype = ["i8", "fp8"]
 l_mnk_nm = [
-    # qkv_proj
+    # qkv_proj.
     (1, 1280, 8192),
     (32, 1280, 8192),
     (64, 1280, 8192),
@@ -239,7 +236,7 @@ l_mnk_nm = [
     (4096, 1280, 8192),
     (8192, 1280, 8192),
     (16384, 1280, 8192),
-    # attn_out
+    # attn_out.
     (1, 8192, 1024),
     (32, 8192, 1024),
     (64, 8192, 1024),
@@ -273,7 +270,7 @@ def test_skinny_gemm_a8w8_pertoken_quant():
     aligned_k = 16
     cu_count = torch.cuda.get_device_properties(device="cuda").multi_processor_count
 
-    # Test cases for WvSplitKQ (small batch sizes)
+    # Test cases for WvSplitKQ (small batch sizes).
     test_mnk_list = [
         [1, 4, 1264],
         [1, 12, 8720],
@@ -351,8 +348,8 @@ if __name__ == "__main__":
     if args.mnk is not None:
         l_mnk_nm = [args.mnk]
 
-    # Test normal GEMM (ASM with I8)
+    # Test normal GEMM (ASM with I8).
     # test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
 
-    # Test skinny GEMM (WvSplitKQ with FP8)
+    # Test skinny GEMM (WvSplitKQ with FP8).
     test_skinny_gemm_a8w8_pertoken_quant()

@@ -18,7 +18,7 @@ ROCM_PATH=${ROCM_PATH:-/opt/rocm}
 PYTHON=${PYTHON:-python3}
 JOBS=${JOBS:-$(nproc)}
 
-SRC_DIR="$(realpath "$(dirname "${BASH_SOURCE[0]}")/third_party/pytorch")"
+SRC_DIR="$(realpath "./third_party/pytorch")"
 BUILD_DIR="$SRC_DIR/build_static"
 INSTALL_DIR="$BUILD_DIR/install"
 
@@ -61,6 +61,11 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
   -DUSE_MEM_EFF_ATTENTION=OFF \
   -DUSE_LITE_PROTO=ON \
   -DONNX_ML=OFF \
+  -DUSE_FBGEMM=OFF \
+  -DUSE_PYTORCH_QNNPACK=OFF \
+  -DUSE_MKLDNN=OFF \
+  -DUSE_GLOG=OFF \
+  -DUSE_GFLAGS=OFF \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCMAKE_CXX_FLAGS="-Wno-stringop-overflow"
 

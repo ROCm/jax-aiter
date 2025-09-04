@@ -11,7 +11,10 @@
 #include "logging.h"
 #include "torch_utils.h"
 
-// Forward declarations for some of the unimplemented functions.
+// Include the proper aiter function declarations
+#include "custom.h"
+
+// Forward declarations for functions not in custom.h
 namespace aiter {
 void LLZZ(at::Tensor in_a, at::Tensor in_b, at::Tensor out_c,
           const int64_t solidx);
@@ -195,7 +198,7 @@ ffi::Error MMCustomGPU_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
 
 #pragma GCC visibility push(default)
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(LLMM1, jax_aiter::LLMM1_Bridge,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(LLMM1JA, jax_aiter::LLMM1_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
                                   .Arg<ffi::AnyBuffer>() // A: [M,K]
@@ -204,7 +207,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(LLMM1, jax_aiter::LLMM1_Bridge,
                                   .Attr<int32_t>("rows_per_block"),
                               {xla::ffi::Traits::kCmdBufferCompatible});
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitK, jax_aiter::WvSplitK_Bridge,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKJA, jax_aiter::WvSplitK_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
                                   .Arg<ffi::AnyBuffer>() // A: [M,K]
@@ -214,7 +217,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitK, jax_aiter::WvSplitK_Bridge,
                                   .Attr<int32_t>("CuCount"),
                               {xla::ffi::Traits::kCmdBufferCompatible});
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKSmall, jax_aiter::WvSplitKSmall_Bridge,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKSmallJA, jax_aiter::WvSplitKSmall_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
                                   .Arg<ffi::AnyBuffer>() // A: [M,K]
@@ -225,7 +228,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKSmall, jax_aiter::WvSplitKSmall_Bridge,
                               {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    WvSplitKQ, jax_aiter::WvSplitKQ_Bridge,
+    WvSplitKQJA, jax_aiter::WvSplitKQ_Bridge,
     ffi::Ffi::Bind()
         .Ctx<ffi::PlatformStream<hipStream_t>>()
         .Arg<ffi::AnyBuffer>() // A: [M,K] (FP8)
@@ -236,7 +239,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int32_t>("CuCount"),
     {xla::ffi::Traits::kCmdBufferCompatible});
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(LLZZ, jax_aiter::LLZZ_Bridge,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(LLZZJA, jax_aiter::LLZZ_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
                                   .Arg<ffi::AnyBuffer>() // A: [M,K] (F32)
@@ -245,7 +248,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(LLZZ, jax_aiter::LLZZ_Bridge,
                                   .Attr<int32_t>("solidx"),
                               {xla::ffi::Traits::kCmdBufferCompatible});
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(MMCustomGPU, jax_aiter::MMCustomGPU_Bridge,
+XLA_FFI_DEFINE_HANDLER_SYMBOL(MMCustomGPUJA, jax_aiter::MMCustomGPU_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
                                   .Arg<ffi::AnyBuffer>() // A: [M,K] (F32)
