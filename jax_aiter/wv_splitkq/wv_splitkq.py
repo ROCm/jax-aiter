@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 """FFI wrapper for WvSplitKQ_Bridge (fp8 x fp8 -> f16/bf16 with quantization)."""
 
 from __future__ import annotations
@@ -13,47 +13,21 @@ import jax
 import jax.numpy as jnp
 
 from ..ja_compat import dtypes
-from ..ffi.registry import get_lib_handle
+from ..ffi.registry import register_ffi_target
 
 log = logging.getLogger("aiter.wv_splitkq")
-
-_LIB = None
-_FFI_REGISTERED = False
-
-# Try to import the on-demand compilation system.
-try:
-    from ..jit.ja_core import (
-        ja_compile_ops,
-        ensure_ffi_target_registered,
-        create_jax_ffi_call,
-    )
-
-    _JIT_AVAILABLE = True
-    log.info("On-demand compilation system available")
-except ImportError as e:
-    _JIT_AVAILABLE = False
-    log.warning(f"On-demand compilation not available: {e}")
 
 
 def _ensure_lib_loaded():
     """Lazy load the library and register FFI target when first needed."""
-    global _LIB, _FFI_REGISTERED
-    if _LIB is None:
-        _LIB = get_lib_handle()
-    if not _FFI_REGISTERED:
-        jax.ffi.register_ffi_target(
-            "WvSplitKQ",
-            jax.ffi.pycapsule(_LIB.WvSplitKQ),
-            platform="ROCM",
-        )
-        _FFI_REGISTERED = True
+    register_ffi_target("WvSplitKQJA", "ROCM")
 
 
 @lru_cache(maxsize=None)
 def _cached_jitted_call(out_shape, out_dtype, cu_count):
     """Create ffi_call + JIT once per signature."""
     call = jax.ffi.ffi_call(
-        "WvSplitKQ",
+        "WvSplitKQJA",
         jax.ShapeDtypeStruct(out_shape, out_dtype),
         vmap_method="broadcast_all",
     )

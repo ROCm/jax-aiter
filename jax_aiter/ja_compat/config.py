@@ -7,12 +7,12 @@ def get_repo_root() -> Path:
     root = os.environ.get("JA_ROOT_DIR")
     if root:
         return Path(root).resolve()
-    return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parents[2]
 
 
 def get_configs_dir() -> Path:
     # matches aiter's "aiter/configs/" dir.
-    return get_repo_root() / "build" / "hipifiedaiter" / "configs"
+    return get_repo_root() / "build" / "hipified_aiter" / "aiter" / "configs"
 
 
 def get_shared_lib() -> Path:

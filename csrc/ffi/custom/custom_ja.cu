@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
 
@@ -11,10 +10,7 @@
 #include "logging.h"
 #include "torch_utils.h"
 
-// Include the proper aiter function declarations
-#include "custom.h"
-
-// Forward declarations for functions not in custom.h
+// Function declarations.
 namespace aiter {
 void LLZZ(at::Tensor in_a, at::Tensor in_b, at::Tensor out_c,
           const int64_t solidx);
@@ -29,7 +25,7 @@ ffi::Error LLMM1_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
                         ffi::AnyBuffer in_b, ffi::Result<ffi::AnyBuffer> out_c,
                         int32_t rows_per_block) {
 
-  // Validate input types match.
+  // Validate types.
   if (in_a.element_type() != in_b.element_type()) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                       "Input tensor types must match");
@@ -46,7 +42,7 @@ ffi::Error LLMM1_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
 
   const int dev_idx = ::jax_aiter::device_from_ptr(in_a.untyped_data());
 
-  // Create tensors using the new AnyBuffer utilities.
+  // Create tensors.
   auto A_t = wrap_any_buffer(in_a, dev_idx);
   auto B_t = wrap_any_buffer(in_b, dev_idx);
   auto out_t = wrap_any_buffer(*out_c, dev_idx);
@@ -59,8 +55,7 @@ ffi::Error WvSplitK_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
                            ffi::AnyBuffer in_b,
                            ffi::Result<ffi::AnyBuffer> out_c, int32_t N,
                            int32_t CuCount) {
-
-  // Validate input types match.
+  // Validate types.
   if (in_a.element_type() != in_b.element_type()) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                       "Input tensor types must match");
@@ -108,7 +103,7 @@ ffi::Error WvSplitKSmall_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
 
   const int dev_idx = ::jax_aiter::device_from_ptr(in_a.untyped_data());
 
-  // Create tensors using the new AnyBuffer utilities
+  // Create tensors.
   auto A_t = wrap_any_buffer(in_a, dev_idx);
   auto B_t = wrap_any_buffer(in_b, dev_idx);
   auto out_t = wrap_any_buffer(*out_c, dev_idx);
@@ -123,7 +118,6 @@ ffi::Error WvSplitKQ_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
                             ffi::Result<ffi::AnyBuffer> out_c,
                             ffi::AnyBuffer scale_a, ffi::AnyBuffer scale_b,
                             int32_t CuCount) {
-
   auto dims_a = in_a.dimensions();
   auto dims_c = out_c->dimensions();
   int64_t m = dims_a[0];
@@ -135,7 +129,7 @@ ffi::Error WvSplitKQ_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
 
   const int dev_idx = ::jax_aiter::device_from_ptr(in_a.untyped_data());
 
-  // Create tensors using the new AnyBuffer utilities
+  // Create tensors.
   auto A_t = wrap_any_buffer(in_a, dev_idx);
   auto B_t = wrap_any_buffer(in_b, dev_idx);
   auto out_t = wrap_any_buffer(*out_c, dev_idx);
@@ -162,7 +156,7 @@ ffi::Error LLZZ_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
 
   const int dev_idx = ::jax_aiter::device_from_ptr(in_a.untyped_data());
 
-  // Create tensors using the new AnyBuffer utilities
+  // Create tensors.
   auto A_t = wrap_any_buffer(in_a, dev_idx);
   auto B_t = wrap_any_buffer(in_b, dev_idx);
   auto out_t = wrap_any_buffer(*out_c, dev_idx);
@@ -185,7 +179,7 @@ ffi::Error MMCustomGPU_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
 
   const int dev_idx = ::jax_aiter::device_from_ptr(in_a.untyped_data());
 
-  // Create tensors using the new AnyBuffer utilities
+  // Create tensors.
   auto A_t = wrap_any_buffer(in_a, dev_idx);
   auto B_t = wrap_any_buffer(in_b, dev_idx);
   auto out_t = wrap_any_buffer(*out_c, dev_idx);
@@ -201,18 +195,18 @@ ffi::Error MMCustomGPU_Bridge(hipStream_t stream, ffi::AnyBuffer in_a,
 XLA_FFI_DEFINE_HANDLER_SYMBOL(LLMM1JA, jax_aiter::LLMM1_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
-                                  .Arg<ffi::AnyBuffer>() // A: [M,K]
-                                  .Arg<ffi::AnyBuffer>() // B: [N,K]
-                                  .Ret<ffi::AnyBuffer>() // out: [M,N]
+                                  .Arg<ffi::AnyBuffer>() // Input A
+                                  .Arg<ffi::AnyBuffer>() // Input B
+                                  .Ret<ffi::AnyBuffer>() // Output
                                   .Attr<int32_t>("rows_per_block"),
                               {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKJA, jax_aiter::WvSplitK_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
-                                  .Arg<ffi::AnyBuffer>() // A: [M,K]
-                                  .Arg<ffi::AnyBuffer>() // B: [K,N]
-                                  .Ret<ffi::AnyBuffer>() // out: [M,N]
+                                  .Arg<ffi::AnyBuffer>() // Input A
+                                  .Arg<ffi::AnyBuffer>() // Input B
+                                  .Ret<ffi::AnyBuffer>() // Output
                                   .Attr<int32_t>("N")
                                   .Attr<int32_t>("CuCount"),
                               {xla::ffi::Traits::kCmdBufferCompatible});
@@ -220,40 +214,39 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKJA, jax_aiter::WvSplitK_Bridge,
 XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKSmallJA, jax_aiter::WvSplitKSmall_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
-                                  .Arg<ffi::AnyBuffer>() // A: [M,K]
-                                  .Arg<ffi::AnyBuffer>() // B: [K,N]
-                                  .Ret<ffi::AnyBuffer>() // out: [M,N]
+                                  .Arg<ffi::AnyBuffer>() // Input A
+                                  .Arg<ffi::AnyBuffer>() // Input B
+                                  .Ret<ffi::AnyBuffer>() // Output
                                   .Attr<int32_t>("N")
                                   .Attr<int32_t>("CuCount"),
                               {xla::ffi::Traits::kCmdBufferCompatible});
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    WvSplitKQJA, jax_aiter::WvSplitKQ_Bridge,
-    ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<hipStream_t>>()
-        .Arg<ffi::AnyBuffer>() // A: [M,K] (FP8)
-        .Arg<ffi::AnyBuffer>() // B: [K,N] (FP8)
-        .Ret<ffi::AnyBuffer>() // out: [M,N] (F16/BF16)
-        .Arg<ffi::AnyBuffer>() // scale_a: [M,1] (F32)
-        .Arg<ffi::AnyBuffer>() // scale_b: [1,N] (F32)
-        .Attr<int32_t>("CuCount"),
-    {xla::ffi::Traits::kCmdBufferCompatible});
+XLA_FFI_DEFINE_HANDLER_SYMBOL(WvSplitKQJA, jax_aiter::WvSplitKQ_Bridge,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<hipStream_t>>()
+                                  .Arg<ffi::AnyBuffer>() // Input A
+                                  .Arg<ffi::AnyBuffer>() // Input B
+                                  .Ret<ffi::AnyBuffer>() // Output
+                                  .Arg<ffi::AnyBuffer>() // Scale A
+                                  .Arg<ffi::AnyBuffer>() // Scale B
+                                  .Attr<int32_t>("CuCount"),
+                              {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(LLZZJA, jax_aiter::LLZZ_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
-                                  .Arg<ffi::AnyBuffer>() // A: [M,K] (F32)
-                                  .Arg<ffi::AnyBuffer>() // B: [K,N] (F32)
-                                  .Ret<ffi::AnyBuffer>() // out: [M,N] (F32)
+                                  .Arg<ffi::AnyBuffer>() // Input A
+                                  .Arg<ffi::AnyBuffer>() // Input B
+                                  .Ret<ffi::AnyBuffer>() // Output
                                   .Attr<int32_t>("solidx"),
                               {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(MMCustomGPUJA, jax_aiter::MMCustomGPU_Bridge,
                               ffi::Ffi::Bind()
                                   .Ctx<ffi::PlatformStream<hipStream_t>>()
-                                  .Arg<ffi::AnyBuffer>() // A: [M,K] (F32)
-                                  .Arg<ffi::AnyBuffer>() // B: [K,N] (F32)
-                                  .Ret<ffi::AnyBuffer>() // out: [M,N] (F32)
+                                  .Arg<ffi::AnyBuffer>() // Input A
+                                  .Arg<ffi::AnyBuffer>() // Input B
+                                  .Ret<ffi::AnyBuffer>() // Output
 );
 
 #pragma GCC visibility pop
