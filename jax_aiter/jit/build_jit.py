@@ -62,7 +62,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
     core_module.get_user_jit_dir = get_user_jit_dir_ja
 
     # Ensure bd_dir is correct after patching get_user_jit_dir.
-    core_module.bd_dir = Path(jax_aiter_root) / "build" / "aiter_build"
+    core_module.bd_dir = Path(get_user_jit_dir_ja()) / "build"
     core_module.bd_dir.mkdir(parents=True, exist_ok=True)
     core_module.CK_DIR = f"{core_module.bd_dir}/ck"
     Path(core_module.CK_DIR).mkdir(parents=True, exist_ok=True)
@@ -358,7 +358,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
         def _run_ninja_build(
             build_directory: str, verbose: bool, error_prefix: str
         ) -> None:
-            command = ["ninja", "-v"]
+            command = ["ninja"]
             num_workers = cpp_extension._get_num_workers(verbose)
             if num_workers is not None:
                 command.extend(["-j", str(num_workers)])
@@ -435,6 +435,12 @@ def build_module(core_module, module_name, verbose=False):
                 logger.info(f"Extra HIP flags: {build_args['flags_extra_hip']}")
             if build_args["blob_gen_cmd"]:
                 logger.info(f"Blob gen cmd: {build_args['blob_gen_cmd']}")
+        # libmha_ modules aren't python.
+        is_python_module = (
+            False
+            if module_name in ("libmha_fwd", "libmha_bwd")
+            else build_args.get("is_python_module", True)
+        )
         core_module.build_module(
             build_args["md_name"],
             build_args["srcs"],
@@ -444,7 +450,7 @@ def build_module(core_module, module_name, verbose=False):
             build_args["extra_include"],
             build_args["extra_ldflags"],
             build_args["verbose"] or verbose,
-            build_args.get("is_python_module", True),
+            is_python_module,
             build_args.get("is_standalone", False),
             build_args.get("torch_exclude", False),
             build_args.get("hipify", True),
