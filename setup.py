@@ -13,7 +13,7 @@ setup(
     description="JAX FFI wrappers for AITER kernels",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/ROCm/jax-aiter.git"
+    url="https://github.com/ROCm/jax-aiter.git",
     license="MIT",
 
     packages=find_packages(include=["jax_aiter", "jax_aiter.*"]),
