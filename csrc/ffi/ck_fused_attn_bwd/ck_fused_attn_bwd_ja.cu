@@ -1,16 +1,21 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
 #include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "hip_utils.h"
 #include "logging.h"
 #include "torch_utils.h"
 
-// Forward declare the aiter torch interface
+// Forward declare the aiter torch interface.
+// Returns { dq, dk, dv, softmax_d }.
 namespace aiter {
 namespace torch_itfs {
 std::vector<at::Tensor>
@@ -39,89 +44,148 @@ namespace jax_aiter {
 
 ffi::Error MhaBwd_Bridge(
     hipStream_t stream,
-    ffi::AnyBuffer dout, // [batch, seqlen_q, nhead, hdim_v]
-    ffi::AnyBuffer q,    // [batch, seqlen_q, nhead, hdim_q]
-    ffi::AnyBuffer k,    // [batch, seqlen_kv, nhead, hdim_q]
-    ffi::AnyBuffer v,    // [batch, seqlen_kv, nhead, hdim_v]
-    ffi::AnyBuffer o,    // [batch, seqlen_q, nhead, hdim_v] (from forward pass)
-    ffi::AnyBuffer lse,  // [batch, nhead, seqlen_q]
-    ffi::Result<ffi::AnyBuffer> dq, // [batch, seqlen_q, nhead, hdim_q]
-    ffi::Result<ffi::AnyBuffer> dk, // [batch, seqlen_kv, nhead, hdim_q]
-    ffi::Result<ffi::AnyBuffer> dv, // [batch, seqlen_kv, nhead, hdim_v]
-    int64_t batch, int64_t nhead, int64_t seqlen_q, int64_t seqlen_kv,
-    int64_t hdim_q, int64_t hdim_v, float scale, float dropout_prob) {
-  JA_LOG("MHA_BWD batch=%ld nhead=%ld seqlen_q=%ld seqlen_kv=%ld hdim_q=%ld "
-         "hdim_v=%ld scale=%f dropout=%f",
-         batch, nhead, seqlen_q, seqlen_kv, hdim_q, hdim_v, scale,
-         dropout_prob);
-
-  // Get device index for tensor creation
+    ffi::AnyBuffer dout,                         // [b, sq, hq, d_v]
+    ffi::AnyBuffer q,                            // [b, sq, hq, d]
+    ffi::AnyBuffer k,                            // [b, sk, hk, d]
+    ffi::AnyBuffer v,                            // [b, sk, hk, d_v]
+    ffi::AnyBuffer out,                          // [b, sq, hq, d_v]
+    ffi::AnyBuffer softmax_lse,                  // [b, hq, sq]
+    std::optional<ffi::AnyBuffer> dq_,           // [b, sq, hq, d]
+    std::optional<ffi::AnyBuffer> dk_,           // [b, sk, hk, d]
+    std::optional<ffi::AnyBuffer> dv_,           // [b, sk, hk, d]
+    std::optional<ffi::AnyBuffer> dbias_,        // [sq, sk]
+    std::optional<ffi::AnyBuffer> bias_,         // [sq, sk]
+    std::optional<ffi::AnyBuffer> alibi_slopes_, // [hq] or [b, hq]
+    std::optional<ffi::AnyBuffer> rng_state_,
+    std::optional<ffi::AnyBuffer> gen_, ffi::Result<ffi::AnyBuffer> dq_ret,
+    ffi::Result<ffi::AnyBuffer> dk_ret, ffi::Result<ffi::AnyBuffer> dv_ret,
+    ffi::Result<ffi::AnyBuffer> softmax_d_ret, double dropout_p,
+    double softmax_scale, bool is_causal, int window_size_left,
+    int window_size_right, bool deterministic) {
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
 
-  // Create tensor views from the JAX buffers using torch_utils helpers
-  // Layout: [batch, seqlen, nhead, hdim]
-  auto dout_tensor = ::jax_aiter::wrap_any_buffer(
-      dout, {batch, seqlen_q, nhead, hdim_v}, dev_idx);
+  auto dout_tensor = ::jax_aiter::wrap_any_buffer(dout, dev_idx);
+  auto q_tensor = ::jax_aiter::wrap_any_buffer(q, dev_idx);
+  auto k_tensor = ::jax_aiter::wrap_any_buffer(k, dev_idx);
+  auto v_tensor = ::jax_aiter::wrap_any_buffer(v, dev_idx);
+  auto out_tensor = ::jax_aiter::wrap_any_buffer(out, dev_idx);
+  auto softmax_lse_tensor = ::jax_aiter::wrap_any_buffer(softmax_lse, dev_idx);
 
-  auto q_tensor = ::jax_aiter::wrap_any_buffer(
-      q, {batch, seqlen_q, nhead, hdim_q}, dev_idx);
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
+      device_of(q_tensor));
 
-  auto k_tensor = ::jax_aiter::wrap_any_buffer(
-      k, {batch, seqlen_kv, nhead, hdim_q}, dev_idx);
+  const c10::hip::HIPStreamMasqueradingAsCUDA ext_stream =
+      c10::hip::getStreamFromExternalMasqueradingAsCUDA(stream, dev_idx);
+  const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
 
-  auto v_tensor = ::jax_aiter::wrap_any_buffer(
-      v, {batch, seqlen_kv, nhead, hdim_v}, dev_idx);
+  // Handle optional parameters (check for None by buffer size).
+  std::optional<at::Tensor> dq_tensor = std::nullopt;
+  if (dq_.has_value() && dq_->size_bytes() > 0) {
+    dq_tensor = ::jax_aiter::wrap_any_buffer(*dq_, dev_idx);
+  }
 
-  auto o_tensor = ::jax_aiter::wrap_any_buffer(
-      o, {batch, seqlen_q, nhead, hdim_v}, dev_idx);
+  std::optional<at::Tensor> dk_tensor = std::nullopt;
+  if (dk_.has_value() && dk_->size_bytes() > 0) {
+    dk_tensor = ::jax_aiter::wrap_any_buffer(*dk_, dev_idx);
+  }
 
-  // LSE tensor: [batch, nhead, seqlen_q]
-  auto lse_tensor =
-      ::jax_aiter::wrap_any_buffer(lse, {batch, nhead, seqlen_q}, dev_idx);
+  std::optional<at::Tensor> dv_tensor = std::nullopt;
+  if (dv_.has_value() && dv_->size_bytes() > 0) {
+    dv_tensor = ::jax_aiter::wrap_any_buffer(*dv_, dev_idx);
+  }
 
-  // Output tensors
-  auto dq_tensor = ::jax_aiter::wrap_any_buffer(
-      *dq, {batch, seqlen_q, nhead, hdim_q}, dev_idx);
+  std::optional<at::Tensor> dbias_tensor = std::nullopt;
+  if (dbias_.has_value() && dbias_->size_bytes() > 0) {
+    dbias_tensor = ::jax_aiter::wrap_any_buffer(*dbias_, dev_idx);
+  }
 
-  auto dk_tensor = ::jax_aiter::wrap_any_buffer(
-      *dk, {batch, seqlen_kv, nhead, hdim_q}, dev_idx);
+  std::optional<const at::Tensor> bias_opt =
+      (bias_.has_value() && bias_->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*bias_, dev_idx))
+          : std::nullopt;
 
-  auto dv_tensor = ::jax_aiter::wrap_any_buffer(
-      *dv, {batch, seqlen_kv, nhead, hdim_v}, dev_idx);
+  std::optional<const at::Tensor> alibi_slopes_opt =
+      (alibi_slopes_.has_value() && alibi_slopes_->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*alibi_slopes_, dev_idx))
+          : std::nullopt;
+
+  std::optional<const at::Tensor> rng_state_opt =
+      (rng_state_.has_value() && rng_state_->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*rng_state_, dev_idx))
+          : std::nullopt;
+
+  std::optional<at::Generator> gen_opt = std::nullopt;
+  if (gen_.has_value() &&
+      gen_->size_bytes() >= static_cast<size_t>(2 * sizeof(int64_t))) {
+    // Extract seed and offset from JAX buffer.
+    const auto *gen_data = static_cast<const int64_t *>(gen_->untyped_data());
+    const uint64_t seed = static_cast<uint64_t>(gen_data[0]);
+    const uint64_t offset = static_cast<uint64_t>(gen_data[1]);
+
+    // Create PyTorch generator with the provided seed.
+    auto gen = at::make_generator<at::CUDAGeneratorImpl>(dev_idx);
+    auto *impl = gen.get<at::CUDAGeneratorImpl>();
+    impl->set_current_seed(seed);
+    impl->set_offset(offset);
+    gen_opt = gen;
+    JA_LOG("[ck_mha_bwd] Using generator with seed: %llu, offset: %llu", seed,
+           offset);
+  }
 
   try {
-    // Call the aiter PyTorch kernel
+    // PyTorch function writes directly to the provided output buffers
+    // and returns { dq, dk, dv, softmax_d }.
     auto results =
-        aiter::torch_itfs::mha_bwd(dout_tensor,  // dout: [b, sq, hq, d_v]
-                                   q_tensor,     // q: [b, sq, hq, d]
-                                   k_tensor,     // k: [b, sk, hk, d]
-                                   v_tensor,     // v: [b, sk, hk, d_v]
-                                   o_tensor,     // out: [b, sq, hq, d_v]
-                                   lse_tensor,   // softmax_lse: [b, hq, sq]
-                                   dropout_prob, // p_dropout
-                                   scale,        // softmax_scale
-                                   false,        // is_causal
-                                   -1,    // window_size_left (-1 = infinite)
-                                   -1,    // window_size_right (-1 = infinite)
-                                   false, // deterministic
-                                   std::make_optional(dq_tensor), // dq_
-                                   std::make_optional(dk_tensor), // dk_
-                                   std::make_optional(dv_tensor), // dv_
-                                   std::nullopt,                  // dbias_
-                                   std::nullopt,                  // bias_
-                                   std::nullopt, // alibi_slopes_
-                                   std::nullopt, // rng_state_
-                                   std::nullopt  // gen_
+        aiter::torch_itfs::mha_bwd(dout_tensor,        // dout
+                                   q_tensor,           // q
+                                   k_tensor,           // k
+                                   v_tensor,           // v
+                                   out_tensor,         // out
+                                   softmax_lse_tensor, // softmax_lse
+                                   dropout_p,          // dropout_p
+                                   softmax_scale,      // softmax_scale
+                                   is_causal,          // is_causal
+                                   window_size_left,   // window_size_left
+                                   window_size_right,  // window_size_right
+                                   deterministic,      // deterministic
+                                   dq_tensor,          // dq_
+                                   dk_tensor,          // dk_
+                                   dv_tensor,          // dv_
+                                   dbias_tensor,       // dbias_
+                                   bias_opt,           // bias_
+                                   alibi_slopes_opt,   // alibi_slopes_
+                                   rng_state_opt,      // rng_state_
+                                   gen_opt             // gen_
         );
+    // Copy results back to JAX output buffers
+    // results = { dq, dk, dv, softmax_d }.
+    if (results.size() >= 4) {
+      // Wrap JAX output buffers as PyTorch tensors for copying.
+      auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq_ret, dev_idx);
 
-    // The function should populate dq_tensor, dk_tensor, dv_tensor in-place
-    // results[0] = dq, results[1] = dk, results[2] = dv, results[3] = softmax_d
+      // Copy tensor results.
+      dq_tensor.copy_(results[0], /*non_blocking=*/true);
 
-    JA_LOG("MHA_BWD completed successfully");
+      if (results[1].numel() > 0) {
+        auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk_ret, dev_idx);
+        dk_tensor.copy_(results[1], /*non_blocking=*/true);
+      }
+      if (results[2].numel() > 0) {
+        auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv_ret, dev_idx);
+        dv_tensor.copy_(results[2], /*non_blocking=*/true);
+      }
+      if (results[3].numel() > 0) {
+        auto softmax_d_tensor =
+            ::jax_aiter::wrap_any_buffer(*softmax_d_ret, dev_idx);
+        softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
+      }
+    }
 
     return ffi::Error::Success();
   } catch (const std::exception &e) {
-    JA_LOG("MHA_BWD failed: %s", e.what());
     return ffi::Error(ffi::ErrorCode::kInternal, e.what());
   }
 }
@@ -130,27 +194,33 @@ ffi::Error MhaBwd_Bridge(
 
 #pragma GCC visibility push(default)
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    MhaBwdJA, jax_aiter::MhaBwd_Bridge,
-    ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<hipStream_t>>()
-        .Arg<ffi::AnyBuffer>() // dout: [batch, seqlen_q, nhead, hdim_v]
-        .Arg<ffi::AnyBuffer>() // q: [batch, seqlen_q, nhead, hdim_q]
-        .Arg<ffi::AnyBuffer>() // k: [batch, seqlen_kv, nhead, hdim_q]
-        .Arg<ffi::AnyBuffer>() // v: [batch, seqlen_kv, nhead, hdim_v]
-        .Arg<ffi::AnyBuffer>() // o: [batch, seqlen_q, nhead, hdim_v]
-        .Arg<ffi::AnyBuffer>() // lse: [batch, nhead, seqlen_q]
-        .Ret<ffi::AnyBuffer>() // dq: [batch, seqlen_q, nhead, hdim_q]
-        .Ret<ffi::AnyBuffer>() // dk: [batch, seqlen_kv, nhead, hdim_q]
-        .Ret<ffi::AnyBuffer>() // dv: [batch, seqlen_kv, nhead, hdim_v]
-        .Attr<int64_t>("batch")
-        .Attr<int64_t>("nhead")
-        .Attr<int64_t>("seqlen_q")
-        .Attr<int64_t>("seqlen_kv")
-        .Attr<int64_t>("hdim_q")
-        .Attr<int64_t>("hdim_v")
-        .Attr<float>("scale")
-        .Attr<float>("dropout_prob"),
-    {xla::ffi::Traits::kCmdBufferCompatible});
+XLA_FFI_DEFINE_HANDLER_SYMBOL(MhaBwdJA, jax_aiter::MhaBwd_Bridge,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<hipStream_t>>()
+                                  .Arg<ffi::AnyBuffer>() // dout
+                                  .Arg<ffi::AnyBuffer>() // q
+                                  .Arg<ffi::AnyBuffer>() // k
+                                  .Arg<ffi::AnyBuffer>() // v
+                                  .Arg<ffi::AnyBuffer>() // out
+                                  .Arg<ffi::AnyBuffer>() // softmax_lse
+                                  .Arg<ffi::AnyBuffer>() // dq_
+                                  .Arg<ffi::AnyBuffer>() // dk_
+                                  .Arg<ffi::AnyBuffer>() // dv_
+                                  .Arg<ffi::AnyBuffer>() // dbias_
+                                  .Arg<ffi::AnyBuffer>() // bias_
+                                  .Arg<ffi::AnyBuffer>() // alibi_slopes_
+                                  .Arg<ffi::AnyBuffer>() // rng_state_
+                                  .Arg<ffi::AnyBuffer>() // gen_
+                                  .Ret<ffi::AnyBuffer>() // dq_ret
+                                  .Ret<ffi::AnyBuffer>() // dk_ret
+                                  .Ret<ffi::AnyBuffer>() // dv_ret
+                                  .Ret<ffi::AnyBuffer>() // softmax_d_ret
+                                  .Attr<double>("dropout_p")
+                                  .Attr<double>("softmax_scale")
+                                  .Attr<bool>("is_causal")
+                                  .Attr<int>("window_size_left")
+                                  .Attr<int>("window_size_right")
+                                  .Attr<bool>("deterministic"),
+                              {xla::ffi::Traits::kCmdBufferCompatible});
 
 #pragma GCC visibility pop
