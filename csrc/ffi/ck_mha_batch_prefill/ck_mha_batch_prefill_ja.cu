@@ -1,16 +1,21 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
 #include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "hip_utils.h"
 #include "logging.h"
 #include "torch_utils.h"
 
-// Forward declare the exact aiter torch interface
+// Forward declare the exact aiter torch interface.
+// returns {out, softmax_lse, p, rng_state};
 namespace aiter {
 namespace torch_itfs {
 std::vector<at::Tensor> mha_batch_prefill(
@@ -46,24 +51,19 @@ ffi::Error MhaBatchPrefill_Bridge(
     ffi::Result<ffi::AnyBuffer> softmax_lse, // [hq, total_q]
     ffi::Result<ffi::AnyBuffer> p, // [hq, total_q, max_seqlen_k] (dropout mask)
     ffi::Result<ffi::AnyBuffer> rng_state, // [2]
-    int64_t max_seqlen_q, int64_t max_seqlen_k, float p_dropout,
-    float softmax_scale, float logits_soft_cap, bool zero_tensors,
-    bool is_causal, int64_t window_size_left, int64_t window_size_right,
-    bool return_softmax_lse, bool return_dropout_randval,
-    ffi::AnyBuffer out_provided, // [total_q, hq, d] (optional)
-    ffi::AnyBuffer bias,         // [total_q, max_seqlen_k] (optional)
-    ffi::AnyBuffer alibi_slopes, // [hq] or [b, hq] (optional)
-    ffi::AnyBuffer gen           // generator (optional)
+    int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale,
+    float logits_soft_cap, bool zero_tensors, bool is_causal,
+    int window_size_left, int window_size_right, bool return_softmax_lse,
+    bool return_dropout_randval,
+    std::optional<ffi::AnyBuffer> out_provided, // [total_q, hq, d] (optional)
+    std::optional<ffi::AnyBuffer> bias, // [total_q, max_seqlen_k] (optional)
+    std::optional<ffi::AnyBuffer> alibi_slopes, // [hq] or [b, hq] (optional)
+    std::optional<ffi::AnyBuffer> gen           // generator (optional)
 ) {
-  JA_LOG("MHA_BATCH_PREFILL max_seqlen_q=%ld max_seqlen_k=%ld dropout=%f "
-         "scale=%f causal=%d window=(%ld,%ld)",
-         max_seqlen_q, max_seqlen_k, p_dropout, softmax_scale, is_causal,
-         window_size_left, window_size_right);
-
   // Get device index for tensor creation
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
 
-  // Create tensor views from the JAX buffers
+  // Create tensor views from the JAX buffers.
   auto q_tensor = ::jax_aiter::wrap_any_buffer(q, dev_idx);
   auto k_tensor = ::jax_aiter::wrap_any_buffer(k, dev_idx);
   auto v_tensor = ::jax_aiter::wrap_any_buffer(v, dev_idx);
@@ -73,76 +73,110 @@ ffi::Error MhaBatchPrefill_Bridge(
   auto kv_page_indices_tensor =
       ::jax_aiter::wrap_any_buffer(kv_page_indices, dev_idx);
 
-  // Create output tensor views for copying results back
-  auto out_tensor = ::jax_aiter::wrap_any_buffer(*out, dev_idx);
-  auto lse_tensor = ::jax_aiter::wrap_any_buffer(*softmax_lse, dev_idx);
-  auto p_tensor = ::jax_aiter::wrap_any_buffer(*p, dev_idx);
-  auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
+      device_of(q_tensor));
 
-  // Handle optional parameters (check for None by buffer size)
-  std::optional<at::Tensor> out_provided_opt = std::nullopt;
-  if (out_provided.size_bytes() > 0) {
-    out_provided_opt =
-        std::make_optional(::jax_aiter::wrap_any_buffer(out_provided, dev_idx));
-  }
+  const c10::hip::HIPStreamMasqueradingAsCUDA ext_stream =
+      c10::hip::getStreamFromExternalMasqueradingAsCUDA(stream, dev_idx);
+  const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
 
-  std::optional<const at::Tensor> bias_opt =
-      bias.size_bytes() > 0 ? std::make_optional<const at::Tensor>(
-                                  ::jax_aiter::wrap_any_buffer(bias, dev_idx))
-                            : std::nullopt;
-
-  std::optional<const at::Tensor> alibi_slopes_opt =
-      alibi_slopes.size_bytes() > 0
-          ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(alibi_slopes, dev_idx))
+  // Handle optional parameters (check for None by buffer size).
+  std::optional<at::Tensor> out_provided_opt =
+      (out_provided.has_value() && out_provided->size_bytes() > 0)
+          ? std::make_optional(
+                ::jax_aiter::wrap_any_buffer(*out_provided, dev_idx))
           : std::nullopt;
 
-  // Generator is always None for now
+  std::optional<const at::Tensor> bias_opt =
+      (bias.has_value() && bias->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*bias, dev_idx))
+          : std::nullopt;
+
+  std::optional<const at::Tensor> alibi_slopes_opt =
+      (alibi_slopes.has_value() && alibi_slopes->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*alibi_slopes, dev_idx))
+          : std::nullopt;
+
   std::optional<at::Generator> gen_opt = std::nullopt;
+  // Handle generator parameter - extract from JAX buffer if provided.
+  if (gen.has_value() &&
+      gen->size_bytes() >= static_cast<size_t>(2 * sizeof(int64_t))) {
+    // Extract seed and offset from JAX buffer.
+    const auto *gen_data = static_cast<const int64_t *>(gen->untyped_data());
+    const uint64_t seed = static_cast<uint64_t>(gen_data[0]);
+    const uint64_t offset = static_cast<uint64_t>(gen_data[1]);
+
+    // Create PyTorch generator with the provided seed.
+    auto gen_torch = at::make_generator<at::CUDAGeneratorImpl>(dev_idx);
+    auto *impl = gen_torch.get<at::CUDAGeneratorImpl>();
+    impl->set_current_seed(seed);
+    impl->set_offset(offset);
+    gen_opt = gen_torch;
+    JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
+  }
 
   try {
     // Call the aiter MHA batch prefill PyTorch kernel with exact signature
     // match
     auto results = aiter::torch_itfs::mha_batch_prefill(
-        q_tensor,                            // q: [total_q, hq, d]
-        k_tensor,                            // k: [total_k, hk, d]
-        v_tensor,                            // v: [total_k, hk, d]
-        cu_seqlens_q_tensor,                 // cu_seqlens_q: [b+1]
-        kv_indptr_tensor,                    // kv_indptr: [b+1]
-        kv_page_indices_tensor,              // kv_page_indices
-        static_cast<int>(max_seqlen_q),      // max_seqlen_q
-        static_cast<int>(max_seqlen_k),      // max_seqlen_k
-        p_dropout,                           // p_dropout
-        softmax_scale,                       // softmax_scale
-        logits_soft_cap,                     // logits_soft_cap
-        zero_tensors,                        // zero_tensors
-        is_causal,                           // is_causal
-        static_cast<int>(window_size_left),  // window_size_left
-        static_cast<int>(window_size_right), // window_size_right
-        return_softmax_lse,                  // return_softmax_lse
-        return_dropout_randval,              // return_dropout_randval
-        out_provided_opt, // out_ (optional pre-allocated output)
-        bias_opt,         // bias_ (optional)
-        alibi_slopes_opt, // alibi_slopes_ (optional)
-        gen_opt           // gen_ (optional generator)
+        q_tensor,               // q: [total_q, hq, d]
+        k_tensor,               // k: [total_k, hk, d]
+        v_tensor,               // v: [total_k, hk, d]
+        cu_seqlens_q_tensor,    // cu_seqlens_q: [b+1]
+        kv_indptr_tensor,       // kv_indptr: [b+1]
+        kv_page_indices_tensor, // kv_page_indices
+        max_seqlen_q,           // max_seqlen_q
+        max_seqlen_k,           // max_seqlen_k
+        p_dropout,              // p_dropout
+        softmax_scale,          // softmax_scale
+        logits_soft_cap,        // logits_soft_cap
+        zero_tensors,           // zero_tensors
+        is_causal,              // is_causal
+        window_size_left,       // window_size_left
+        window_size_right,      // window_size_right
+        return_softmax_lse,     // return_softmax_lse
+        return_dropout_randval, // return_dropout_randval
+        out_provided_opt,       // out_ (optional pre-allocated output)
+        bias_opt,               // bias_ (optional)
+        alibi_slopes_opt,       // alibi_slopes_ (optional)
+        gen_opt                 // gen_ (optional generator)
     );
 
     // Copy results back to JAX output buffers
-    // results = {out, softmax_lse, p, rng_state}
+    // results = {out, softmax_lse, p, rng_state}.
     if (results.size() >= 4) {
-      out_tensor.copy_(results[0]); // output
-      lse_tensor.copy_(results[1]); // softmax_lse
-      if (return_dropout_randval && results[2].numel() > 0) {
-        p_tensor.copy_(results[2]); // dropout mask
-      }
-      rng_tensor.copy_(results[3]); // rng_state
-    }
+      // Create output tensor views for copying results back.
+      auto out_tensor = ::jax_aiter::wrap_any_buffer(*out, dev_idx);
 
-    JA_LOG("MHA_BATCH_PREFILL completed successfully");
+      // Always copy main output.
+      out_tensor.copy_(results[0], /*non_blocking=*/true);
+
+      // Only copy LSE if requested (and if result has valid data).
+      if (return_softmax_lse && results[1].numel() > 0) {
+        auto lse_tensor = ::jax_aiter::wrap_any_buffer(*softmax_lse, dev_idx);
+        lse_tensor.copy_(results[1], /*non_blocking=*/true);
+      }
+
+      // Only copy dropout mask if requested and valid.
+      if (return_dropout_randval && results[2].numel() > 0) {
+        auto p_tensor = ::jax_aiter::wrap_any_buffer(*p, dev_idx);
+        p_tensor.copy_(results[2], /*non_blocking=*/true);
+      }
+
+      // Copy RNG state if valid.
+      if (results[3].numel() > 0) {
+        auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
+        rng_tensor.copy_(results[3], /*non_blocking=*/true);
+      }
+    } else {
+      JA_LOG("MHA_FWD warning: expected at least 4 results, got %zu",
+             results.size());
+    }
 
     return ffi::Error::Success();
   } catch (const std::exception &e) {
-    JA_LOG("MHA_BATCH_PREFILL failed: %s", e.what());
     return ffi::Error(ffi::ErrorCode::kInternal, e.what());
   }
 }
@@ -165,15 +199,15 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>() // softmax_lse: [hq, total_q]
         .Ret<ffi::AnyBuffer>() // p: [hq, total_q, max_seqlen_k] (dropout mask)
         .Ret<ffi::AnyBuffer>() // rng_state: [2]
-        .Attr<int64_t>("max_seqlen_q")
-        .Attr<int64_t>("max_seqlen_k")
+        .Attr<int>("max_seqlen_q")
+        .Attr<int>("max_seqlen_k")
         .Attr<float>("p_dropout")
         .Attr<float>("softmax_scale")
         .Attr<float>("logits_soft_cap")
         .Attr<bool>("zero_tensors")
         .Attr<bool>("is_causal")
-        .Attr<int64_t>("window_size_left")
-        .Attr<int64_t>("window_size_right")
+        .Attr<int>("window_size_left")
+        .Attr<int>("window_size_right")
         .Attr<bool>("return_softmax_lse")
         .Attr<bool>("return_dropout_randval")
         .Arg<ffi::AnyBuffer>()  // out_provided: [total_q, hq, d] (optional)

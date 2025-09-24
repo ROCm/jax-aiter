@@ -7,9 +7,11 @@
 
 namespace jax_aiter {
 
+// #define JAX_AITER_DEBUG 1
+
 #ifdef JAX_AITER_DEBUG
 #define JA_LOG(fmt, ...)                                                       \
-  std::fprintf(stderr, "[JAX_AITER] " fmt "\n", ##__VA_ARGS__)
+  std::fprintf(stderr, "[JAX_AITER_CPP] " fmt "\n", ##__VA_ARGS__)
 #else
 #define JA_LOG(fmt, ...)                                                       \
   do {                                                                         \
@@ -21,7 +23,7 @@ namespace jax_aiter {
 #define JA_CHECK(cond, msg)                                                    \
   do {                                                                         \
     if (!(cond)) {                                                             \
-      std::fprintf(stderr, "[JAX_AITER][FATAL] %s:%d: %s\n", __FILE__,         \
+      std::fprintf(stderr, "[JAX_AITER_CPP][FATAL] %s:%d: %s\n", __FILE__,         \
                    __LINE__, msg);                                             \
       std::abort();                                                            \
     }                                                                          \

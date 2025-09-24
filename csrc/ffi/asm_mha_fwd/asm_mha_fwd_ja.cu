@@ -4,6 +4,8 @@
 #include "xla/ffi/api/ffi.h"
 
 #include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "hip_utils.h"
@@ -52,6 +54,13 @@ ffi::Error FmhaV3Fwd_Bridge(
   auto k_tensor = ::jax_aiter::wrap_any_buffer(k, dev_idx);
   auto v_tensor = ::jax_aiter::wrap_any_buffer(v, dev_idx);
 
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
+      device_of(q_tensor));
+
+  const c10::hip::HIPStreamMasqueradingAsCUDA ext_stream =
+      c10::hip::getStreamFromExternalMasqueradingAsCUDA(stream, dev_idx);
+  const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
+
   // Handle optional parameters by checking buffer size.
   std::optional<at::Tensor> out_provided_opt = std::nullopt;
   if (out_.has_value() && out_->size_bytes() > 0) {
@@ -72,6 +81,22 @@ ffi::Error FmhaV3Fwd_Bridge(
           : std::nullopt;
 
   std::optional<at::Generator> gen_opt = std::nullopt;
+  // Handle generator parameter - extract from JAX buffer if provided.
+  if (gen_.has_value() &&
+      gen_->size_bytes() >= static_cast<size_t>(2 * sizeof(int64_t))) {
+    // Expecting exactly 2 int64 values: [seed, offset].
+    const auto *gen_data = static_cast<const int64_t *>(gen_->untyped_data());
+    const uint64_t seed = static_cast<uint64_t>(gen_data[0]);
+    const uint64_t offset = static_cast<uint64_t>(gen_data[1]);
+
+    // Create PyTorch generator with the provided seed.
+    auto gen = at::make_generator<at::CUDAGeneratorImpl>(dev_idx);
+    auto *impl = gen.get<at::CUDAGeneratorImpl>();
+    impl->set_current_seed(seed);
+    impl->set_offset(offset);
+    gen_opt = gen;
+    JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
+  }
 
   try {
     auto results = aiter::torch_itfs::fmha_v3_fwd(
@@ -96,33 +121,27 @@ ffi::Error FmhaV3Fwd_Bridge(
     if (results.size() >= 4) {
       try {
         // Wrap JAX output buffers as PyTorch tensors.
-        JA_LOG("Wrapping output buffers");
         auto o_tensor = ::jax_aiter::wrap_any_buffer(*o, dev_idx);
-        auto lse_tensor = ::jax_aiter::wrap_any_buffer(*lse, dev_idx);
 
         // Copy main outputs.
-        o_tensor.copy_(results[0]);
-        
+        o_tensor.copy_(results[0], /*non_blocking=*/true);
+
         // Only copy LSE if requested (and if result has valid data)
         if (return_softmax_lse && results[1].numel() > 0) {
-          lse_tensor.copy_(results[1]);
+          auto lse_tensor = ::jax_aiter::wrap_any_buffer(*lse, dev_idx);
+          lse_tensor.copy_(results[1], /*non_blocking=*/true);
         }
 
         // Copy optional dropout mask if valid.
         if (p->untyped_data() && p->size_bytes() > 0) {
           auto p_tensor = ::jax_aiter::wrap_any_buffer(*p, dev_idx);
-          p_tensor.copy_(results[2]);
+          p_tensor.copy_(results[2], /*non_blocking=*/true);
         }
 
         // Copy RNG state if valid.
         if (rng_state->untyped_data() && rng_state->size_bytes() > 0) {
-          JA_LOG(
-              "rng_state buffer element_type: %d (hex: 0x%x), size: %zu bytes",
-              static_cast<int>(rng_state->element_type()),
-              static_cast<int>(rng_state->element_type()),
-              rng_state->size_bytes());
           auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
-          rng_tensor.copy_(results[3]);
+          rng_tensor.copy_(results[3], /*non_blocking=*/true);
         }
       } catch (const std::exception &e) {
         return ffi::Error(ffi::ErrorCode::kInternal,

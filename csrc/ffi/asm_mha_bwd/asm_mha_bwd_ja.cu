@@ -6,6 +6,8 @@
 #include "xla/ffi/api/ffi.h"
 
 #include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "hip_utils.h"
@@ -45,9 +47,9 @@ ffi::Error FmhaV3Bwd_Bridge(
     ffi::AnyBuffer k,    // [batch, seqlen_kv, nhead, hdim_q]
     ffi::AnyBuffer v,    // [batch, seqlen_kv, nhead, hdim_v]
     ffi::AnyBuffer out,  // [batch, seqlen_q, nhead, hdim_v] (from forward pass)
-    ffi::AnyBuffer softmax_lse,            // [batch, nhead, seqlen_q]
-    std::optional<ffi::AnyBuffer> dq_,
-    std::optional<ffi::AnyBuffer> dk_, std::optional<ffi::AnyBuffer> dv_,
+    ffi::AnyBuffer softmax_lse, // [batch, nhead, seqlen_q]
+    std::optional<ffi::AnyBuffer> dq_, std::optional<ffi::AnyBuffer> dk_,
+    std::optional<ffi::AnyBuffer> dv_,
     std::optional<ffi::AnyBuffer> alibi_slopes_,
     std::optional<ffi::AnyBuffer> rng_state_,
     std::optional<ffi::AnyBuffer> gen_,
@@ -67,6 +69,13 @@ ffi::Error FmhaV3Bwd_Bridge(
   auto v_tensor = ::jax_aiter::wrap_any_buffer(v, dev_idx);
   auto out_tensor = ::jax_aiter::wrap_any_buffer(out, dev_idx);
   auto softmax_lse_tensor = ::jax_aiter::wrap_any_buffer(softmax_lse, dev_idx);
+
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
+      device_of(q_tensor));
+
+  const c10::hip::HIPStreamMasqueradingAsCUDA ext_stream =
+      c10::hip::getStreamFromExternalMasqueradingAsCUDA(stream, dev_idx);
+  const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
 
   // Handle optional parameters by checking buffer size.
   std::optional<at::Tensor> dq_provided_opt = std::nullopt;
@@ -100,6 +109,22 @@ ffi::Error FmhaV3Bwd_Bridge(
           : std::nullopt;
 
   std::optional<at::Generator> gen_opt = std::nullopt;
+  // Handle generator parameter - extract from JAX buffer if provided.
+  if (gen_.has_value() &&
+      gen_->size_bytes() >= static_cast<size_t>(2 * sizeof(int64_t))) {
+    // Extract seed and offset from JAX buffer.
+    const auto *gen_data = static_cast<const int64_t *>(gen_->untyped_data());
+    const uint64_t seed = static_cast<uint64_t>(gen_data[0]);
+    const uint64_t offset = static_cast<uint64_t>(gen_data[1]);
+
+    // Create PyTorch generator with the provided seed.
+    auto gen_torch = at::make_generator<at::CUDAGeneratorImpl>(dev_idx);
+    auto *impl = gen_torch.get<at::CUDAGeneratorImpl>();
+    impl->set_current_seed(seed);
+    impl->set_offset(offset);
+    gen_opt = gen_torch;
+    JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
+  }
 
   try {
     auto results = aiter::torch_itfs::fmha_v3_bwd(
@@ -138,10 +163,10 @@ ffi::Error FmhaV3Bwd_Bridge(
             ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
 
         // Copy gradient tensors to output buffers.
-        dq_tensor.copy_(results[0]);
-        dk_tensor.copy_(results[1]);
-        dv_tensor.copy_(results[2]);
-        softmax_d_tensor.copy_(results[3]);
+        dq_tensor.copy_(results[0], /*non_blocking=*/true);
+        dk_tensor.copy_(results[1], /*non_blocking=*/true);
+        dv_tensor.copy_(results[2], /*non_blocking=*/true);
+        softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
 
         JA_LOG("Successfully copied all backward gradients");
       } catch (const std::exception &e) {
@@ -170,11 +195,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // v: [batch, seqlen_kv, nhead, hdim_v]
         .Arg<ffi::AnyBuffer>() // o: [batch, seqlen_q, nhead, hdim_v]
         .Arg<ffi::AnyBuffer>() // lse: [batch, nhead, seqlen_q]
-        .Arg<ffi::AnyBuffer>()  // dq_provided (optional)
-        .Arg<ffi::AnyBuffer>()  // dk_provided (optional)
-        .Arg<ffi::AnyBuffer>()  // dv_provided (optional)
-        .Arg<ffi::AnyBuffer>()  // alibi_slopes (optional)
-        .Arg<ffi::AnyBuffer>()  // rng_state_provided (optional)
+        .Arg<ffi::AnyBuffer>() // dq_provided (optional)
+        .Arg<ffi::AnyBuffer>() // dk_provided (optional)
+        .Arg<ffi::AnyBuffer>() // dv_provided (optional)
+        .Arg<ffi::AnyBuffer>() // alibi_slopes (optional)
+        .Arg<ffi::AnyBuffer>() // rng_state_provided (optional)
         .Arg<ffi::AnyBuffer>() // gen (optional)
         .Ret<ffi::AnyBuffer>() // dq: [batch, seqlen_q, nhead, hdim_q]
         .Ret<ffi::AnyBuffer>() // dk: [batch, seqlen_kv, nhead, hdim_q]

@@ -1,16 +1,21 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
 #include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "hip_utils.h"
 #include "logging.h"
 #include "torch_utils.h"
 
-// Forward declare the exact aiter torch interface
+// Forward declare the exact aiter torch interface.
+// returns { dq, dk, dv, softmax_d };
 namespace aiter {
 namespace torch_itfs {
 std::vector<at::Tensor> mha_varlen_bwd(
@@ -55,22 +60,17 @@ ffi::Error MhaVarlenBwd_Bridge(
     int64_t max_seqlen_q, int64_t max_seqlen_k, float p_dropout,
     float softmax_scale, bool zero_tensors, bool is_causal,
     int64_t window_size_left, int64_t window_size_right, bool deterministic,
-    ffi::AnyBuffer dq_provided,  // [total_q, hq, d_q] (optional)
-    ffi::AnyBuffer dk_provided,  // [total_k, hk, d_q] (optional)
-    ffi::AnyBuffer dv_provided,  // [total_k, hk, d_v] (optional)
-    ffi::AnyBuffer alibi_slopes, // [hq] or [b, hq] (optional)
-    ffi::AnyBuffer rng_state,    // [2] (optional)
-    ffi::AnyBuffer gen           // generator (optional)
+    std::optional<ffi::AnyBuffer> dq_, // [total_q, hq, d_q] (optional)
+    std::optional<ffi::AnyBuffer> dk_, // [total_k, hk, d_q] (optional)
+    std::optional<ffi::AnyBuffer> dv_, // [total_k, hk, d_v] (optional)
+    std::optional<ffi::AnyBuffer> alibi_slopes_, // [hq] or [b, hq] (optional)
+    std::optional<ffi::AnyBuffer> rng_state_,    // [2] (optional)
+    std::optional<ffi::AnyBuffer> gen_           // generator (optional)
 ) {
-  JA_LOG("MHA_VARLEN_BWD max_seqlen_q=%ld max_seqlen_k=%ld dropout=%f scale=%f "
-         "causal=%d window=(%ld,%ld) det=%d",
-         max_seqlen_q, max_seqlen_k, p_dropout, softmax_scale, is_causal,
-         window_size_left, window_size_right, deterministic);
-
-  // Get device index for tensor creation
+  // Get device index for tensor creation.
   const int dev_idx = ::jax_aiter::device_from_ptr(dout.untyped_data());
 
-  // Create tensor views from the JAX buffers (required inputs)
+  // Create tensor views from the JAX buffers (required inputs).
   auto dout_tensor = ::jax_aiter::wrap_any_buffer(dout, dev_idx);
   auto q_tensor = ::jax_aiter::wrap_any_buffer(q, dev_idx);
   auto k_tensor = ::jax_aiter::wrap_any_buffer(k, dev_idx);
@@ -82,45 +82,61 @@ ffi::Error MhaVarlenBwd_Bridge(
   auto cu_seqlens_k_tensor =
       ::jax_aiter::wrap_any_buffer(cu_seqlens_k, dev_idx);
 
-  // Create output tensor views for copying results back
-  auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq, dev_idx);
-  auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk, dev_idx);
-  auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv, dev_idx);
-  auto softmax_d_tensor = ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
+      device_of(q_tensor));
+
+  const c10::hip::HIPStreamMasqueradingAsCUDA ext_stream =
+      c10::hip::getStreamFromExternalMasqueradingAsCUDA(stream, dev_idx);
+  const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
 
   // Handle optional parameters (check for None by buffer size)
   std::optional<at::Tensor> dq_provided_opt = std::nullopt;
-  if (dq_provided.size_bytes() > 0) {
+  if (dq_.has_value() && dq_->size_bytes() > 0) {
     dq_provided_opt =
-        std::make_optional(::jax_aiter::wrap_any_buffer(dq_provided, dev_idx));
+        std::make_optional(::jax_aiter::wrap_any_buffer(*dq_, dev_idx));
   }
 
   std::optional<at::Tensor> dk_provided_opt = std::nullopt;
-  if (dk_provided.size_bytes() > 0) {
+  if (dk_.has_value() && dk_->size_bytes() > 0) {
     dk_provided_opt =
-        std::make_optional(::jax_aiter::wrap_any_buffer(dk_provided, dev_idx));
+        std::make_optional(::jax_aiter::wrap_any_buffer(*dk_, dev_idx));
   }
 
   std::optional<at::Tensor> dv_provided_opt = std::nullopt;
-  if (dv_provided.size_bytes() > 0) {
+  if (dv_.has_value() && dv_->size_bytes() > 0) {
     dv_provided_opt =
-        std::make_optional(::jax_aiter::wrap_any_buffer(dv_provided, dev_idx));
+        std::make_optional(::jax_aiter::wrap_any_buffer(*dv_, dev_idx));
   }
 
   std::optional<const at::Tensor> alibi_slopes_opt =
-      alibi_slopes.size_bytes() > 0
+      (alibi_slopes_.has_value() && alibi_slopes_->size_bytes() > 0)
           ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(alibi_slopes, dev_idx))
+                ::jax_aiter::wrap_any_buffer(*alibi_slopes_, dev_idx))
           : std::nullopt;
 
   std::optional<const at::Tensor> rng_state_opt =
-      rng_state.size_bytes() > 0
+      (rng_state_.has_value() && rng_state_->size_bytes() > 0)
           ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(rng_state, dev_idx))
+                ::jax_aiter::wrap_any_buffer(*rng_state_, dev_idx))
           : std::nullopt;
 
-  // Generator is always None for now
   std::optional<at::Generator> gen_opt = std::nullopt;
+  // Handle generator parameter - extract from JAX buffer if provided.
+  if (gen_.has_value() &&
+      gen_->size_bytes() >= static_cast<size_t>(2 * sizeof(int64_t))) {
+    // Extract seed and offset from JAX buffer.
+    const auto *gen_data = static_cast<const int64_t *>(gen_->untyped_data());
+    const uint64_t seed = static_cast<uint64_t>(gen_data[0]);
+    const uint64_t offset = static_cast<uint64_t>(gen_data[1]);
+
+    // Create PyTorch generator with the provided seed.
+    auto gen_torch = at::make_generator<at::CUDAGeneratorImpl>(dev_idx);
+    auto *impl = gen_torch.get<at::CUDAGeneratorImpl>();
+    impl->set_current_seed(seed);
+    impl->set_offset(offset);
+    gen_opt = gen_torch;
+    JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
+  }
 
   try {
     // Call the aiter MHA varlen backward PyTorch kernel with exact signature
@@ -152,16 +168,19 @@ ffi::Error MhaVarlenBwd_Bridge(
     );
 
     // Copy results back to JAX output buffers
-    // results = {dq, dk, dv, softmax_d}
+    // results = {dq, dk, dv, softmax_d}.
     if (results.size() >= 4) {
-      dq_tensor.copy_(results[0]);        // dq gradient
-      dk_tensor.copy_(results[1]);        // dk gradient
-      dv_tensor.copy_(results[2]);        // dv gradient
-      softmax_d_tensor.copy_(results[3]); // softmax_d
+      // Create output tensor views for copying results back.
+      auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq, dev_idx);
+      auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk, dev_idx);
+      auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv, dev_idx);
+      auto softmax_d_tensor = ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
+
+      dq_tensor.copy_(results[0], /*non_blocking=*/true);
+      dk_tensor.copy_(results[1], /*non_blocking=*/true);
+      dv_tensor.copy_(results[2], /*non_blocking=*/true);
+      softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
     }
-
-    JA_LOG("MHA_VARLEN_BWD completed successfully");
-
     return ffi::Error::Success();
   } catch (const std::exception &e) {
     JA_LOG("MHA_VARLEN_BWD failed: %s", e.what());

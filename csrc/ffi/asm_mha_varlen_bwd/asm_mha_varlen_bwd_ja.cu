@@ -4,6 +4,8 @@
 #include "xla/ffi/api/ffi.h"
 
 #include <ATen/hip/HIPContext.h>
+#include <ATen/hip/HIPGeneratorImpl.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <torch/all.h>
 
 #include "hip_utils.h"
@@ -90,39 +92,63 @@ ffi::Error FmhaV3VarlenBwd_Bridge(
   auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv, dev_idx);
   auto softmax_d_tensor = ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
 
+  // Set device and stream guards
+  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
+      device_of(q_tensor));
+
+  const c10::hip::HIPStreamMasqueradingAsCUDA ext_stream =
+      c10::hip::getStreamFromExternalMasqueradingAsCUDA(stream, dev_idx);
+  const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
+
   // Handle optional parameters (check for None by buffer size)
   std::optional<at::Tensor> dq_provided_opt = std::nullopt;
-  if (dq_provided.size_bytes() > 0) {
+  if (dq_provided.has_value() && dq_provided.size_bytes() > 0) {
     dq_provided_opt =
         std::make_optional(::jax_aiter::wrap_any_buffer(dq_provided, dev_idx));
   }
 
   std::optional<at::Tensor> dk_provided_opt = std::nullopt;
-  if (dk_provided.size_bytes() > 0) {
+  if (dk_provided.has_value() && dk_provided.size_bytes() > 0) {
     dk_provided_opt =
         std::make_optional(::jax_aiter::wrap_any_buffer(dk_provided, dev_idx));
   }
 
   std::optional<at::Tensor> dv_provided_opt = std::nullopt;
-  if (dv_provided.size_bytes() > 0) {
+  if (dv_provided.has_value() && dv_provided.size_bytes() > 0) {
     dv_provided_opt =
         std::make_optional(::jax_aiter::wrap_any_buffer(dv_provided, dev_idx));
   }
 
-  std::optional<const at::Tensor> alibi_slopes_opt =
-      alibi_slopes.size_bytes() > 0
-          ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(alibi_slopes, dev_idx))
-          : std::nullopt;
+  std::optional<const at::Tensor> alibi_slopes_opt = std::nullopt;
+  if (alibi_slopes.has_value() && alibi_slopes.size_bytes() > 0) {
+    alibi_slopes_opt = std::make_optional<const at::Tensor>(
+        ::jax_aiter::wrap_any_buffer(alibi_slopes, dev_idx));
+  }
 
-  std::optional<const at::Tensor> rng_state_opt =
-      rng_state.size_bytes() > 0
-          ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(rng_state, dev_idx))
-          : std::nullopt;
+  std::optional<const at::Tensor> rng_state_opt = std::nullopt;
+  if (rng_state.has_value() && rng_state.size_bytes() > 0) {
+    rng_state_opt = std::make_optional<const at::Tensor>(
+        ::jax_aiter::wrap_any_buffer(rng_state, dev_idx));
+  }
 
-  // Generator is always None for now
+  // Handle generator parameter for dropout
   std::optional<at::Generator> gen_opt = std::nullopt;
+  if (gen.has_value() && gen.size_bytes() > 0) {
+    // Extract seed and offset from JAX generator buffer
+    auto gen_tensor = ::jax_aiter::wrap_any_buffer(gen, dev_idx);
+    auto gen_data = gen_tensor.data_ptr<uint64_t>();
+    uint64_t seed = gen_data[0];
+    uint64_t offset = gen_data[1];
+
+    // Create PyTorch generator
+    auto pytorch_gen = at::make_generator<at::CUDAGeneratorImpl>(dev_idx);
+    auto cuda_gen = at::check_generator<at::CUDAGeneratorImpl>(pytorch_gen);
+    cuda_gen->set_current_seed(seed);
+    cuda_gen->set_offset(offset);
+    gen_opt = pytorch_gen;
+
+    JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
+  }
 
   try {
     // Call the aiter FMHA V3 varlen backward PyTorch kernel with exact
@@ -158,12 +184,13 @@ ffi::Error FmhaV3VarlenBwd_Bridge(
     // Copy results back to JAX output buffers
     // results = {dq, dk, dv, softmax_d}
     if (results.size() >= 4) {
-      dq_tensor.copy_(results[0]);        // dq gradient
-      dk_tensor.copy_(results[1]);        // dk gradient
-      dv_tensor.copy_(results[2]);        // dv gradient
-      softmax_d_tensor.copy_(results[3]); // softmax_d
+      dq_tensor.copy_(results[0], /*non_blocking=*/true);        // dq gradient
+      dk_tensor.copy_(results[1], /*non_blocking=*/true);        // dk gradient
+      dv_tensor.copy_(results[2], /*non_blocking=*/true);        // dv gradient
+      softmax_d_tensor.copy_(results[3], /*non_blocking=*/true); // softmax_d
     }
 
+    JA_LOG("FMHA_V3_VARLEN_BWD completed successfully");
     JA_LOG("FMHA_V3_VARLEN_BWD completed successfully");
 
     return ffi::Error::Success();
