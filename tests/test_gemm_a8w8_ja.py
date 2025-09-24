@@ -83,9 +83,7 @@ def run_gemm_skinny(
 
 
 @perftest()
-def run_jax_gemm_skinny(
-    XQ, WQ, XS, WS, dtype=dtypes.bf16, cu_count=1
-):
+def run_jax_gemm_skinny(XQ, WQ, XS, WS, dtype=dtypes.bf16, cu_count=1):
     if dtype == dtypes.bf16:
         jax_out_dtype = jax_dtypes.bf16
     elif dtype == dtypes.fp16:
@@ -178,7 +176,7 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     x, x_scale = aiter.per_tensor_quant(x, quant_dtype=quantDtype)
     weight, w_scale = aiter.per_tensor_quant(weight, quant_dtype=quantDtype)
     bias = None
-    
+
     # Ground truth.
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
 
