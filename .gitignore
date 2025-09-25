@@ -57,7 +57,8 @@ coverage.xml
 
 # Project-specific ignores.
 build/
-third_party/
+third_party/*
+!third_party/aiter
 
 # Python cache.
 __pycache__/
