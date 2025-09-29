@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
-# third_party/build_static_pytorch.sh
-#
-# 1. HIP-ify the cloned PyTorch tree (idempotent – does nothing if already done)
-# 2. Configure a static-only, PIC build that targets ROCm
-# 3. Install c10, torch_cpu, and torch_hip as *.a archives + headers
-#
-# Environment overrides:
-#   ROCM_ARCH   gfx arch (default gfx942)
-#   ROCM_PATH   /opt/rocm by default
-#   JOBS        parallel build jobs (default: $(nproc))
-#   PYTHON      Python interpreter (default: python3)
+# scripts/build_static_pytorch.sh
+# Static-only, PIC PyTorch build for ROCm, minimized to c10/torch_cpu/torch_hip
 
 set -euxo pipefail
 
@@ -30,50 +21,111 @@ echo "Install prefix  : $INSTALL_DIR"
 echo "Jobs            : $JOBS"
 echo
 
+# 1) HIPify once (idempotent)
 if [ ! -f "$SRC_DIR/.hipify_done" ]; then
   echo "HIPifying PyTorch sources (in-place)"
-  "$PYTHON" "$SRC_DIR/tools/amd_build/build_amd.py" \
-    --project-directory="$SRC_DIR"
+  "$PYTHON" "$SRC_DIR/tools/amd_build/build_amd.py" --project-directory="$SRC_DIR"
   touch "$SRC_DIR/.hipify_done"
   echo "HIPify complete"
   echo
 fi
 
+# 2) Configure a static, PIC, ROCm-only, minimal build
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DBUILD_SHARED_LIBS=OFF \
-  -DUSE_PYTHON=ON -DBUILD_PYTHON=OFF \
   -DUSE_ROCM=ON -DROCM_ARCH="$ROCM_ARCH" \
-  -DUSE_CUDA=OFF -DUSE_NCCL=OFF \
+  -DUSE_CUDA=OFF \
+  -DUSE_XPU=OFF \
+  -DUSE_CUDNN=OFF \
+  -DUSE_CUSPARSELT=OFF \
+  -DUSE_CUDSS=OFF \
+  -DUSE_CUFILE=OFF \
+  -DUSE_STATIC_CUDNN=OFF \
+  \
+  -DBUILD_PYTHON=OFF \
+  -DUSE_PYTHON=OFF \
+  -DUSE_NUMPY=OFF \
+  \
   -DUSE_DISTRIBUTED=OFF \
-  -DBUILD_JNI=OFF \
+  -DUSE_GLOO=OFF \
+  -DUSE_MPI=OFF \
+  -DUSE_TENSORPIPE=OFF \
+  -DUSE_UCC=OFF \
+  -DUSE_C10D_GLOO=OFF \
+  -DUSE_C10D_NCCL=OFF \
+  -DUSE_C10D_MPI=OFF \
+  -DUSE_C10D_UCC=OFF \
+  -DUSE_NCCL=OFF \
+  -DUSE_RCCL=OFF \
+  -DUSE_XCCL=OFF \
+  -DUSE_STATIC_NCCL=OFF \
+  -DUSE_SYSTEM_NCCL=OFF \
+  -DUSE_NVSHMEM=OFF \
+  \
   -DUSE_OPENMP=OFF \
-  -DUSE_MIMALLOC=OFF \
-  -DUSE_OBSERVERS=OFF \
-  -DUSE_NNPACK=OFF \
-  -DUSE_ITT=OFF \
-  -DUSE_KINETO=OFF \
-  -DUSE_XNNPACK=OFF \
-  -DBUILD_TEST=OFF -DBUILD_C10_HIP_TEST=OFF \
-  -DBUILD_CAFFE2_OPS=OFF \
-  -DUSE_FLASH_ATTENTION=OFF -DUSE_AOTRITON=OFF \
-  -DUSE_MEM_EFF_ATTENTION=OFF \
-  -DUSE_LITE_PROTO=ON \
-  -DONNX_ML=OFF \
-  -DUSE_FBGEMM=OFF \
-  -DUSE_PYTORCH_QNNPACK=OFF \
+  -DUSE_BLAS=OFF \
   -DUSE_MKLDNN=OFF \
+  -DUSE_MKLDNN_ACL=OFF \
+  -DUSE_MKLDNN_CBLAS=OFF \
+  -DUSE_STATIC_MKL=OFF \
+  -DUSE_MAGMA=OFF \
+  -DUSE_NUMA=OFF \
+  -DUSE_EIGEN_SPARSE=OFF \
+  -DUSE_SYSTEM_EIGEN_INSTALL=OFF \
+  -DUSE_VALGRIND=OFF \
+  \
+  -DUSE_XNNPACK=OFF \
+  -DUSE_PYTORCH_QNNPACK=OFF \
+  -DUSE_FBGEMM=OFF \
+  -DUSE_NNPACK=OFF \
+  \
+  -DUSE_KINETO=OFF \
+  -DUSE_PROF=OFF \
+  -DUSE_ITT=OFF \
+  -DUSE_OBSERVERS=OFF \
+  -DUSE_MIMALLOC=OFF \
+  -DUSE_CUPTI_SO=OFF \
+  \
+  -DUSE_VULKAN=OFF \
+  -DUSE_OPENCL=OFF \
+  -DUSE_PYTORCH_METAL=OFF \
+  -DUSE_PYTORCH_METAL_EXPORT=OFF \
+  -DUSE_MPS=OFF \
+  -DUSE_COREML_DELEGATE=OFF \
+  \
+  -DONNX_ML=OFF \
+  -DUSE_SYSTEM_ONNX=OFF \
+  \
+  -DBUILD_TEST=OFF \
+  -DBUILD_C10_HIP_TEST=OFF \
+  -DBUILD_BINARY=OFF \
+  -DBUILD_JNI=OFF \
+  -DBUILD_FUNCTORCH=OFF \
+  -DBUILD_LAZY_TS_BACKEND=OFF \
+  -DBUILD_LITE_INTERPRETER=OFF \
+  -DUSE_LITE_PROTO=ON \
+  \
   -DUSE_GLOG=OFF \
   -DUSE_GFLAGS=OFF \
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  -DCMAKE_CXX_FLAGS="-Wno-stringop-overflow"
+  \
+  -DUSE_ROCM_CK_GEMM=OFF \
+  \
+  -DUSE_FLASH_ATTENTION=OFF \
+  -DUSE_MEM_EFF_ATTENTION=OFF \
+  -DUSE_AOTRITON=OFF \
+  \
+  -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections" \
+  -DCMAKE_CXX_FLAGS="-Wno-stringop-overflow -ffunction-sections -fdata-sections -DUSE_DIRECT_NVRTC"
 
-cmake --build "$BUILD_DIR" --target c10 torch_cpu torch_hip -j"$JOBS"
+# 3) Build and install just what we need for linking
+cmake --build "$BUILD_DIR" --target c10 torch_cpu torch_hip caffe2_nvrtc -j"$JOBS"
 cmake --install "$BUILD_DIR" --prefix "$INSTALL_DIR"
 
 echo
-echo "Static libraries ready:"
-ls -1 "$INSTALL_DIR/lib/"lib{c10,torch_*}.a
+echo "Static libraries installed:"
+ls -1 "$INSTALL_DIR/lib/"lib{c10,torch_*}.a || true
 echo "Headers installed under:"
 echo "  $INSTALL_DIR/include"

@@ -50,6 +50,7 @@ LDFLAGS := -Wl,--whole-archive \
     $(TORCH_STATIC_LIBDIR)/libtorch_hip.a \
     $(TORCH_STATIC_LIBDIR)/libc10.a \
     $(TORCH_STATIC_LIBDIR)/libc10_hip.a \
+    $(TORCH_STATIC_LIBDIR)/libcaffe2_nvrtc.a \
   -Wl,--no-whole-archive \
   -Wl,--start-group \
     $(TORCH_STATIC_LIBDIR)/libcpuinfo.a \
@@ -62,13 +63,14 @@ LDFLAGS := -Wl,--whole-archive \
   -lhipsparse -lhipblaslt -lhipblas \
   -lhipfft -lhipsolver -lMIOpen \
   -lamdhip64 \
+  -lhiprtc \
   -Wl,-rpath,$(HIP_LIB) \
   -ldl -lpthread -fopenmp \
   -Wl,--gc-sections \
   -Wl,--no-gnu-unique \
   -Wl,-soname,libjax_aiter.so
 
-OUT_SO := build/bin/libjax_aiter.so
+OUT_SO := build/aiter_build/libjax_aiter.so
 
 .PHONY: all lib configure clean
 
@@ -79,7 +81,7 @@ configure:
 %/: 
 	mkdir -p $@
 
-$(OUT_SO): build/bin/
+$(OUT_SO): build/aiter_build/
 	$(HIPCC) -shared -fPIC $(CXXFLAGS) $(LDFLAGS) -o $@
 
 clean:

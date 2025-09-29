@@ -12,7 +12,7 @@ import ctypes
 import logging
 from typing import Dict, List, Optional
 
-from ..ja_compat.config import get_shared_lib, get_repo_root
+from ..ja_compat import config as ja_config
 
 logger = logging.getLogger("JAX_AITER")
 
@@ -64,7 +64,7 @@ def load_umbrella_library():
     if _umbrella_handle is not None:
         return _umbrella_handle
 
-    umbrella_path = get_shared_lib()
+    umbrella_path = ja_config.get_umbrella_lib()
     if not umbrella_path.exists():
         raise FileNotFoundError(
             f"Umbrella library not found: {umbrella_path}. Run `make` first."
@@ -87,14 +87,16 @@ def load_thin_modules():
     if not _umbrella_handle:
         raise RuntimeError("Umbrella library must be loaded first")
 
-    lib_dir = get_repo_root() / "build" / "aiter_build"
+    lib_dir = ja_config.get_repo_root()
     if not lib_dir.exists():
         logger.warning(f"Module directory not found: {lib_dir}")
         return
 
-    # Only search for modules in the top-level aiter_build directory.
+    # Search for *.so files in configured directories.
     for module_so in sorted(lib_dir.glob("*.so")):
         try:
+            if module_so.name == "libjax_aiter.so":
+                continue
             logger.info(f"Loading thin module: {module_so}")
             module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
             _module_handles[module_so.name] = module_handle

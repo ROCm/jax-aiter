@@ -1,0 +1,24 @@
+diff --git a/caffe2/CMakeLists.txt b/caffe2/CMakeLists.txt
+index d1ce24e37fe..5ce7fdb35d5 100644
+--- a/caffe2/CMakeLists.txt
++++ b/caffe2/CMakeLists.txt
+@@ -553,7 +553,8 @@ endif()
+ 
+ if(USE_CUDA)
+   list(APPEND Caffe2_GPU_CU_SRCS ${Caffe2_GPU_HIP_JIT_FUSERS_SRCS})
+-  add_library(caffe2_nvrtc SHARED ${ATen_NVRTC_STUB_SRCS})
++  add_library(caffe2_nvrtc STATIC ${ATen_NVRTC_STUB_SRCS})
++  set_target_properties(caffe2_nvrtc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+   if(MSVC)
+     # Delay load nvcuda.dll so we can import torch compiled with cuda on a CPU-only machine
+     set(DELAY_LOAD_FLAGS "-DELAYLOAD:nvcuda.dll;delayimp.lib")
+@@ -632,7 +633,8 @@ if(USE_ROCM)
+   endif()
+   # caffe2_nvrtc's stubs to driver APIs are useful for HIP.
+   # See NOTE [ ATen NVRTC Stub and HIP ]
+-  add_library(caffe2_nvrtc SHARED ${ATen_NVRTC_STUB_SRCS})
++  add_library(caffe2_nvrtc STATIC ${ATen_NVRTC_STUB_SRCS})
++  set_target_properties(caffe2_nvrtc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+   target_link_libraries(caffe2_nvrtc hip::amdhip64 hiprtc::hiprtc)
+   target_include_directories(caffe2_nvrtc PRIVATE ${CMAKE_BINARY_DIR})
+   target_compile_definitions(caffe2_nvrtc PRIVATE USE_ROCM __HIP_PLATFORM_AMD__)

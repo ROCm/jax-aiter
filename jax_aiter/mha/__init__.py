@@ -40,17 +40,31 @@ from .mha import (
     _create_generator_tensor,
 )
 
+# Import variable-length MHA implementation.
+from .mha_varlen import (
+    flash_attn_varlen,
+    mha_varlen_fwd,
+    mha_varlen_bwd,
+    _flash_attn_varlen_forward,
+    _flash_attn_varlen_backward,
+)
+
 __all__ = [
     # High-level Flash Attention API (recommended for most users).
     "flash_attn_func",
+    "flash_attn_varlen",
     # Low-level kernel functions.
     "mha_fwd",
     "mha_bwd",
     "fmha_v3_fwd",
     "fmha_v3_bwd",
+    "mha_varlen_fwd",
+    "mha_varlen_bwd",
     # Internal functions.
     "_flash_attn_forward",
     "_flash_attn_backward",
+    "_flash_attn_varlen_forward",
+    "_flash_attn_varlen_backward",
     "debug_kernel_params",
     "_can_impl_fmha_v3_fwd",
     "_can_impl_fmha_v3_bwd",
