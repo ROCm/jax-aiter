@@ -47,18 +47,18 @@ ffi::Error MhaBatchPrefill_Bridge(
     ffi::AnyBuffer cu_seqlens_q, // [b+1]
     ffi::AnyBuffer kv_indptr,    // [b+1]
     ffi::AnyBuffer kv_page_indices,
+    std::optional<ffi::AnyBuffer> out_provided, // [total_q, hq, d] (optional)
+    std::optional<ffi::AnyBuffer> bias, // [total_q, max_seqlen_k] (optional)
+    std::optional<ffi::AnyBuffer> alibi_slopes, // [hq] or [b, hq] (optional)
+    std::optional<ffi::AnyBuffer> gen,           // generator (optional)
     ffi::Result<ffi::AnyBuffer> out,         // [total_q, hq, d]
     ffi::Result<ffi::AnyBuffer> softmax_lse, // [hq, total_q]
     ffi::Result<ffi::AnyBuffer> p, // [hq, total_q, max_seqlen_k] (dropout mask)
     ffi::Result<ffi::AnyBuffer> rng_state, // [2]
-    int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale,
-    float logits_soft_cap, bool zero_tensors, bool is_causal,
+    int max_seqlen_q, int max_seqlen_k, double p_dropout, double softmax_scale,
+    double logits_soft_cap, bool zero_tensors, bool is_causal,
     int window_size_left, int window_size_right, bool return_softmax_lse,
-    bool return_dropout_randval,
-    std::optional<ffi::AnyBuffer> out_provided, // [total_q, hq, d] (optional)
-    std::optional<ffi::AnyBuffer> bias, // [total_q, max_seqlen_k] (optional)
-    std::optional<ffi::AnyBuffer> alibi_slopes, // [hq] or [b, hq] (optional)
-    std::optional<ffi::AnyBuffer> gen           // generator (optional)
+    bool return_dropout_randval
 ) {
   // Get device index for tensor creation
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
@@ -114,7 +114,6 @@ ffi::Error MhaBatchPrefill_Bridge(
     impl->set_current_seed(seed);
     impl->set_offset(offset);
     gen_opt = gen_torch;
-    JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
   }
 
   try {
@@ -170,11 +169,7 @@ ffi::Error MhaBatchPrefill_Bridge(
         auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
         rng_tensor.copy_(results[3], /*non_blocking=*/true);
       }
-    } else {
-      JA_LOG("MHA_FWD warning: expected at least 4 results, got %zu",
-             results.size());
     }
-
     return ffi::Error::Success();
   } catch (const std::exception &e) {
     return ffi::Error(ffi::ErrorCode::kInternal, e.what());
@@ -195,25 +190,25 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // cu_seqlens_q: [b+1]
         .Arg<ffi::AnyBuffer>() // kv_indptr: [b+1]
         .Arg<ffi::AnyBuffer>() // kv_page_indices
+        .Arg<ffi::AnyBuffer>()  // out_provided: [total_q, hq, d] (optional)
+        .Arg<ffi::AnyBuffer>()  // bias: [total_q, max_seqlen_k] (optional)
+        .Arg<ffi::AnyBuffer>()  // alibi_slopes: [hq] or [b, hq] (optional)
+        .Arg<ffi::AnyBuffer>()  // gen: generator (optional)
         .Ret<ffi::AnyBuffer>() // out: [total_q, hq, d]
         .Ret<ffi::AnyBuffer>() // softmax_lse: [hq, total_q]
         .Ret<ffi::AnyBuffer>() // p: [hq, total_q, max_seqlen_k] (dropout mask)
         .Ret<ffi::AnyBuffer>() // rng_state: [2]
         .Attr<int>("max_seqlen_q")
         .Attr<int>("max_seqlen_k")
-        .Attr<float>("p_dropout")
-        .Attr<float>("softmax_scale")
-        .Attr<float>("logits_soft_cap")
+        .Attr<double>("p_dropout")
+        .Attr<double>("softmax_scale")
+        .Attr<double>("logits_soft_cap")
         .Attr<bool>("zero_tensors")
         .Attr<bool>("is_causal")
         .Attr<int>("window_size_left")
         .Attr<int>("window_size_right")
         .Attr<bool>("return_softmax_lse")
-        .Attr<bool>("return_dropout_randval")
-        .Arg<ffi::AnyBuffer>()  // out_provided: [total_q, hq, d] (optional)
-        .Arg<ffi::AnyBuffer>()  // bias: [total_q, max_seqlen_k] (optional)
-        .Arg<ffi::AnyBuffer>()  // alibi_slopes: [hq] or [b, hq] (optional)
-        .Arg<ffi::AnyBuffer>(), // gen: generator (optional)
+        .Attr<bool>("return_dropout_randval"),
     {xla::ffi::Traits::kCmdBufferCompatible});
 
 #pragma GCC visibility pop

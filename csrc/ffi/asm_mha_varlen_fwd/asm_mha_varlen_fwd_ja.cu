@@ -47,21 +47,21 @@ ffi::Error FmhaV3VarlenFwd_Bridge(
     ffi::AnyBuffer v,                           // [total_k, hk, d_v]
     ffi::AnyBuffer cu_seqlens_q,                // [b+1]
     std::optional<ffi::AnyBuffer> cu_seqlens_k, // [b+1]
-    ffi::Result<ffi::AnyBuffer> out,            // [total_q, hq, d_v]
-    ffi::Result<ffi::AnyBuffer> softmax_lse,    // [b, hq, max_seqlen_q]
+    std::optional<ffi::AnyBuffer> out_,         // [total_q, hq, d_v] (optional)
+    std::optional<ffi::AnyBuffer> block_table_, // [hq] or [b, hq] (optional)
+    std::optional<ffi::AnyBuffer>
+        bias_, // [max_seqlen_q, max_seqlen_k] (optional)
+    std::optional<ffi::AnyBuffer> alibi_slopes_, // [hq] or [b, hq] (optional)
+    std::optional<ffi::AnyBuffer> gen_,          // generator (optional)
+    ffi::Result<ffi::AnyBuffer> out,             // [total_q, hq, d_v]
+    ffi::Result<ffi::AnyBuffer> softmax_lse,     // [b, hq, max_seqlen_q]
     ffi::Result<ffi::AnyBuffer>
         p, // [b, hq, max_seqlen_q, max_seqlen_k] (dropout mask)
     ffi::Result<ffi::AnyBuffer> rng_state, // [2]
     int max_seqlen_q, int max_seqlen_k, int min_seqlen_q, float p_dropout,
     float softmax_scale, float logits_soft_cap, bool zero_tensors,
     bool is_causal, int window_size_left, int window_size_right,
-    bool return_softmax_lse, bool return_dropout_randval,
-    std::optional<ffi::AnyBuffer> out_, // [total_q, hq, d_v] (optional)
-    std::optional<ffi::AnyBuffer>
-        bias_, // [max_seqlen_q, max_seqlen_k] (optional)
-    std::optional<ffi::AnyBuffer> alibi_slopes_, // [hq] or [b, hq] (optional)
-    std::optional<ffi::AnyBuffer> gen_           // generator (optional)
-) {
+    bool return_softmax_lse, bool return_dropout_randval, int how_v3_bf16_cvt) {
   // Get device index for tensor creation.
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
 
@@ -80,27 +80,33 @@ ffi::Error FmhaV3VarlenFwd_Bridge(
   const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
 
   std::optional<const at::Tensor> cu_seqlens_k_opt =
-      (cu_seqlens_k.has_value() && cu_seqlens_k->size() > 0)
+      (cu_seqlens_k.has_value() && cu_seqlens_k->size_bytes() > 0)
           ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(cu_seqlens_k.value(), dev_idx))
+                ::jax_aiter::wrap_any_buffer(*cu_seqlens_k, dev_idx))
           : std::nullopt;
 
-  // Handle optional parameters (check for None by buffer size).
-  std::optional<at::Tensor> out_opt =
+  std::optional<const at::Tensor> out_opt =
       (out_.has_value() && out_->size_bytes() > 0)
-          ? std::make_optional(::jax_aiter::wrap_any_buffer(*out_, dev_idx))
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*out_, dev_idx))
           : std::nullopt;
 
-  std::optional<const at::Tensor> bias_opt =
-      (bias_.has_value() && bias_->size_bytes() > 0)
+  std::optional<const at::Tensor> block_table_opt =
+      (block_table_.has_value() && block_table_->size_bytes() > 0)
           ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(*bias_, dev_idx))
+                ::jax_aiter::wrap_any_buffer(*block_table_, dev_idx))
           : std::nullopt;
 
   std::optional<const at::Tensor> alibi_slopes_opt =
       (alibi_slopes_.has_value() && alibi_slopes_->size_bytes() > 0)
           ? std::make_optional<const at::Tensor>(
                 ::jax_aiter::wrap_any_buffer(*alibi_slopes_, dev_idx))
+          : std::nullopt;
+
+  std::optional<const at::Tensor> bias_opt =
+      (bias_.has_value() && bias_->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*bias_, dev_idx))
           : std::nullopt;
 
   std::optional<at::Generator> gen_opt = std::nullopt;
@@ -125,29 +131,29 @@ ffi::Error FmhaV3VarlenFwd_Bridge(
     // Call the aiter FMHA V3 varlen forward PyTorch kernel with exact signature
     // match.
     auto results = aiter::torch_itfs::fmha_v3_varlen_fwd(
-        q_tensor,            // q: [total_q, hq, d]
-        k_tensor,            // k: [total_k, hk, d]
-        v_tensor,            // v: [total_k, hk, d]
-        cu_seqlens_q_tensor, // cu_seqlens_q: [b+1]
-        cu_seqlens_k_opt,    // cu_seqlens_k: [b+1] (optional reference)
-        static_cast<int>(max_seqlen_q),     // max_seqlen_q
-        static_cast<int>(max_seqlen_k),     // max_seqlen_k
-        0,                                  // min_seqlen_q (default to 0)
-        p_dropout,                          // p_dropout
-        softmax_scale,                      // softmax_scale
-        0.0f,                               // logits_soft_cap (default to 0.0f)
-        zero_tensors,                       // zero_tensors
-        is_causal,                          // is_causal
-        static_cast<int>(window_size_left), // window_size_left
-        static_cast<int>(window_size_right), // window_size_right
-        return_softmax_lse,                  // return_softmax_lse
-        return_dropout_randval,              // return_dropout_randval
-        0,                                   // how_v3_bf16_cvt (default to 0)
-        out_opt,          // out_ (optional pre-allocated output)
-        std::nullopt,     // block_table_ (not supported in this interface)
-        bias_opt,         // bias_ (optional)
-        alibi_slopes_opt, // alibi_slopes_ (optional)
-        gen_opt           // gen_ (optional generator)
+        q_tensor,               // q: [total_q, hq, d]
+        k_tensor,               // k: [total_k, hk, d]
+        v_tensor,               // v: [total_k, hk, d]
+        cu_seqlens_q_tensor,    // cu_seqlens_q: [b+1]
+        cu_seqlens_k_opt,       // cu_seqlens_k: [b+1] (optional reference)
+        max_seqlen_q,           // max_seqlen_q
+        max_seqlen_k,           // max_seqlen_k
+        min_seqlen_q,           // min_seqlen_q
+        p_dropout,              // p_dropout
+        softmax_scale,          // softmax_scale
+        logits_soft_cap,        // logits_soft_cap
+        zero_tensors,           // zero_tensors
+        is_causal,              // is_causal
+        window_size_left,       // window_size_left
+        window_size_right,      // window_size_right
+        return_softmax_lse,     // return_softmax_lse
+        return_dropout_randval, // return_dropout_randval
+        how_v3_bf16_cvt,        // how_v3_bf16_cvt (default to 0)
+        out_opt,                // out_ (optional pre-allocated output)
+        block_table_opt,        // block_table_ (optional)
+        bias_opt,               // bias_ (optional)
+        alibi_slopes_opt,       // alibi_slopes_ (optional)
+        gen_opt                 // gen_ (optional generator)
     );
 
     // Copy results back to JAX output buffers using tensor copy operations.
@@ -202,6 +208,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // v: [total_k, hk, d_v]
         .Arg<ffi::AnyBuffer>() // cu_seqlens_q: [b+1]
         .Arg<ffi::AnyBuffer>() // cu_seqlens_k: [b+1]
+        .Arg<ffi::AnyBuffer>() // out_: [total_q, hq, d_v] (optional)
+        .Arg<ffi::AnyBuffer>() // block_table_: [hq] or [b, hq] (optional)
+        .Arg<ffi::AnyBuffer>() // bias_: [max_seqlen_q, max_seqlen_k] (optional)
+        .Arg<ffi::AnyBuffer>() // alibi_slopes_: [hq] or [b, hq] (optional)
+        .Arg<ffi::AnyBuffer>() // gen_: generator (optional)
         .Ret<ffi::AnyBuffer>() // out: [total_q, hq, d_v]
         .Ret<ffi::AnyBuffer>() // softmax_lse: [b, hq, max_seqlen_q]
         .Ret<ffi::AnyBuffer>() // p: [b, hq, max_seqlen_q, max_seqlen_k]
@@ -209,7 +220,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>() // rng_state: [2]
         .Attr<int>("max_seqlen_q")
         .Attr<int>("max_seqlen_k")
-        .Attr<int>("min_seqlen_k")
+        .Attr<int>("min_seqlen_q")
         .Attr<float>("p_dropout")
         .Attr<float>("softmax_scale")
         .Attr<float>("logits_soft_cap")
@@ -219,11 +230,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("window_size_right")
         .Attr<bool>("return_softmax_lse")
         .Attr<bool>("return_dropout_randval")
-        .Arg<ffi::AnyBuffer>() // out_: [total_q, hq, d_v] (optional)
-        .Arg<ffi::AnyBuffer>() // block_table_: [hq] or [b, hq] (optional)
-        .Arg<ffi::AnyBuffer>() // bias_: [max_seqlen_q, max_seqlen_k] (optional)
-        .Arg<ffi::AnyBuffer>() // alibi_slopes_: [hq] or [b, hq] (optional)
-        .Arg<ffi::AnyBuffer>(), // gen_: generator (optional)
+        .Attr<int>("how_v3_bf16_cvt"),
     {xla::ffi::Traits::kCmdBufferCompatible});
 
 #pragma GCC visibility pop
