@@ -50,11 +50,6 @@ def _empty_tensor(dtype):
     return jnp.zeros((0,), dtype=dtype)
 
 
-def _static_gt_zero(x) -> bool:
-    """Convert to Python bool for (x > 0) without tracer issues."""
-    return bool(x > 0.0)
-
-
 def _static_is_zero(x) -> bool:
     """Convert to Python bool for (x == 0) without tracer issues."""
     return float(x) == 0.0
@@ -145,7 +140,7 @@ def _can_impl_fmha_v3_bwd(
     is_v3_atomic_fp32=True,
 ):
     """Check if FMHA v3 backward kernel can be used.
-    
+
     Note: v3 backward does NOT support bias gradient computation.
     """
     _, seqlen_q, nhead_q, hdim_q = q.shape
@@ -797,9 +792,7 @@ def _flash_attn_forward(
     _, seqlen_k, nhead_k, hdim_v = v.shape
 
     # Normalize window sizes for compatibility.
-    wl_orig, wr_orig = window_size_left, window_size_right
-    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
-    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
+    window_size_left, window_size_right = _normalize_window_size(window_size_left, window_size_right, seqlen_k)
 
     # Select optimal kernel based on input constraints.
     can_use_v3 = _can_impl_fmha_v3_fwd(
@@ -881,7 +874,7 @@ def _flash_attn_backward(
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]]:
     """Backward pass with automatic kernel selection and bias gradient support.
-    
+
     Returns: (dq, dk, dv, softmax_d, dbias) - dbias is None if no bias provided.
     """
     # Select optimal backward kernel.
@@ -977,33 +970,6 @@ def _flash_attn_backward(
                 f"Backward kernel returned None gradients: "
                 f"dq={dq_grad is not None}, dk={dk_grad is not None}, dv={dv_grad is not None}"
             )
-
-        # Debug output for gradient inspection.
-        if DEBUG_MHA:
-            kernel_type = "FMHA_V3" if can_use_v3_bwd else "MHA"
-            print(f"=== {kernel_type}_BWD JAX-AITER DEBUG ===")
-            print(f"Backward pass completed using {kernel_type} kernel")
-
-            if hasattr(dq_grad, "flatten"):
-                flat_dq = dq_grad.flatten()
-                sample_size = min(5, len(flat_dq))
-                dq_sample = [f"{flat_dq[i]:.6f}" for i in range(sample_size)]
-                print(f"dQ sample values: {dq_sample}")
-
-            if hasattr(dk_grad, "flatten"):
-                flat_dk = dk_grad.flatten()
-                sample_size = min(5, len(flat_dk))
-                dk_sample = [f"{flat_dk[i]:.6f}" for i in range(sample_size)]
-                print(f"dK sample values: {dk_sample}")
-
-            if hasattr(dv_grad, "flatten"):
-                flat_dv = dv_grad.flatten()
-                sample_size = min(5, len(flat_dv))
-                dv_sample = [f"{flat_dv[i]:.6f}" for i in range(sample_size)]
-                print(f"dV sample values: {dv_sample}")
-
-            print(f"Gradient shapes: dQ={dq_grad.shape}, dK={dk_grad.shape}, dV={dv_grad.shape}")
-            print(f"=== END {kernel_type}_BWD JAX-AITER DEBUG ===")
 
         return dq_grad, dk_grad, dv_grad, softmax_d, dbias_result
 
