@@ -97,7 +97,6 @@ def load_thin_modules():
         try:
             if module_so.name == "libjax_aiter.so":
                 continue
-            logger.info(f"Loading thin module: {module_so}")
             module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
             _module_handles[module_so.name] = module_handle
             logger.info(f"Loaded thin module: {module_so}")

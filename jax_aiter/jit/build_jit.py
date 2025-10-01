@@ -230,10 +230,10 @@ def patch_aiter_core(core_module, jax_aiter_root):
             d_opt_build_args["extra_ldflags"].extend(
                 [
                     "-Wl,--no-as-needed",
-                    f"-L{core_module.JA_ROOT_DIR}/build/bin",
+                    f"-L{core_module.JA_ROOT_DIR}/build/aiter_build",
                     "-ljax_aiter",
                     "-Wl,--as-needed",
-                    "-Wl,-rpath,'$ORIGIN/../bin'",
+                    "-Wl,-rpath,'$ORIGIN'",
                     "-Wl,--enable-new-dtags",
                 ]
             )
