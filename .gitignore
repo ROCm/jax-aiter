@@ -75,3 +75,5 @@ hipify_output_dict_dump.txt
 # Misc.
 .DS_Store
 Thumbs.db
+jax_aiter/_hsa/
+jax_aiter/_lib/

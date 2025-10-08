@@ -14,33 +14,21 @@ import jax.numpy as jnp
 
 from ..ja_compat import dtypes
 from ..ja_compat.tuning import get_ASMGEMM_config
-from ..ffi.registry import get_lib_handle
+from ..ffi.registry import register_ffi_target
 
 log = logging.getLogger("aiter.asm.a8w8")
-
-_LIB = None
-_FFI_REGISTERED = False
 
 
 def _ensure_lib_loaded():
     """Lazy load the library and register FFI target when first needed."""
-    global _LIB, _FFI_REGISTERED
-    if _LIB is None:
-        _LIB = get_lib_handle()
-    if not _FFI_REGISTERED:
-        jax.ffi.register_ffi_target(
-            "asm_gemm_a8w8_bridge",
-            jax.ffi.pycapsule(_LIB.GemmA8W8),
-            platform="ROCM",
-        )
-        _FFI_REGISTERED = True
+    register_ffi_target("GemmA8W8JA", "ROCM")
 
 
 @lru_cache(maxsize=None)
 def _cached_jitted_call(out_shape, out_dtype, sub_m, sub_n, splitK):
     """Create ffi_call + JIT once per signature."""
     call = jax.ffi.ffi_call(
-        "asm_gemm_a8w8_bridge",
+        "GemmA8W8JA",
         jax.ShapeDtypeStruct(out_shape, out_dtype),
         vmap_method="broadcast_all",
     )

@@ -59,10 +59,17 @@ ffi::Error MhaBwd_Bridge(
     std::optional<ffi::AnyBuffer> rng_state_,
     std::optional<ffi::AnyBuffer> gen_, ffi::Result<ffi::AnyBuffer> dq_ret,
     ffi::Result<ffi::AnyBuffer> dk_ret, ffi::Result<ffi::AnyBuffer> dv_ret,
-    ffi::Result<ffi::AnyBuffer> softmax_d_ret, double dropout_p,
-    double softmax_scale, bool is_causal, int window_size_left,
+    ffi::Result<ffi::AnyBuffer> softmax_d_ret, float dropout_p,
+    float softmax_scale, bool is_causal, int window_size_left,
     int window_size_right, bool deterministic) {
+  if (!q.untyped_data() || !k.untyped_data() || !v.untyped_data()) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                      "Required input buffer (q/k/v) is null");
+  }
+
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
+  if (dev_idx < 0)
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "bad device from q");
 
   auto dout_tensor = ::jax_aiter::wrap_any_buffer(dout, dev_idx);
   auto q_tensor = ::jax_aiter::wrap_any_buffer(q, dev_idx);
@@ -131,63 +138,84 @@ ffi::Error MhaBwd_Bridge(
     impl->set_current_seed(seed);
     impl->set_offset(offset);
     gen_opt = gen;
-    JA_LOG("[ck_mha_bwd] Using generator with seed: %llu, offset: %llu", seed,
-           offset);
   }
 
+  std::vector<at::Tensor> results;
   try {
     // PyTorch function writes directly to the provided output buffers
     // and returns { dq, dk, dv, softmax_d }.
-    auto results =
-        aiter::torch_itfs::mha_bwd(dout_tensor,        // dout
-                                   q_tensor,           // q
-                                   k_tensor,           // k
-                                   v_tensor,           // v
-                                   out_tensor,         // out
-                                   softmax_lse_tensor, // softmax_lse
-                                   dropout_p,          // dropout_p
-                                   softmax_scale,      // softmax_scale
-                                   is_causal,          // is_causal
-                                   window_size_left,   // window_size_left
-                                   window_size_right,  // window_size_right
-                                   deterministic,      // deterministic
-                                   dq_tensor,          // dq_
-                                   dk_tensor,          // dk_
-                                   dv_tensor,          // dv_
-                                   dbias_tensor,       // dbias_
-                                   bias_opt,           // bias_
-                                   alibi_slopes_opt,   // alibi_slopes_
-                                   rng_state_opt,      // rng_state_
-                                   gen_opt             // gen_
-        );
-    // Copy results back to JAX output buffers
-    // results = { dq, dk, dv, softmax_d }.
-    if (results.size() >= 4) {
-      // Wrap JAX output buffers as PyTorch tensors for copying.
-      auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq_ret, dev_idx);
-
-      // Copy tensor results.
-      dq_tensor.copy_(results[0], /*non_blocking=*/true);
-
-      if (results[1].numel() > 0) {
-        auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk_ret, dev_idx);
-        dk_tensor.copy_(results[1], /*non_blocking=*/true);
-      }
-      if (results[2].numel() > 0) {
-        auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv_ret, dev_idx);
-        dv_tensor.copy_(results[2], /*non_blocking=*/true);
-      }
-      if (results[3].numel() > 0) {
-        auto softmax_d_tensor =
-            ::jax_aiter::wrap_any_buffer(*softmax_d_ret, dev_idx);
-        softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
-      }
-    }
-
-    return ffi::Error::Success();
+    results = aiter::torch_itfs::mha_bwd(dout_tensor,        // dout
+                                         q_tensor,           // q
+                                         k_tensor,           // k
+                                         v_tensor,           // v
+                                         out_tensor,         // out
+                                         softmax_lse_tensor, // softmax_lse
+                                         dropout_p,          // dropout_p
+                                         softmax_scale,      // softmax_scale
+                                         is_causal,          // is_causal
+                                         window_size_left,   // window_size_left
+                                         window_size_right, // window_size_right
+                                         deterministic,     // deterministic
+                                         dq_tensor,         // dq_
+                                         dk_tensor,         // dk_
+                                         dv_tensor,         // dv_
+                                         dbias_tensor,      // dbias_
+                                         bias_opt,          // bias_
+                                         alibi_slopes_opt,  // alibi_slopes_
+                                         rng_state_opt,     // rng_state_
+                                         gen_opt            // gen_
+    );
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("fmha_v3_fwd PyTorch error: ") +
+                          e.what_without_backtrace());
   } catch (const std::exception &e) {
-    return ffi::Error(ffi::ErrorCode::kInternal, e.what());
+    const char *what_msg = e.what();
+    std::fprintf(stderr,
+                 "[FMHA_FWD] Exception caught - type: %s, message: %s\n",
+                 typeid(e).name(), what_msg ? what_msg : "null");
+    std::fflush(stderr);
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("fmha_v3_fwd: ") +
+                          (what_msg ? what_msg : "unknown error"));
   }
+
+  if (results.size() < 4) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      "Kernel returned insufficient results");
+  }
+
+  // Copy results back to JAX output buffers
+  // results = { dq, dk, dv, softmax_d }.
+  try {
+    // Wrap JAX output buffers as PyTorch tensors for copying.
+    auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq_ret, dev_idx);
+    dq_tensor.copy_(results[0], /*non_blocking=*/true);
+
+    if (results[1].numel() > 0) {
+      auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk_ret, dev_idx);
+      dk_tensor.copy_(results[1], /*non_blocking=*/true);
+    }
+    if (results[2].numel() > 0) {
+      auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv_ret, dev_idx);
+      dv_tensor.copy_(results[2], /*non_blocking=*/true);
+    }
+    if (results[3].numel() > 0) {
+      auto softmax_d_tensor =
+          ::jax_aiter::wrap_any_buffer(*softmax_d_ret, dev_idx);
+      softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
+    }
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy PyTorch error: ") +
+                          e.what_without_backtrace());
+  } catch (const std::exception &e) {
+    const char *what_msg = e.what();
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy failed: ") +
+                          (what_msg ? what_msg : "unknown error"));
+  }
+  return ffi::Error::Success();
 }
 
 } // namespace jax_aiter
@@ -215,8 +243,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(MhaBwdJA, jax_aiter::MhaBwd_Bridge,
                                   .Ret<ffi::AnyBuffer>() // dk_ret
                                   .Ret<ffi::AnyBuffer>() // dv_ret
                                   .Ret<ffi::AnyBuffer>() // softmax_d_ret
-                                  .Attr<double>("dropout_p")
-                                  .Attr<double>("softmax_scale")
+                                  .Attr<float>("dropout_p")
+                                  .Attr<float>("softmax_scale")
                                   .Attr<bool>("is_causal")
                                   .Attr<int>("window_size_left")
                                   .Attr<int>("window_size_right")

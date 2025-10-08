@@ -60,7 +60,14 @@ ffi::Error FmhaV3Bwd_Bridge(
     float dropout_p, float softmax_scale, bool is_causal, int window_size_left,
     int window_size_right, bool deterministic, bool is_v3_atomic_fp32,
     int how_v3_bf16_cvt) {
+  if (!q.untyped_data() || !k.untyped_data() || !v.untyped_data()) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                      "Required input buffer (q/k/v) is null");
+  }
+
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
+  if (dev_idx < 0)
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "bad device from q");
 
   // Wrap input tensors.
   auto dout_tensor = ::jax_aiter::wrap_any_buffer(dout, dev_idx);
@@ -126,8 +133,9 @@ ffi::Error FmhaV3Bwd_Bridge(
     JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
   }
 
+  std::vector<at::Tensor> results;
   try {
-    auto results = aiter::torch_itfs::fmha_v3_bwd(
+    results = aiter::torch_itfs::fmha_v3_bwd(
         dout_tensor,        // dout: [b, sq, hq, d_v]
         q_tensor,           // q: [b, sq, hq, d]
         k_tensor,           // k: [b, sk, hk, d]
@@ -149,36 +157,60 @@ ffi::Error FmhaV3Bwd_Bridge(
         rng_state_opt,      // rng_state_ (optional)
         gen_opt             // gen_ (optional generator)
     );
-
-    // Copy results back to JAX output buffers.
-    // Results: {dq, dk, dv, softmax_d}.
-    if (results.size() >= 4) {
-      try {
-        // Wrap JAX output buffers as PyTorch tensors.
-        JA_LOG("Wrapping backward output buffers");
-        auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq, dev_idx);
-        auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk, dev_idx);
-        auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv, dev_idx);
-        auto softmax_d_tensor =
-            ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
-
-        // Copy gradient tensors to output buffers.
-        dq_tensor.copy_(results[0], /*non_blocking=*/true);
-        dk_tensor.copy_(results[1], /*non_blocking=*/true);
-        dv_tensor.copy_(results[2], /*non_blocking=*/true);
-        softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
-
-        JA_LOG("Successfully copied all backward gradients");
-      } catch (const std::exception &e) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          std::string("Output buffer wrapping failed: ") +
-                              e.what());
-      }
-    }
-    return ffi::Error::Success();
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("fmha_v3_fwd PyTorch error: ") +
+                          e.what_without_backtrace());
   } catch (const std::exception &e) {
-    return ffi::Error(ffi::ErrorCode::kInternal, e.what());
+    const char *what_msg = e.what();
+    std::fprintf(stderr,
+                 "[FMHA_FWD] Exception caught - type: %s, message: %s\n",
+                 typeid(e).name(), what_msg ? what_msg : "null");
+    std::fflush(stderr);
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("fmha_v3_fwd: ") +
+                          (what_msg ? what_msg : "unknown error"));
   }
+
+  if (results.size() < 4) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      "Kernel returned insufficient results");
+  }
+
+  // Copy results back to JAX output buffers.
+  // Results: {dq, dk, dv, softmax_d}.
+  try {
+    // Wrap JAX output buffers as PyTorch tensors.
+    auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq, dev_idx);
+
+    dq_tensor.copy_(results[0], /*non_blocking=*/true);
+
+    // Copy gradient tensors to output buffers.
+    if (results[1].numel() > 0) {
+      auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk, dev_idx);
+      dk_tensor.copy_(results[1], /*non_blocking=*/true);
+    }
+
+    if (results[2].numel() > 0) {
+      auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv, dev_idx);
+      dv_tensor.copy_(results[2], /*non_blocking=*/true);
+    }
+
+    if (results[3].numel() > 0) {
+      auto softmax_d_tensor = ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
+      softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
+    }
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy PyTorch error: ") +
+                          e.what_without_backtrace());
+  } catch (const std::exception &e) {
+    const char *what_msg = e.what();
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy failed: ") +
+                          (what_msg ? what_msg : "unknown error"));
+  }
+  return ffi::Error::Success();
 }
 
 } // namespace jax_aiter

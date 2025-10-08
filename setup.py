@@ -11,8 +11,10 @@ README_FILE = THIS_DIR / "README.md"
 README = README_FILE.read_text(encoding="utf-8") if README_FILE.exists() else ""
 
 PKG_LIB_DIR = Path("jax_aiter/_lib")
+PKG_HSA_DIR = Path("jax_aiter/_hsa")
 # many .so files; we'll exclude aiter_build/build/**
 SO_DIR = Path("build/aiter_build")
+HSA_DIR = Path("third_party/aiter/hsa")
 
 
 def _should_skip(p: Path) -> bool:
@@ -37,10 +39,40 @@ def _copy_libs() -> int:
     return n
 
 
+def _copy_hsa_kernels() -> int:
+    """Copy HSA kernel files (.co) from third_party/aiter/hsa into jax_aiter/_hsa."""
+    if not HSA_DIR.exists():
+        print(f"Warning: HSA directory not found at {HSA_DIR}, skipping kernel copy")
+        return 0
+
+    PKG_HSA_DIR.mkdir(parents=True, exist_ok=True)
+    n = 0
+
+    # Copy the entire hsa directory structure.
+    for item in HSA_DIR.rglob("*"):
+        if item.is_file():
+            # Calculate relative path from HSA_DIR.
+            rel_path = item.relative_to(HSA_DIR)
+            dest_file = PKG_HSA_DIR / rel_path
+
+            # Create parent directories if needed.
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+            # Copy the file.
+            shutil.copy2(item, dest_file)
+            n += 1
+
+    return n
+
+
 class build_py(_build_py):
     def run(self):
-        n = _copy_libs()
-        self.announce(f"Copied {n} .so files into {PKG_LIB_DIR}", level=3)
+        n_libs = _copy_libs()
+        self.announce(f"Copied {n_libs} .so files into {PKG_LIB_DIR}", level=3)
+
+        n_hsa = _copy_hsa_kernels()
+        self.announce(f"Copied {n_hsa} HSA kernel files into {PKG_HSA_DIR}", level=3)
+
         super().run()
 
 
@@ -48,8 +80,16 @@ class develop(_develop):
     """Ensure libs are copied for editable installs too."""
 
     def run(self):
-        n = _copy_libs()
-        self.announce(f"(develop) Copied {n} .so files into {PKG_LIB_DIR}", level=3)
+        n_libs = _copy_libs()
+        self.announce(
+            f"(develop) Copied {n_libs} .so files into {PKG_LIB_DIR}", level=3
+        )
+
+        n_hsa = _copy_hsa_kernels()
+        self.announce(
+            f"(develop) Copied {n_hsa} HSA kernel files into {PKG_HSA_DIR}", level=3
+        )
+
         super().run()
 
 
@@ -72,7 +112,7 @@ setup(
     url="https://github.com/ROCm/jax-aiter.git",
     license="MIT",
     packages=find_packages(include=["jax_aiter", "jax_aiter.*"]),
-    include_package_data=True,  # picks up MANIFEST.in entries for sdist
+    include_package_data=True,  # picks up MANIFEST.in entries for sdist.
     python_requires=">=3.10",
     install_requires=[],
     extras_require={
@@ -80,8 +120,13 @@ setup(
         "examples": ["torch"],
     },
     package_data={
-        # Wheel inclusion: include the copied .so files
-        "jax_aiter": ["_lib/*.so"],
+        # Wheel inclusion: include the copied .so files and HSA kernels.
+        "jax_aiter": [
+            "_lib/*.so",
+            "_hsa/**/*.co",
+            "_hsa/**/*.csv",
+            "_hsa/**/*.py",
+        ],
     },
     cmdclass={
         "build_py": build_py,

@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Tuple, Optional, List
 import os
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -52,20 +53,15 @@ def _empty_tensor(dtype):
 
 def _static_is_zero(x) -> bool:
     """Convert to Python bool for (x == 0) without tracer issues."""
-    return float(x) == 0.0
+    return np.float32(x) == 0.0
 
 
-def _static_bool(x) -> bool:
-    """Safely convert to concrete Python bool."""
-    return True if x is True else False if x is False else False
-
-
-def _static_float(x) -> float:
+def _static_float(x) -> np.float32:
     """Convert to float for static arguments."""
-    return float(x)
+    return np.float32(x)
 
 
-def _static_int(x) -> int:
+def _static_int(x) -> np.int32:
     """Convert to int32 for static arguments."""
     return np.int32(x)
 
@@ -525,11 +521,11 @@ def mha_fwd(
         gen,
         dropout_p=_static_float(dropout_p),
         softmax_scale=_static_float(softmax_scale),
-        is_causal=_static_bool(is_causal),
+        is_causal=is_causal,
         window_size_left=_static_int(window_size_left),
         window_size_right=_static_int(window_size_right),
-        return_softmax_lse=_static_bool(return_softmax_lse),
-        return_dropout_randval=_static_bool(return_dropout_randval),
+        return_softmax_lse=return_softmax_lse,
+        return_dropout_randval=return_dropout_randval,
     )
 
     # Convert tuple to list for consistency.
@@ -593,11 +589,11 @@ def fmha_v3_fwd(
         gen,
         dropout_p=_static_float(dropout_p),
         softmax_scale=_static_float(softmax_scale),
-        is_causal=_static_bool(is_causal),
+        is_causal=is_causal,
         window_size_left=_static_int(window_size_left),
         window_size_right=_static_int(window_size_right),
-        return_softmax_lse=_static_bool(return_softmax_lse),
-        return_dropout_randval=_static_bool(return_dropout_randval),
+        return_softmax_lse=return_softmax_lse,
+        return_dropout_randval=return_dropout_randval,
     )
 
     return list(results)
@@ -681,10 +677,10 @@ def mha_bwd(
         gen,
         dropout_p=_static_float(dropout_p),
         softmax_scale=_static_float(softmax_scale),
-        is_causal=_static_bool(is_causal),
+        is_causal=is_causal,
         window_size_left=_static_int(window_size_left),
         window_size_right=_static_int(window_size_right),
-        deterministic=_static_bool(deterministic),
+        deterministic=deterministic,
     )
 
     return results
@@ -764,11 +760,11 @@ def fmha_v3_bwd(
         gen,
         dropout_p=_static_float(dropout_p),
         softmax_scale=_static_float(softmax_scale),
-        is_causal=_static_bool(is_causal),
+        is_causal=is_causal,
         window_size_left=_static_int(window_size_left),
         window_size_right=_static_int(window_size_right),
-        deterministic=_static_bool(deterministic),
-        is_v3_atomic_fp32=_static_bool(is_v3_atomic_fp32),
+        deterministic=deterministic,
+        is_v3_atomic_fp32=is_v3_atomic_fp32,
         how_v3_bf16_cvt=_static_int(how_v3_bf16_cvt),
     )
 
@@ -792,7 +788,9 @@ def _flash_attn_forward(
     _, seqlen_k, nhead_k, hdim_v = v.shape
 
     # Normalize window sizes for compatibility.
-    window_size_left, window_size_right = _normalize_window_size(window_size_left, window_size_right, seqlen_k)
+    window_size_left, window_size_right = _normalize_window_size(
+        window_size_left, window_size_right, seqlen_k
+    )
 
     # Select optimal kernel based on input constraints.
     can_use_v3 = _can_impl_fmha_v3_fwd(
@@ -993,7 +991,7 @@ def _flash_attn_backward(
 
 
 # Public API functions with custom VJP for autodiff.
-@jax.custom_vjp
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 9, 10, 11))
 def flash_attn_func(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -1009,7 +1007,7 @@ def flash_attn_func(
     return_attn_probs: bool = False,
 ) -> jnp.ndarray:
     """
-    Flash Attention function compatible with standard API.
+    Flash Attention function following canonical JAX custom_vjp pattern.
 
     Args:
         q: Query tensor [batch_size, seqlen, nheads, headdim_q]
@@ -1026,9 +1024,9 @@ def flash_attn_func(
         return_attn_probs: Whether to return attention probabilities
 
     Returns:
-        Output tensor, optionally with lse and attention probabilities
+        Always returns (output, softmax_lse, S_dmask, rng_state) - user extracts what they need.
     """
-    # Set default softmax scale
+    # Set default softmax scale.
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -1045,13 +1043,13 @@ def flash_attn_func(
         pad_v = 8 - head_size_v_og % 8
         v_padded = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad_v)))
 
-    # PARENT-LEVEL NORMALIZATION: Normalize window sizes once here using concrete values
-    # This ensures consistent behavior between forward and backward passes
+    # Normalize window sizes once here using concrete values.
+    # This ensures consistent behavior between forward and backward passes.
     seqlen_k = k_padded.shape[1]
     wl_norm, wr_norm = _normalize_window_size(window_size[0], window_size[1], seqlen_k)
 
     # Call forward kernel with normalized window sizes for consistent behavior
-    out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+    out_padded, softmax_lse, S_dmask, _ = _flash_attn_forward(
         q_padded,
         k_padded,
         v_padded,
@@ -1069,19 +1067,7 @@ def flash_attn_func(
     # Unpad output to original dimensions
     out = out_padded[..., :head_size_v_og]
 
-    # Convert to tracer-safe boolean values for conditional logic
-    safe_return_lse = _static_bool(return_lse)
-    safe_return_attn_probs = _static_bool(return_attn_probs)
-
-    # Return in the format requested by user using safe boolean values
-    if safe_return_lse and safe_return_attn_probs:
-        return (out, softmax_lse, S_dmask)
-    elif safe_return_lse:
-        return (out, softmax_lse)
-    elif safe_return_attn_probs:
-        return (out, S_dmask)
-    else:
-        return out
+    return (out, softmax_lse, S_dmask)
 
 
 def _flash_attn_func_fwd(
@@ -1135,20 +1121,7 @@ def _flash_attn_func_fwd(
     )
 
     out = out_padded[..., :head_size_v_og]
-
-    # Convert to tracer-safe boolean values for conditional logic.
-    safe_return_lse = _static_bool(return_lse)
-    safe_return_attn_probs = _static_bool(return_attn_probs)
-
-    # Prepare return value based on user requirements using safe boolean values.
-    if safe_return_lse and safe_return_attn_probs:
-        result = (out, softmax_lse, S_dmask)
-    elif safe_return_lse:
-        result = (out, softmax_lse)
-    elif safe_return_attn_probs:
-        result = (out, S_dmask)
-    else:
-        result = out
+    result = (out, softmax_lse, S_dmask)
 
     # Residuals needed for backward pass.
     residuals = (
@@ -1172,8 +1145,21 @@ def _flash_attn_func_fwd(
     return result, residuals
 
 
-def _flash_attn_func_bwd(residuals, grad_outputs):
-    """Backward pass using residuals and output gradients."""
+def _flash_attn_func_bwd(
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size,
+    deterministic,
+    return_lse,
+    return_attn_probs,
+    residuals,
+    grad_outputs,
+):
+    """Backward pass using residuals and output gradients.
+
+    Note: With nondiff_argnums, non-differentiable arguments come first in the signature.
+    """
     (
         q_padded,
         k_padded,
@@ -1237,20 +1223,13 @@ def _flash_attn_func_bwd(residuals, grad_outputs):
     # Handle bias gradient - now properly extracted from backward kernel
     dbias = dbias_grad  # Already computed by the appropriate kernel
 
-    # Return gradients for all inputs (None for non-differentiable params)
+    # Return gradients for differentiable inputs only: q, k, v, softmax_scale, bias, alibi_slopes
     return (
-        dq,  # q
-        dk,  # k
-        dv,  # v
-        None,  # dropout_p
-        None,  # softmax_scale
-        None,  # causal
-        None,  # window_size
-        dbias,  # bias
-        None,  # alibi_slopes
-        None,  # deterministic
-        None,  # return_lse
-        None,  # return_attn_probs
+        dq,  # q (index 0)
+        dk,  # k (index 1)
+        dv,  # v (index 2)
+        dbias,  # bias (index 7)
+        None,  # alibi_slopes (index 8) - typically no gradient needed
     )
 
 

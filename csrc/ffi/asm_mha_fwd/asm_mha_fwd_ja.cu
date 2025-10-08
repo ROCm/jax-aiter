@@ -45,9 +45,16 @@ ffi::Error FmhaV3Fwd_Bridge(
     std::optional<ffi::AnyBuffer> gen_, ffi::Result<ffi::AnyBuffer> o,
     ffi::Result<ffi::AnyBuffer> lse, ffi::Result<ffi::AnyBuffer> p,
     ffi::Result<ffi::AnyBuffer> rng_state, float dropout_p, float softmax_scale,
-    bool is_causal, int64_t window_size_left, int64_t window_size_right,
+    bool is_causal, int window_size_left, int window_size_right,
     bool return_softmax_lse, bool return_dropout_randval) {
+  if (!q.untyped_data() || !k.untyped_data() || !v.untyped_data()) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                      "Required input buffer (q/k/v) is null");
+  }
+
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
+  if (dev_idx < 0)
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "bad device from q");
 
   // Wrap input tensors.
   auto q_tensor = ::jax_aiter::wrap_any_buffer(q, dev_idx);
@@ -98,8 +105,9 @@ ffi::Error FmhaV3Fwd_Bridge(
     JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
   }
 
+  std::vector<at::Tensor> results;
   try {
-    auto results = aiter::torch_itfs::fmha_v3_fwd(
+    results = aiter::torch_itfs::fmha_v3_fwd(
         q_tensor,               // q: [b, sq, hq, d]
         k_tensor,               // k: [b, sk, hk, d]
         v_tensor,               // v: [b, sk, hk, d_v]
@@ -115,44 +123,62 @@ ffi::Error FmhaV3Fwd_Bridge(
         alibi_slopes_opt,       // alibi_slopes_ (optional)
         gen_opt                 // gen_ (optional generator)
     );
-
-    // Copy results back to JAX output buffers.
-    // Results: {out, softmax_lse, p, rng_state}.
-    if (results.size() >= 4) {
-      try {
-        // Wrap JAX output buffers as PyTorch tensors.
-        auto o_tensor = ::jax_aiter::wrap_any_buffer(*o, dev_idx);
-
-        // Copy main outputs.
-        o_tensor.copy_(results[0], /*non_blocking=*/true);
-
-        // Only copy LSE if requested (and if result has valid data)
-        if (return_softmax_lse && results[1].numel() > 0) {
-          auto lse_tensor = ::jax_aiter::wrap_any_buffer(*lse, dev_idx);
-          lse_tensor.copy_(results[1], /*non_blocking=*/true);
-        }
-
-        // Copy optional dropout mask if valid.
-        if (p->untyped_data() && p->size_bytes() > 0) {
-          auto p_tensor = ::jax_aiter::wrap_any_buffer(*p, dev_idx);
-          p_tensor.copy_(results[2], /*non_blocking=*/true);
-        }
-
-        // Copy RNG state if valid.
-        if (rng_state->untyped_data() && rng_state->size_bytes() > 0) {
-          auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
-          rng_tensor.copy_(results[3], /*non_blocking=*/true);
-        }
-      } catch (const std::exception &e) {
-        return ffi::Error(ffi::ErrorCode::kInternal,
-                          std::string("Output buffer wrapping failed: ") +
-                              e.what());
-      }
-    }
-    return ffi::Error::Success();
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("fmha_v3_fwd PyTorch error: ") +
+                          e.what_without_backtrace());
   } catch (const std::exception &e) {
-    return ffi::Error(ffi::ErrorCode::kInternal, e.what());
+    const char *what_msg = e.what();
+    std::fprintf(stderr,
+                 "[FMHA_FWD] Exception caught - type: %s, message: %s\n",
+                 typeid(e).name(), what_msg ? what_msg : "null");
+    std::fflush(stderr);
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("fmha_v3_fwd: ") +
+                          (what_msg ? what_msg : "unknown error"));
   }
+
+  if (results.size() < 4) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      "Kernel returned insufficient results");
+  }
+  // Copy results back to JAX output buffers.
+  // Results: {out, softmax_lse, p, rng_state}.
+  try {
+    // Wrap JAX output buffers as PyTorch tensors.
+    auto o_tensor = ::jax_aiter::wrap_any_buffer(*o, dev_idx);
+
+    // Copy main outputs.
+    o_tensor.copy_(results[0], /*non_blocking=*/true);
+
+    // Only copy LSE if requested (and if result has valid data)
+    if (return_softmax_lse && results[1].numel() > 0) {
+      auto lse_tensor = ::jax_aiter::wrap_any_buffer(*lse, dev_idx);
+      lse_tensor.copy_(results[1], /*non_blocking=*/true);
+    }
+
+    // Copy optional dropout mask if valid.
+    if (return_dropout_randval && results[2].numel() > 0) {
+      auto p_tensor = ::jax_aiter::wrap_any_buffer(*p, dev_idx);
+      p_tensor.copy_(results[2], /*non_blocking=*/true);
+    }
+
+    // Copy RNG state if valid.
+    if (results.size() > 3 && results[3].numel() > 0) {
+      auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
+      rng_tensor.copy_(results[3], /*non_blocking=*/true);
+    }
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy PyTorch error: ") +
+                          e.what_without_backtrace());
+  } catch (const std::exception &e) {
+    const char *what_msg = e.what();
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy failed: ") +
+                          (what_msg ? what_msg : "unknown error"));
+  }
+  return ffi::Error::Success();
 }
 
 } // namespace jax_aiter

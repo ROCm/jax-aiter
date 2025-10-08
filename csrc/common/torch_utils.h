@@ -122,6 +122,10 @@ template <typename T>
 inline at::Tensor
 wrap_buffer(void *data, at::IntArrayRef shape, at::IntArrayRef strides,
             int device_idx = current_device(), bool requires_grad = false) {
+  if (!data) {
+    throw std::runtime_error("wrap_buffer: null data pointer");
+  }
+
   auto opts = at::TensorOptions()
                   .dtype(torch_dtype<T>())
                   .device(at::kCUDA, device_idx)
@@ -178,13 +182,9 @@ inline at::Tensor wrap_any_buffer(xla::ffi::AnyBuffer buffer,
                   .device(at::kCUDA, device_idx)
                   .requires_grad(requires_grad);
 
-  try {
-    // Non-owning tensor - null deleter.
-    return at::from_blob(
-        buffer.untyped_data(), shape, strides, [](void *) {}, opts);
-  } catch (const std::exception &e) {
-    throw;
-  }
+  // Non-owning tensor - null deleter.
+  return at::from_blob(
+      buffer.untyped_data(), shape, strides, [](void *) {}, opts);
 }
 
 // Creates tensor from XLA buffer with explicit shape override.
@@ -192,6 +192,10 @@ inline at::Tensor wrap_any_buffer(xla::ffi::AnyBuffer buffer,
                                   at::IntArrayRef shape,
                                   int device_idx = current_device(),
                                   bool requires_grad = false) {
+  if (!buffer.untyped_data()) {
+    throw std::runtime_error("wrap_any_buffer: null buffer data");
+  }
+
   auto strides = compute_row_major_strides(shape);
   auto torch_dtype = xla_to_torch_dtype(buffer.element_type());
 
@@ -211,6 +215,10 @@ inline at::Tensor wrap_any_buffer(xla::ffi::AnyBuffer buffer,
                                   at::IntArrayRef strides,
                                   int device_idx = current_device(),
                                   bool requires_grad = false) {
+  if (!buffer.untyped_data()) {
+    throw std::runtime_error("wrap_any_buffer: null buffer data");
+  }
+
   auto torch_dtype = xla_to_torch_dtype(buffer.element_type());
 
   auto opts = at::TensorOptions()
