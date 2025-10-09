@@ -59,6 +59,7 @@ coverage.xml
 build/
 third_party/*
 !third_party/aiter
+!third_party/pytorch
 
 # Python cache.
 __pycache__/
