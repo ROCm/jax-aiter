@@ -53,15 +53,15 @@ ffi::Error MhaBwd_Bridge(
     std::optional<ffi::AnyBuffer> dq_,           // [b, sq, hq, d]
     std::optional<ffi::AnyBuffer> dk_,           // [b, sk, hk, d]
     std::optional<ffi::AnyBuffer> dv_,           // [b, sk, hk, d]
-    std::optional<ffi::AnyBuffer> dbias_,        // [sq, sk]
     std::optional<ffi::AnyBuffer> bias_,         // [sq, sk]
     std::optional<ffi::AnyBuffer> alibi_slopes_, // [hq] or [b, hq]
     std::optional<ffi::AnyBuffer> rng_state_,
     std::optional<ffi::AnyBuffer> gen_, ffi::Result<ffi::AnyBuffer> dq_ret,
     ffi::Result<ffi::AnyBuffer> dk_ret, ffi::Result<ffi::AnyBuffer> dv_ret,
-    ffi::Result<ffi::AnyBuffer> softmax_d_ret, float dropout_p,
-    float softmax_scale, bool is_causal, int window_size_left,
-    int window_size_right, bool deterministic) {
+    ffi::Result<ffi::AnyBuffer> softmax_d_ret,
+    ffi::Result<ffi::AnyBuffer> dbias_, float dropout_p, float softmax_scale,
+    bool is_causal, int window_size_left, int window_size_right,
+    bool deterministic) {
   if (!q.untyped_data() || !k.untyped_data() || !v.untyped_data()) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                       "Required input buffer (q/k/v) is null");
@@ -77,6 +77,11 @@ ffi::Error MhaBwd_Bridge(
   auto v_tensor = ::jax_aiter::wrap_any_buffer(v, dev_idx);
   auto out_tensor = ::jax_aiter::wrap_any_buffer(out, dev_idx);
   auto softmax_lse_tensor = ::jax_aiter::wrap_any_buffer(softmax_lse, dev_idx);
+
+  std::optional<at::Tensor> dbias_tensor = std::nullopt;
+  if (dbias_->size_bytes() > 0) {
+    dbias_tensor = ::jax_aiter::wrap_any_buffer(*dbias_, dev_idx);
+  }
 
   const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
       device_of(q_tensor));
@@ -99,11 +104,6 @@ ffi::Error MhaBwd_Bridge(
   std::optional<at::Tensor> dv_tensor = std::nullopt;
   if (dv_.has_value() && dv_->size_bytes() > 0) {
     dv_tensor = ::jax_aiter::wrap_any_buffer(*dv_, dev_idx);
-  }
-
-  std::optional<at::Tensor> dbias_tensor = std::nullopt;
-  if (dbias_.has_value() && dbias_->size_bytes() > 0) {
-    dbias_tensor = ::jax_aiter::wrap_any_buffer(*dbias_, dev_idx);
   }
 
   std::optional<const at::Tensor> bias_opt =
@@ -234,7 +234,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(MhaBwdJA, jax_aiter::MhaBwd_Bridge,
                                   .Arg<ffi::AnyBuffer>() // dq_
                                   .Arg<ffi::AnyBuffer>() // dk_
                                   .Arg<ffi::AnyBuffer>() // dv_
-                                  .Arg<ffi::AnyBuffer>() // dbias_
                                   .Arg<ffi::AnyBuffer>() // bias_
                                   .Arg<ffi::AnyBuffer>() // alibi_slopes_
                                   .Arg<ffi::AnyBuffer>() // rng_state_
@@ -243,6 +242,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(MhaBwdJA, jax_aiter::MhaBwd_Bridge,
                                   .Ret<ffi::AnyBuffer>() // dk_ret
                                   .Ret<ffi::AnyBuffer>() // dv_ret
                                   .Ret<ffi::AnyBuffer>() // softmax_d_ret
+                                  .Ret<ffi::AnyBuffer>() // dbias_
                                   .Attr<float>("dropout_p")
                                   .Attr<float>("softmax_scale")
                                   .Attr<bool>("is_causal")
