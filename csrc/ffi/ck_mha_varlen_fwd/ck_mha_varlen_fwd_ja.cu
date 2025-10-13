@@ -52,17 +52,15 @@ ffi::Error MhaVarlenFwd_Bridge(
     std::optional<ffi::AnyBuffer> block_table,  // [hq] or [b, hq] (optional)
     std::optional<ffi::AnyBuffer> bias, // [total_q, max_seqlen_k] (optional)
     std::optional<ffi::AnyBuffer> alibi_slopes, // [hq] or [b, hq] (optional)
-    std::optional<ffi::AnyBuffer> gen,           // generator (optional)
+    std::optional<ffi::AnyBuffer> gen,          // generator (optional)
     ffi::Result<ffi::AnyBuffer> out,            // [total_q, hq, d]
     ffi::Result<ffi::AnyBuffer> softmax_lse,    // [hq, total_q]
     ffi::Result<ffi::AnyBuffer> p, // [hq, total_q, max_seqlen_k] (dropout mask)
     ffi::Result<ffi::AnyBuffer> rng_state, // [2]
-    int max_seqlen_q, int max_seqlen_k, int min_seqlen_q,
-    double p_dropout, double softmax_scale, double logits_soft_cap,
-    bool zero_tensors, bool is_causal, int window_size_left,
-    int window_size_right, bool return_softmax_lse,
-    bool return_dropout_randval
-) {
+    int max_seqlen_q, int max_seqlen_k, int min_seqlen_q, float p_dropout,
+    float softmax_scale, float logits_soft_cap, bool zero_tensors,
+    bool is_causal, int window_size_left, int window_size_right,
+    bool return_softmax_lse, bool return_dropout_randval) {
   // Get device index for tensor creation.
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
 
@@ -128,65 +126,89 @@ ffi::Error MhaVarlenFwd_Bridge(
     gen_opt = gen_torch;
   }
 
+  std::vector<at::Tensor> results;
   try {
-    // Call the aiter MHA varlen forward PyTorch kernel with exact signature
-    // match
-    auto results = aiter::torch_itfs::mha_varlen_fwd(
-        q_tensor,                            // q: [total_q, hq, d]
-        k_tensor,                            // k: [total_k, hk, d]
-        v_tensor,                            // v: [total_k, hk, d]
-        cu_seqlens_q_tensor,                 // cu_seqlens_q: [b+1]
-        cu_seqlens_k_opt,                    // cu_seqlens_k: [b+1] (optional)
-        max_seqlen_q,                        // max_seqlen_q
-        max_seqlen_k,                        // max_seqlen_k
-        min_seqlen_q,                        // min_seqlen_q
-        p_dropout,                           // p_dropout
-        softmax_scale,                       // softmax_scale
-        logits_soft_cap,                     // logits_soft_cap
-        zero_tensors,                        // zero_tensors
-        is_causal,                           // is_causal
-        window_size_left,                    // window_size_left
-        window_size_right,                   // window_size_right
-        return_softmax_lse,                  // return_softmax_lse
-        return_dropout_randval,              // return_dropout_randval
-        out_provided_opt, // out_ (optional pre-allocated output)
-        block_table_opt,  // block_table_ (optional for paged attention)
-        bias_opt,         // bias_ (optional)
-        alibi_slopes_opt, // alibi_slopes_ (optional)
-        gen_opt           // gen_ (optional generator)
+    results = aiter::torch_itfs::mha_varlen_fwd(
+        q_tensor,               // q: [total_q, hq, d]
+        k_tensor,               // k: [total_k, hk, d]
+        v_tensor,               // v: [total_k, hk, d]
+        cu_seqlens_q_tensor,    // cu_seqlens_q: [b+1]
+        cu_seqlens_k_opt,       // cu_seqlens_k: [b+1] (optional)
+        max_seqlen_q,           // max_seqlen_q
+        max_seqlen_k,           // max_seqlen_k
+        min_seqlen_q,           // min_seqlen_q
+        p_dropout,              // p_dropout
+        softmax_scale,          // softmax_scale
+        logits_soft_cap,        // logits_soft_cap
+        zero_tensors,           // zero_tensors
+        is_causal,              // is_causal
+        window_size_left,       // window_size_left
+        window_size_right,      // window_size_right
+        return_softmax_lse,     // return_softmax_lse
+        return_dropout_randval, // return_dropout_randval
+        out_provided_opt,       // out_ (optional pre-allocated output)
+        block_table_opt,        // block_table_ (optional for paged attention)
+        bias_opt,               // bias_ (optional)
+        alibi_slopes_opt,       // alibi_slopes_ (optional)
+        gen_opt                 // gen_ (optional generator)
     );
-
-    // Copy results back to JAX output buffers
-    // results = {out, softmax_lse, p, rng_state}.
-    if (results.size() >= 4) {
-      // Create output tensor views for copying results back.
-      auto out_tensor = ::jax_aiter::wrap_any_buffer(*out, dev_idx);
-
-      // Always copy main output
-      out_tensor.copy_(results[0], /*non_blocking=*/true);
-
-      // Only copy LSE if requested (and if result has valid data)
-      if (return_softmax_lse && results[1].numel() > 0) {
-        auto lse_tensor = ::jax_aiter::wrap_any_buffer(*softmax_lse, dev_idx);
-        lse_tensor.copy_(results[1], /*non_blocking=*/true);
-      }
-
-      // Only copy dropout mask if requested and valid
-      if (return_dropout_randval && results[2].numel() > 0) {
-        auto p_tensor = ::jax_aiter::wrap_any_buffer(*p, dev_idx);
-        p_tensor.copy_(results[2], /*non_blocking=*/true);
-      }
-
-      // Copy RNG state if valid
-      if (results[3].numel() > 0) {
-        auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
-        rng_tensor.copy_(results[3], /*non_blocking=*/true);
-      }
-    }
-    return ffi::Error::Success();
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("mha_varlen_fwd PyTorch error: ") +
+                          e.what_without_backtrace());
   } catch (const std::exception &e) {
-    return ffi::Error(ffi::ErrorCode::kInternal, e.what());
+    const char *what_msg = e.what();
+    std::fprintf(stderr,
+                 "[mha_varlen_fwd] Exception caught - type: %s, message: %s\n",
+                 typeid(e).name(), what_msg ? what_msg : "null");
+    std::fflush(stderr);
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("mha_varlen_fwd: ") +
+                          (what_msg ? what_msg : "unknown error"));
   }
+
+  if (results.size() < 4) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      "Kernel returned insufficient results");
+  }
+
+  // Copy results back to JAX output buffers
+  // results = {out, softmax_lse, p, rng_state}.
+  try {
+    // Create output tensor views for copying results back.
+    auto out_tensor = ::jax_aiter::wrap_any_buffer(*out, dev_idx);
+
+    // Always copy main output
+    out_tensor.copy_(results[0], /*non_blocking=*/true);
+
+    // Only copy LSE if requested (and if result has valid data)
+    if (return_softmax_lse && results[1].numel() > 0) {
+      auto lse_tensor = ::jax_aiter::wrap_any_buffer(*softmax_lse, dev_idx);
+      lse_tensor.copy_(results[1], /*non_blocking=*/true);
+    }
+
+    // Only copy dropout mask if requested and valid
+    if (return_dropout_randval && results[2].numel() > 0) {
+      auto p_tensor = ::jax_aiter::wrap_any_buffer(*p, dev_idx);
+      p_tensor.copy_(results[2], /*non_blocking=*/true);
+    }
+
+    // Copy RNG state if valid
+    if (results[3].numel() > 0) {
+      auto rng_tensor = ::jax_aiter::wrap_any_buffer(*rng_state, dev_idx);
+      rng_tensor.copy_(results[3], /*non_blocking=*/true);
+    }
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy PyTorch error: ") +
+                          e.what_without_backtrace());
+  } catch (const std::exception &e) {
+    const char *what_msg = e.what();
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy failed: ") +
+                          (what_msg ? what_msg : "unknown error"));
+  }
+  return ffi::Error::Success();
 }
 
 } // namespace jax_aiter
@@ -202,11 +224,11 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // v: [total_k, hk, d]
         .Arg<ffi::AnyBuffer>() // cu_seqlens_q: [b+1]
         .Arg<ffi::AnyBuffer>() // cu_seqlens_k: [b+1]
-        .Arg<ffi::AnyBuffer>()  // out_provided: [total_q, hq, d] (optional)
-        .Arg<ffi::AnyBuffer>()  // block_table: [hq] or [b, hq] (optional)
-        .Arg<ffi::AnyBuffer>()  // bias: [total_q, max_seqlen_k] (optional)
-        .Arg<ffi::AnyBuffer>()  // alibi_slopes: [hq] or [b, hq] (optional)
-        .Arg<ffi::AnyBuffer>()  // gen: generator (optional)
+        .Arg<ffi::AnyBuffer>() // out_provided: [total_q, hq, d] (optional)
+        .Arg<ffi::AnyBuffer>() // block_table: [hq] or [b, hq] (optional)
+        .Arg<ffi::AnyBuffer>() // bias: [total_q, max_seqlen_k] (optional)
+        .Arg<ffi::AnyBuffer>() // alibi_slopes: [hq] or [b, hq] (optional)
+        .Arg<ffi::AnyBuffer>() // gen: generator (optional)
         .Ret<ffi::AnyBuffer>() // out: [total_q, hq, d]
         .Ret<ffi::AnyBuffer>() // softmax_lse: [hq, total_q]
         .Ret<ffi::AnyBuffer>() // p: [hq, total_q, max_seqlen_k] (dropout mask)
@@ -214,9 +236,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("max_seqlen_q")
         .Attr<int>("max_seqlen_k")
         .Attr<int>("min_seqlen_q")
-        .Attr<double>("p_dropout")
-        .Attr<double>("softmax_scale")
-        .Attr<double>("logits_soft_cap")
+        .Attr<float>("p_dropout")
+        .Attr<float>("softmax_scale")
+        .Attr<float>("logits_soft_cap")
         .Attr<bool>("zero_tensors")
         .Attr<bool>("is_causal")
         .Attr<int>("window_size_left")

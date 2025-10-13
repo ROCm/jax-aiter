@@ -45,28 +45,27 @@ namespace jax_aiter {
 
 ffi::Error MhaVarlenBwd_Bridge(
     hipStream_t stream,
-    ffi::AnyBuffer dout,                   // [total_q, hq, d_v]
-    ffi::AnyBuffer q,                      // [total_q, hq, d_q]
-    ffi::AnyBuffer k,                      // [total_k, hk, d_q]
-    ffi::AnyBuffer v,                      // [total_k, hk, d_v]
-    ffi::AnyBuffer out,                    // [total_q, hq, d_v]
-    ffi::AnyBuffer softmax_lse,            // [b, hq, sq]
-    ffi::AnyBuffer cu_seqlens_q,           // [b+1]
-    ffi::AnyBuffer cu_seqlens_k,           // [b+1]
+    ffi::AnyBuffer dout,               // [total_q, hq, d_v]
+    ffi::AnyBuffer q,                  // [total_q, hq, d_q]
+    ffi::AnyBuffer k,                  // [total_k, hk, d_q]
+    ffi::AnyBuffer v,                  // [total_k, hk, d_v]
+    ffi::AnyBuffer out,                // [total_q, hq, d_v]
+    ffi::AnyBuffer softmax_lse,        // [b, hq, sq]
+    ffi::AnyBuffer cu_seqlens_q,       // [b+1]
+    ffi::AnyBuffer cu_seqlens_k,       // [b+1]
     std::optional<ffi::AnyBuffer> dq_, // [total_q, hq, d_q] (optional)
     std::optional<ffi::AnyBuffer> dk_, // [total_k, hk, d_q] (optional)
     std::optional<ffi::AnyBuffer> dv_, // [total_k, hk, d_v] (optional)
     std::optional<ffi::AnyBuffer> alibi_slopes_, // [hq] or [b, hq] (optional)
     std::optional<ffi::AnyBuffer> rng_state_,    // [2] (optional)
-    std::optional<ffi::AnyBuffer> gen_,           // generator (optional)
-    ffi::Result<ffi::AnyBuffer> dq,        // [total_q, hq, d_q]
-    ffi::Result<ffi::AnyBuffer> dk,        // [total_k, hk, d_q]
-    ffi::Result<ffi::AnyBuffer> dv,        // [total_k, hk, d_v]
-    ffi::Result<ffi::AnyBuffer> softmax_d, // [b, hq, max_seqlen_q]
-    int max_seqlen_q, int max_seqlen_k, double p_dropout,
-    double softmax_scale, bool zero_tensors, bool is_causal,
-    int window_size_left, int window_size_right, bool deterministic
-) {
+    std::optional<ffi::AnyBuffer> gen_,          // generator (optional)
+    ffi::Result<ffi::AnyBuffer> dq,              // [total_q, hq, d_q]
+    ffi::Result<ffi::AnyBuffer> dk,              // [total_k, hk, d_q]
+    ffi::Result<ffi::AnyBuffer> dv,              // [total_k, hk, d_v]
+    ffi::Result<ffi::AnyBuffer> softmax_d,       // [b, hq, max_seqlen_q]
+    int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale,
+    bool zero_tensors, bool is_causal, int window_size_left,
+    int window_size_right, bool deterministic) {
   // Get device index for tensor creation.
   const int dev_idx = ::jax_aiter::device_from_ptr(dout.untyped_data());
 
@@ -137,60 +136,85 @@ ffi::Error MhaVarlenBwd_Bridge(
     gen_opt = gen_torch;
   }
 
+  std::vector<at::Tensor> results;
   try {
     // Call the aiter MHA varlen backward PyTorch kernel with exact signature
     // match
-    auto results = aiter::torch_itfs::mha_varlen_bwd(
-        dout_tensor,                         // dout: [total_q, hq, d_v]
-        q_tensor,                            // q: [total_q, hq, d_q]
-        k_tensor,                            // k: [total_k, hk, d_q]
-        v_tensor,                            // v: [total_k, hk, d_v]
-        out_tensor,                          // out: [total_q, hq, d_v]
-        softmax_lse_tensor,                  // softmax_lse: [b, hq, sq]
-        cu_seqlens_q_tensor,                 // cu_seqlens_q: [b+1]
-        cu_seqlens_k_tensor,                 // cu_seqlens_k: [b+1]
-        max_seqlen_q,                        // max_seqlen_q
-        max_seqlen_k,                        // max_seqlen_k
-        p_dropout,                           // p_dropout
-        softmax_scale,                       // softmax_scale
-        zero_tensors,                        // zero_tensors
-        is_causal,                           // is_causal
-        window_size_left,                    // window_size_left
-        window_size_right,                   // window_size_right
-        deterministic,                       // deterministic
-        dq_provided_opt,                     // dq_ (optional pre-allocated gradient)
-        dk_provided_opt,                     // dk_ (optional pre-allocated gradient)
-        dv_provided_opt,                     // dv_ (optional pre-allocated gradient)
-        alibi_slopes_opt,                    // alibi_slopes_ (optional)
-        rng_state_opt,                       // rng_state_ (optional)
-        gen_opt                              // gen_ (optional generator)
+    results = aiter::torch_itfs::mha_varlen_bwd(
+        dout_tensor,         // dout: [total_q, hq, d_v]
+        q_tensor,            // q: [total_q, hq, d_q]
+        k_tensor,            // k: [total_k, hk, d_q]
+        v_tensor,            // v: [total_k, hk, d_v]
+        out_tensor,          // out: [total_q, hq, d_v]
+        softmax_lse_tensor,  // softmax_lse: [b, hq, sq]
+        cu_seqlens_q_tensor, // cu_seqlens_q: [b+1]
+        cu_seqlens_k_tensor, // cu_seqlens_k: [b+1]
+        max_seqlen_q,        // max_seqlen_q
+        max_seqlen_k,        // max_seqlen_k
+        p_dropout,           // p_dropout
+        softmax_scale,       // softmax_scale
+        zero_tensors,        // zero_tensors
+        is_causal,           // is_causal
+        window_size_left,    // window_size_left
+        window_size_right,   // window_size_right
+        deterministic,       // deterministic
+        dq_provided_opt,     // dq_ (optional pre-allocated gradient)
+        dk_provided_opt,     // dk_ (optional pre-allocated gradient)
+        dv_provided_opt,     // dv_ (optional pre-allocated gradient)
+        alibi_slopes_opt,    // alibi_slopes_ (optional)
+        rng_state_opt,       // rng_state_ (optional)
+        gen_opt              // gen_ (optional generator)
     );
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("mha_varlen_bwd PyTorch error: ") +
+                          e.what_without_backtrace());
+  } catch (const std::exception &e) {
+    const char *what_msg = e.what();
+    std::fprintf(stderr,
+                 "[mha_varlen_bwd] Exception caught - type: %s, message: %s\n",
+                 typeid(e).name(), what_msg ? what_msg : "null");
+    std::fflush(stderr);
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("mha_varlen_bwd: ") +
+                          (what_msg ? what_msg : "unknown error"));
+  }
 
+  if (results.size() < 4) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      "Kernel returned insufficient results");
+  }
+  try {
     // Copy results back to JAX output buffers
     // results = {dq, dk, dv, softmax_d}.
-    if (results.size() >= 4) {
-      auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq, dev_idx);
-      dq_tensor.copy_(results[0], /*non_blocking=*/true); // dq gradient
+    auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq, dev_idx);
+    dq_tensor.copy_(results[0], /*non_blocking=*/true); // dq gradient
 
-      if (results[1].numel() > 0) {
+    if (results[1].numel() > 0) {
       auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk, dev_idx);
       dk_tensor.copy_(results[1], /*non_blocking=*/true); // dk gradient
-      }
+    }
 
-      if (results[2].numel() > 0) {
+    if (results[2].numel() > 0) {
       auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv, dev_idx);
       dv_tensor.copy_(results[2], /*non_blocking=*/true); // dv gradient
-      }
+    }
 
-      if (results[3].numel() > 0) {
+    if (results[3].numel() > 0) {
       auto softmax_d_tensor = ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
       softmax_d_tensor.copy_(results[3], /*non_blocking=*/true); // softmax_d
-      }
     }
-    return ffi::Error::Success();
-    } catch (const std::exception &e) {
-      return ffi::Error(ffi::ErrorCode::kInternal, e.what());
-    }
+  } catch (const c10::Error &e) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy PyTorch error: ") +
+                          e.what_without_backtrace());
+  } catch (const std::exception &e) {
+    const char *what_msg = e.what();
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      std::string("Output copy failed: ") +
+                          (what_msg ? what_msg : "unknown error"));
+  }
+  return ffi::Error::Success();
 }
 
 } // namespace jax_aiter
@@ -209,20 +233,20 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // softmax_lse: [b, hq, sq]
         .Arg<ffi::AnyBuffer>() // cu_seqlens_q: [b+1]
         .Arg<ffi::AnyBuffer>() // cu_seqlens_k: [b+1]
-        .Arg<ffi::AnyBuffer>()  // dq_provided: [total_q, hq, d_q] (optional)
-        .Arg<ffi::AnyBuffer>()  // dk_provided: [total_k, hk, d_q] (optional)
-        .Arg<ffi::AnyBuffer>()  // dv_provided: [total_k, hk, d_v] (optional)
-        .Arg<ffi::AnyBuffer>()  // alibi_slopes: [hq] or [b, hq] (optional)
-        .Arg<ffi::AnyBuffer>()  // rng_state: [2] (optional)
-        .Arg<ffi::AnyBuffer>()  // gen: generator (optional)
+        .Arg<ffi::AnyBuffer>() // dq_provided: [total_q, hq, d_q] (optional)
+        .Arg<ffi::AnyBuffer>() // dk_provided: [total_k, hk, d_q] (optional)
+        .Arg<ffi::AnyBuffer>() // dv_provided: [total_k, hk, d_v] (optional)
+        .Arg<ffi::AnyBuffer>() // alibi_slopes: [hq] or [b, hq] (optional)
+        .Arg<ffi::AnyBuffer>() // rng_state: [2] (optional)
+        .Arg<ffi::AnyBuffer>() // gen: generator (optional)
         .Ret<ffi::AnyBuffer>() // dq: [total_q, hq, d_q]
         .Ret<ffi::AnyBuffer>() // dk: [total_k, hk, d_q]
         .Ret<ffi::AnyBuffer>() // dv: [total_k, hk, d_v]
         .Ret<ffi::AnyBuffer>() // softmax_d: [b, hq, max_seqlen_q]
         .Attr<int>("max_seqlen_q")
         .Attr<int>("max_seqlen_k")
-        .Attr<double>("p_dropout")
-        .Attr<double>("softmax_scale")
+        .Attr<float>("p_dropout")
+        .Attr<float>("softmax_scale")
         .Attr<bool>("zero_tensors")
         .Attr<bool>("is_causal")
         .Attr<int>("window_size_left")

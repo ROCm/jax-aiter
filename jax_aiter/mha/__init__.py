@@ -34,10 +34,7 @@ from .mha import (
     _flash_attn_forward,
     _flash_attn_backward,
     debug_kernel_params,
-    _can_impl_fmha_v3_fwd,
-    _can_impl_fmha_v3_bwd,
     _normalize_window_size,
-    _create_generator_tensor,
 )
 
 # Import variable-length MHA implementation.

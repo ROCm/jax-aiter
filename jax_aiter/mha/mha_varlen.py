@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Tuple, Optional, List
 import os
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -48,14 +49,9 @@ def _empty_tensor(dtype):
     return jnp.zeros((0,), dtype=dtype)
 
 
-def _static_bool(x) -> bool:
-    """Safely convert to concrete Python bool."""
-    return True if x is True else False if x is False else False
-
-
 def _static_float(x) -> float:
     """Convert to float for static arguments."""
-    return float(x)
+    return np.float32(x)
 
 
 def _static_int(x) -> int:
@@ -70,13 +66,6 @@ def _normalize_window_size(
     wl = -1 if window_size_left >= max_seqlen_k else window_size_left
     wr = -1 if window_size_right >= max_seqlen_k else window_size_right
     return wl, wr
-
-
-def _create_generator_tensor(dropout_p: float) -> Optional[jnp.ndarray]:
-    """Create RNG generator tensor for dropout with fixed seed."""
-    if dropout_p <= 0.0:
-        return None
-    return jnp.array([123, np.int64(0)], dtype=jnp.int64)
 
 
 def _cached_mha_varlen_fwd_call(
@@ -148,7 +137,7 @@ def _cached_mha_varlen_fwd_call(
             return_dropout_randval=return_dropout_randval,
         )
 
-        return result 
+        return result
 
     return jax.jit(
         _invoke,
@@ -285,14 +274,14 @@ def mha_varlen_fwd(
     """MHA varlen forward kernel."""
     _ensure_ffi_target_registered("MhaVarlenFwdJA")
 
-    total_q, num_heads, head_size_q = q.shape
-    total_k, num_heads_k, head_size_v = v.shape
+    total_q, num_heads_q, head_size_q = q.shape
+    total_k, _, head_size_v = v.shape
 
-    # Handle optional tensors
+    # Handle optional tensors.
     if cu_seqlens_k is None:
         cu_seqlens_k = _empty_tensor(jnp.int32)
     if out_provided is None:
-        out_provided = _empty_tensor(v.dtype)  # Use v.dtype instead of q.dtype
+        out_provided = _empty_tensor(v.dtype)
     if block_table is None:
         block_table = _empty_tensor(jnp.int32)
     if bias is None:
@@ -302,10 +291,9 @@ def mha_varlen_fwd(
     if gen is None:
         gen = _empty_tensor(jnp.int64)
 
-    # Output shapes for MhaVarlenFwdJA - use AITER's native varlen format
-    out_shape = (total_q, num_heads, head_size_v)
-    softmax_lse_shape = (num_heads, total_q)  # Flat varlen format: [nheads_k, total_q]
-    p_shape = (num_heads, total_q, max_seqlen_k)  # Flat varlen format: [nheads, total_q, max_seqlen_k]
+    out_shape = (total_q, num_heads_q, head_size_v)
+    softmax_lse_shape = (num_heads_q, total_q)
+    p_shape = (num_heads_q, total_q, max_seqlen_k)
     rng_state_shape = (2,)
 
     fn = _cached_mha_varlen_fwd_call(
@@ -333,12 +321,12 @@ def mha_varlen_fwd(
         p_dropout=_static_float(p_dropout),
         softmax_scale=_static_float(softmax_scale),
         logits_soft_cap=_static_float(logits_soft_cap),
-        zero_tensors=_static_bool(zero_tensors),
-        is_causal=_static_bool(is_causal),
+        zero_tensors=zero_tensors,
+        is_causal=is_causal,
         window_size_left=_static_int(window_size_left),
         window_size_right=_static_int(window_size_right),
-        return_softmax_lse=_static_bool(return_softmax_lse),
-        return_dropout_randval=_static_bool(return_dropout_randval),
+        return_softmax_lse=return_softmax_lse,
+        return_dropout_randval=return_dropout_randval,
     )
 
     return list(results)
@@ -424,11 +412,11 @@ def mha_varlen_bwd(
         max_seqlen_k=_static_int(max_seqlen_k),
         p_dropout=_static_float(p_dropout),
         softmax_scale=_static_float(softmax_scale),
-        zero_tensors=_static_bool(zero_tensors),
-        is_causal=_static_bool(is_causal),
+        zero_tensors=zero_tensors,
+        is_causal=is_causal,
         window_size_left=_static_int(window_size_left),
         window_size_right=_static_int(window_size_right),
-        deterministic=_static_bool(deterministic),
+        deterministic=deterministic,
     )
 
     return results
@@ -456,18 +444,32 @@ def _flash_attn_varlen_forward(
     how_v3_bf16_cvt: Optional[int] = 1,
     block_table: Optional[jnp.ndarray] = None,
     out: Optional[jnp.ndarray] = None,
-    zero_tensors: bool = False
+    zero_tensors: bool = False,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Forward pass for varlen attention."""
+    (_, nhead_q, hdim_q) = q.shape
 
-    # Normalize window sizes
-    wl_norm, wr_norm = _normalize_window_size(
-        window_size_left, window_size_right, max_seqlen_k
-    )
+    nhead_k = v.shape[-2]
+    hdim_v = v.shape[-1]
 
-    # Create generator for dropout
-    gen_tensor = _create_generator_tensor(dropout_p)
+    mask = causal == True and window_size_left == -1  # causal mask
+    nmask = (
+        causal == False and window_size_left == -1 and window_size_right == -1
+    )  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
+    def can_impl_fmha_v3_fwd():
+        ret = alibi_slopes is None
+        ret = ret and (bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (hdim_q == hdim_v)
+        ret = ret and (hdim_q == 128)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (q.dtype == dtypes.bf16)
+        return ret
+
+    # if can_impl_fmha_v3_fwd():
     result = mha_varlen_fwd(
         q,
         k,
@@ -482,23 +484,17 @@ def _flash_attn_varlen_forward(
         logits_soft_cap,
         zero_tensors,
         causal,
-        wl_norm,
-        wr_norm,
+        window_size_left,
+        window_size_right,
         return_lse,
         return_softmax,
-        None,  # out_provided
+        out,
         block_table,
         bias,
         alibi_slopes,
-        gen_tensor,
+        None,
     )
 
-    # Extract results: [out, lse_flat, p, rng_state]
-    out_tensor = result[0]
-    lse_flat = result[1]    # [nheads, total_q] - flat varlen format
-    p_tensor = result[2]
-    rng_state = result[3]
-    
     return list(result)
 
 
@@ -533,7 +529,7 @@ def _flash_attn_varlen_backward(
         k,
         v,
         out,
-        softmax_lse_3d,  # Already in 3D format
+        softmax_lse_3d,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
@@ -558,7 +554,7 @@ def _flash_attn_varlen_backward(
 
 
 # Public API functions with custom VJP for autodiff.
-@jax.custom_vjp
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17))
 def flash_attn_varlen(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -583,7 +579,7 @@ def flash_attn_varlen(
 ) -> jnp.ndarray:
     """
     Flash Attention function for variable-length sequences.
-    
+
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
     than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
     For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
@@ -658,7 +654,9 @@ def flash_attn_varlen(
         pad_v = 8 - head_size_v_og % 8
         v_padded = jnp.pad(v, ((0, 0), (0, 0), (0, pad_v)))
 
-    wl_norm, wr_norm = _normalize_window_size(window_size[0], window_size[1], max_seqlen_k)
+    wl_norm, wr_norm = _normalize_window_size(
+        window_size[0], window_size[1], max_seqlen_k
+    )
 
     # Call forward kernel.
     out_padded, softmax_lse_3d, S_dmask, rng_state = _flash_attn_varlen_forward(
@@ -691,7 +689,7 @@ def flash_attn_varlen(
 
     # Always return a fixed triple; let caller ignore Nones.
     lse_ret = softmax_lse_3d if return_lse else None
-    s_ret   = S_dmask if (return_attn_probs and dropout_p > 0) else None
+    s_ret = S_dmask if (return_attn_probs and dropout_p > 0) else None
     return (out, lse_ret, s_ret)
 
 
@@ -770,9 +768,8 @@ def _flash_attn_varlen_fwd(
 
     out = out_padded[..., :head_size_v_og]
 
-    # Convert to tracer-safe boolean values
     lse_ret = softmax_lse_3d if return_lse else None
-    s_ret   = S_dmask if (return_attn_probs and dropout_p > 0) else None
+    s_ret = S_dmask if (return_attn_probs and dropout_p > 0) else None
     result = (out, lse_ret, s_ret)
 
     # Residuals needed for backward pass
@@ -790,7 +787,7 @@ def _flash_attn_varlen_fwd(
         dropout_p,
         softmax_scale,
         logits_soft_cap,
-        zero_tensors,  # Use actual zero_tensors parameter instead of hardcoded False
+        zero_tensors,
         causal,
         (wl_norm, wr_norm),
         bias,
@@ -806,8 +803,29 @@ def _flash_attn_varlen_fwd(
     return result, residuals
 
 
-def _flash_attn_varlen_bwd(residuals, grad_outputs):
+def _flash_attn_varlen_bwd(
+    max_seqlen_q,
+    max_seqlen_k,
+    min_seqlen_q,
+    dropout_p,
+    softmax_scale,
+    logits_soft_cap,
+    causal,
+    window_size,
+    deterministic,
+    return_lse,
+    return_attn_probs,
+    residuals,
+    grad_outputs,
+):
     """Backward pass using residuals and output gradients."""
+    # Unpack grad_outputs (cotangent of the output)
+    if isinstance(grad_outputs, (tuple, list)):
+        dout = grad_outputs[0]
+    else:
+        dout = grad_outputs
+
+    # Unpack residuals
     (
         q_padded,
         k_padded,
@@ -835,18 +853,10 @@ def _flash_attn_varlen_bwd(residuals, grad_outputs):
         how_v3_bf16_cvt,
     ) = residuals
 
-    # Handle different output formats - extract gradient w.r.t. main output.
-    if isinstance(grad_outputs, tuple):
-        dout = grad_outputs[0]
-    else:
-        dout = grad_outputs
-
-    # Pad gradient to match padded dimensions
-    if dout.shape[-1] != out_padded.shape[-1]:
-        pad_v = out_padded.shape[-1] - dout.shape[-1]
+    dout_padded = dout
+    if head_size_v_og % 8 != 0:
+        pad_v = 8 - head_size_v_og % 8
         dout_padded = jnp.pad(dout, ((0, 0), (0, 0), (0, pad_v)))
-    else:
-        dout_padded = dout
 
     # Call backward function
     dq_padded, dk_padded, dv_padded, softmax_d = _flash_attn_varlen_backward(
@@ -885,19 +895,8 @@ def _flash_attn_varlen_bwd(residuals, grad_outputs):
         dv,  # v
         None,  # cu_seqlens_q
         None,  # cu_seqlens_k
-        None,  # max_seqlen_q
-        None,  # max_seqlen_k
-        None,  # min_seqlen_q
-        None,  # dropout_p
-        None,  # softmax_scale
-        None,  # logits_soft_cap
-        None,  # causal
-        None,  # window_size
         None,  # bias (no gradient computation for varlen)
         None,  # alibi_slopes
-        None,  # deterministic
-        None,  # return_lse
-        None,  # return_attn_probs
         None,  # block_table
         None,  # out
     )

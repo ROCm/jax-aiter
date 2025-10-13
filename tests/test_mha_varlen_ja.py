@@ -25,7 +25,7 @@ from torch.utils import dlpack as torch_dlpack
 # JAX-aiter imports.
 import jax_aiter
 from jax_aiter.ja_compat import dtypes as jax_dtypes
-from jax_aiter.mha import flash_attn_varlen as jax_flash_attn_varlen
+from jax_aiter.mha import flash_attn_varlen
 
 
 def _to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -93,113 +93,7 @@ def run_torch(
         return out, dq, dk, dv
 
 
-def run_aiter(
-    q,
-    k,
-    v,
-    query_padding_mask,
-    key_padding_mask,
-    min_seqlen_q=0,
-    bias=None,
-    alibi_slopes=None,
-    dout=None,
-    dropout_p=0.0,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
-):
-    torch.cuda.synchronize()
-    (
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        q,
-        k,
-        v,
-        output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
-    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-    
-    batch_size = q.shape[0]
-    if bias is not None:
-        # TODO - implement generate_bias() to unpad
-        total_q = q_unpad.shape[0]
-        assert total_q == batch_size * max_seqlen_q
-        assert q.shape[1] == max_seqlen_q
-        assert k.shape[1] == max_seqlen_k
-        bias_unpad = bias.reshape(batch_size * max_seqlen_q, max_seqlen_k)
-    else:
-        bias_unpad = None
-
-    outputs = aiter.flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_q=min_seqlen_q,
-        dropout_p=dropout_p,
-        causal=causal,
-        window_size=window_size,
-        bias=bias_unpad,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_lse=return_lse,
-        return_attn_probs=return_attn_probs,
-    )
-
-    # import pdb; pdb.set_trace()
-
-    if type(outputs) is tuple:
-        out = output_pad_fn(outputs[0])
-    else:
-        out = output_pad_fn(outputs)
-
-    if dropout_p > 0.0 and return_attn_probs:
-        (_, seqlen_q, _, d) = q.shape
-        (_, seqlen_k, _, d) = k.shape
-        S_dmask = outputs[-1]
-        S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
-        S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
-            S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
-        )
-        S_dmask_converted = convert_flash_attn_S_to_softmax(
-            S_dmask,
-            seqlen_q,
-            seqlen_k,
-            query_padding_mask,
-            key_padding_mask,
-            d,
-            dropout_p > 0.0,
-            causal=causal,
-            window_size=window_size,
-        )
-        dropout_mask = S_dmask_converted >= 0
-    else:
-        dropout_mask = None
-
-    if dout is None or not return_lse:
-        return out, dropout_mask, None, None, None
-    else:
-        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
-            out, (q_unpad, k_unpad, v_unpad), dout
-        )
-        dq = dq_pad_fn(dq_unpad)
-        dk = dk_pad_fn(dk_unpad)
-        dv = dk_pad_fn(dv_unpad)
-        return out, dropout_mask, dq, dk, dv
-
-
-def run_jax_varlen(
+def run_jax(
     q,
     k,
     v,
@@ -217,9 +111,7 @@ def run_jax_varlen(
     return_attn_probs=False,
 ):
     """JAX implementation for varlen attention."""
-    torch.cuda.synchronize()
-    
-    # Unpad inputs using generate_qkv
+    # Unpad inputs using generate_qkv.
     (
         q_unpad,
         k_unpad,
@@ -235,153 +127,112 @@ def run_jax_varlen(
         dq_pad_fn,
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
-    
-    try:
-        # Prepare bias_unpad if needed
-        batch_size = q.shape[0]
-        if bias is not None:
-            bias_unpad = bias.reshape(batch_size * max_seqlen_q, max_seqlen_k)
-        else:
-            bias_unpad = None
+    if bias is not None:
+        # TODO - implement generate_bias() to unpad.
+        total_q = q_unpad.shape[0]
+        assert total_q == batch_size * max_seqlen_q
+        assert q.shape[1] == max_seqlen_q
+        assert k.shape[1] == max_seqlen_k
+        bias_unpad = bias.reshape(batch_size * max_seqlen_q, max_seqlen_k)
+    else:
+        bias_unpad = None
 
-        # Convert to JAX
-        qj = _to_jax(q_unpad)
-        kj = _to_jax(k_unpad)
-        vj = _to_jax(v_unpad)
-        cu_seqlens_qj = _to_jax(cu_seqlens_q)
-        cu_seqlens_kj = _to_jax(cu_seqlens_k)
-        bj = _to_jax(bias_unpad) if bias_unpad is not None else None
-        alj = _to_jax(alibi_slopes) if alibi_slopes is not None else None
-        if bias is not None:
-            alj = None  # bias wins over ALiBi
+    # Convert to JAX
+    qj = _to_jax(q_unpad)
+    kj = _to_jax(k_unpad)
+    vj = _to_jax(v_unpad)
+    cu_seqlens_qj = _to_jax(cu_seqlens_q)
+    cu_seqlens_kj = _to_jax(cu_seqlens_k)
+    bj = _to_jax(bias_unpad) if bias_unpad is not None else None
+    alj = _to_jax(alibi_slopes) if alibi_slopes is not None else None
 
-        # Normalize window sizes like mha_varlen does
-        def _normalize_window_like_varlen(ws, sk):
-            wl, wr = (int(ws[0].item()), int(ws[1].item())) if hasattr(ws, "shape") else ws
-            def n(x):
-                if x < 0:
-                    return -1
-                return -1 if x >= sk else int(x)
-            return n(wl), n(wr)
+    window_size = tuple(int(x) for x in window_size)
 
-        wl, wr = _normalize_window_like_varlen(window_size, int(max_seqlen_k))
+    # JAX forward wrapper.
+    def fwd_core(Q, K, V, B):
+        return flash_attn_varlen(
+            Q,
+            K,
+            V,
+            cu_seqlens_qj,
+            cu_seqlens_kj,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            dropout_p=dropout_p,
+            softmax_scale=None,
+            logits_soft_cap=0.0,
+            causal=causal,
+            window_size=window_size,
+            bias=B,
+            alibi_slopes=alj,
+            block_table=None,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+        )
 
-        # JAX forward wrapper
-        def fwd_core(Q, K, V, B):
-            return jax_flash_attn_varlen(
-                Q,
-                K,
-                V,
-                cu_seqlens_qj,
-                cu_seqlens_kj,
-                max_seqlen_q,
-                max_seqlen_k,
-                min_seqlen_q=min_seqlen_q,
-                dropout_p=dropout_p,
-                softmax_scale=None,
-                logits_soft_cap=0.0,
-                causal=causal,
-                window_size=(wl, wr),
-                bias=B,
-                alibi_slopes=alj,
-                block_table=None,
-                deterministic=deterministic,
-                return_lse=return_lse,
-                return_attn_probs=return_attn_probs,
-            )
+    # One forward + vjp.
+    (outj, lse_j, S_dmask_jax), pullback = jax.vjp(
+        lambda Q, K, V, B: fwd_core(Q, K, V, B), qj, kj, vj, bj
+    )
 
+    # Convert and pad output.
+    out_t = output_pad_fn(_to_torch(outj))
 
-        # One forward + vjp
-        if bj is None:
-            full_out, pullback = jax.vjp(lambda Q, K, V: fwd_core(Q, K, V, None), qj, kj, vj)
-        else:
-            full_out, pullback = jax.vjp(lambda Q, K, V, B: fwd_core(Q, K, V, B), qj, kj, vj, bj)
+    # Convert dropout mask if present
+    dropout_mask = None
+    if dropout_p > 0.0 and return_attn_probs:
+        (_, seqlen_q, _, d) = q.shape
+        (_, seqlen_k, _, d) = k.shape
+        S_dmask = _to_torch(S_dmask_jax)
+        S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
+        S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
+            S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
+        )
+        S_dmask_converted = convert_flash_attn_S_to_softmax(
+            S_dmask,
+            seqlen_q,
+            seqlen_k,
+            query_padding_mask,
+            key_padding_mask,
+            d,
+            True,  # dropout_p > 0.0
+            causal=causal,
+            window_size=window_size,
+        )
+        dropout_mask = S_dmask_converted >= 0
 
-        # import pdb; pdb.set_trace()
+    # Handle gradients if dout provided.
+    if dout is None or not return_lse:
+        return out_t, dropout_mask, None, None, None
 
-        # Extract outputs
-        if isinstance(full_out, (tuple, list)) and len(full_out) >= 3:
-            outj, lse_j, S_dmask_jax = full_out
-        elif isinstance(full_out, (tuple, list)) and len(full_out) >= 2:
-            outj, lse_j = full_out
-            S_dmask_jax = None
-        elif isinstance(full_out, (tuple, list)) and len(full_out) >= 1:
-            outj = full_out[0]
-            lse_j = None
-            S_dmask_jax = None
-        else:
-            outj = full_out
-            lse_j = None
-            S_dmask_jax = None
+    # Unpad dout for JAX
+    from aiter.bert_padding import unpad_input
 
-        # Convert and pad output
-        out_t_unpad = _to_torch(outj)
-        out_t = output_pad_fn(out_t_unpad)
+    dout_unpad, _, _, _, _ = unpad_input(dout, query_padding_mask)
+    cot = (
+        _to_jax(dout_unpad),
+        jnp.zeros_like(lse_j) if return_lse else None,
+        jnp.zeros_like(S_dmask_jax) if return_attn_probs else None,
+    )
 
-        # Convert dropout mask if present
-        dropout_mask = None
-        if dropout_p > 0.0 and S_dmask_jax is not None:
-            S_dmask_t = _to_torch(S_dmask_jax)
-            S_dmask = ck_randval_to_dropout_mask(S_dmask_t, dropout_p)
-            S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
-                S_dmask, cu_seqlens_q, q.shape[1], k.shape[1]
-            )
-            S_dmask_converted = convert_flash_attn_S_to_softmax(
-                S_dmask,
-                q.shape[1],
-                k.shape[1],
-                query_padding_mask,
-                key_padding_mask,
-                q.shape[-1],
-                True,
-                causal=causal,
-                window_size=window_size,
-            )
-            dropout_mask = S_dmask_converted >= 0
+    # Pullback.
+    if bj is None:
+        dqj, dkj, dvj, _ = pullback(cot)
+    else:
+        dqj, dkj, dvj, dbj = pullback(cot)
 
-        # Handle gradients if dout provided
-        if dout is None or not return_lse:
-            return out_t, dropout_mask, None, None, None
-        else:
-            # Unpad dout for JAX
-            from aiter.bert_padding import unpad_input
-            dout_unpad, _, _, _, _ = unpad_input(dout, query_padding_mask)
-            cot = _to_jax(dout_unpad)
+    # Convert grads back to torch and pad
+    dq_t = _to_torch(dqj)
+    dk_t = _to_torch(dkj)
+    dv_t = _to_torch(dvj)
 
-            # Build full cot structure to match forward output
-            if isinstance(full_out, (tuple, list)):
-                full_cot = [cot]
-                if len(full_out) > 1:
-                    full_cot.append(None if full_out[1] is None else jnp.zeros_like(full_out[1]))
-                if len(full_out) > 2:
-                    full_cot.append(None if full_out[2] is None else jnp.zeros_like(full_out[2]))
-                full_cot = tuple(full_cot)
-            else:
-                full_cot = cot
+    dq = dq_pad_fn(dq_t)
+    dk = dk_pad_fn(dk_t)
+    dv = dk_pad_fn(dv_t)  # Note: CK test used dk_pad_fn for dv as well
 
-            # Pullback
-            grads = pullback(full_cot)
-            if bj is None:
-                dqj, dkj, dvj = grads
-            else:
-                dqj, dkj, dvj, dbj = grads
-
-            # Convert grads back to torch and pad
-            dq_t = _to_torch(dqj)
-            dk_t = _to_torch(dkj)
-            dv_t = _to_torch(dvj)
-
-            dq = dq_pad_fn(dq_t)
-            dk = dk_pad_fn(dk_t)
-            dv = dk_pad_fn(dv_t)  # Note: CK test used dk_pad_fn for dv as well
-
-            return out_t, dropout_mask, dq, dk, dv
-
-    except Exception as e:
-        print(f"JAX varlen implementation failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    return out_t, dropout_mask, dq, dk, dv
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -447,7 +298,7 @@ def test_flash_attn_varlen_func(
     torch.cuda.empty_cache()
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
-    window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+    window_size = (-1, -1) if not local else tuple(torch.randint(0, seqlen_k, (2,)))
 
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True
@@ -470,7 +321,7 @@ def test_flash_attn_varlen_func(
         dtype=dtype,
         requires_grad=True,
     )
-    
+
     if bias_type == "bias":
         # TODO - We need to implement unpad bias [batch_size, seqlen_q, seqlen_k] -> [total_q, max_seqlen_k]
         # Let total_q = batch_size * seqlen_q to pass the test for now
@@ -519,27 +370,9 @@ def test_flash_attn_varlen_func(
     else:
         return_attn_probs = False
 
-    # Run AITER implementation
-    # out_aiter, dropout_mask_aiter, dq_aiter, dk_aiter, dv_aiter = run_aiter(
-    #     q,
-    #     k,
-    #     v,
-    #     query_padding_mask,
-    #     key_padding_mask,
-    #     min_seqlen_q,
-    #     attn_bias,
-    #     alibi_slopes,
-    #     dout,
-    #     dropout_p,
-    #     causal,
-    #     window_size,
-    #     deterministic,
-    #     return_lse,
-    #     return_attn_probs,
-    # )
-
-    # Run JAX implementation
-    jax_result = run_jax_varlen(
+    # Returns from the aiter:
+    # out_aiter, dropout_mask_aiter, dq_aiter, dk_aiter, dv_aiter
+    jax_result = run_jax(
         q,
         k,
         v,
@@ -556,9 +389,6 @@ def test_flash_attn_varlen_func(
         return_lse,
         return_attn_probs,
     )
-
-    if jax_result is None:
-        pytest.skip("JAX implementation failed")
 
     out_jax, dropout_mask_jax, dq_jax, dk_jax, dv_jax = jax_result
 
@@ -600,9 +430,11 @@ def test_flash_attn_varlen_func(
     print(f"JAX vs REF Output max diff: {(out_jax - out_ref).abs().max().item()}")
     # print(f"JAX vs AITER Output max diff: {(out_jax - out_aiter).abs().max().item()}")
     print(f"PT vs REF Output max diff: {(out_pt - out_ref).abs().max().item()}")
-    
+
     out_tol = max(4 * (out_pt - out_ref).abs().max().item(), 0.01)
-    assert (out_jax - out_ref).abs().max().item() <= out_tol, "JAX output doesn't match REF"
+    assert (
+        out_jax - out_ref
+    ).abs().max().item() <= out_tol, "JAX output doesn't match REF"
 
     # TODO: Support varlen bwd for bias
     if bias_type == "bias":
@@ -626,9 +458,15 @@ def test_flash_attn_varlen_func(
         dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
         dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
 
-        assert (dq_jax - dq_ref).abs().max().item() <= dq_tol, "JAX dQ doesn't match REF"
-        assert (dk_jax - dk_ref).abs().max().item() <= dk_tol, "JAX dK doesn't match REF"
-        assert (dv_jax - dv_ref).abs().max().item() <= dv_tol, "JAX dV doesn't match REF"
+        assert (
+            dq_jax - dq_ref
+        ).abs().max().item() <= dq_tol, "JAX dQ doesn't match REF"
+        assert (
+            dk_jax - dk_ref
+        ).abs().max().item() <= dk_tol, "JAX dK doesn't match REF"
+        assert (
+            dv_jax - dv_ref
+        ).abs().max().item() <= dv_tol, "JAX dV doesn't match REF"
 
 
 if __name__ == "__main__":
