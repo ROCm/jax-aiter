@@ -51,11 +51,6 @@ def _empty_tensor(dtype):
     return jnp.zeros((0,), dtype=dtype)
 
 
-def _static_is_zero(x) -> bool:
-    """Convert to Python bool for (x == 0) without tracer issues."""
-    return np.float32(x) == 0.0
-
-
 def _static_float(x) -> np.float32:
     """Convert to float for static arguments."""
     return np.float32(x)
@@ -597,7 +592,7 @@ def mha_fwd(
         v.shape[3],
     )
 
-    # Handle optional tensors
+    # Handle optional tensors.
     if out is None:
         out = _empty_tensor(q.dtype)
     if bias is None:
@@ -1176,7 +1171,7 @@ def flash_attn_func(
         return_softmax=return_attn_probs and dropout_p > 0,
     )
 
-    # Unpad output to original dimensions
+    # Unpad output to original dimensions.
     out = out_padded[..., :head_size_v_og]
 
     result = [out]
@@ -1344,15 +1339,12 @@ def _flash_attn_func_bwd(
     dk = dk_padded[..., :head_size_q_og]
     dv = dv_padded[..., :head_size_v_og]
 
-    # Handle bias gradient - now properly extracted from backward kernel
-    dbias = dbias_grad  # Already computed by the appropriate kernel
-
     # Return gradients for differentiable inputs only: q, k, v, softmax_scale, bias, alibi_slopes
     return (
         dq,  # q (index 0)
         dk,  # k (index 1)
         dv,  # v (index 2)
-        dbias,  # bias (index 7)
+        dbias_grad,  # bias (index 7)
         None,  # alibi_slopes (index 8) - typically no gradient needed
     )
 

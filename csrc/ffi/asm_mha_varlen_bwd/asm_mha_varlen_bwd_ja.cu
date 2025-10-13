@@ -56,15 +56,15 @@ ffi::Error FmhaV3VarlenBwd_Bridge(
     std::optional<ffi::AnyBuffer> dv_provided,  // [total_k, hk, d_v] (optional)
     std::optional<ffi::AnyBuffer> alibi_slopes, // [hq] or [b, hq] (optional)
     std::optional<ffi::AnyBuffer> rng_state,    // [2] (optional)
-    std::optional<ffi::AnyBuffer> gen_,          // generator (optional)
+    std::optional<ffi::AnyBuffer> gen_,         // generator (optional)
     ffi::Result<ffi::AnyBuffer> dq,             // [total_q, hq, d_q]
     ffi::Result<ffi::AnyBuffer> dk,             // [total_k, hk, d_q]
     ffi::Result<ffi::AnyBuffer> dv,             // [total_k, hk, d_v]
     ffi::Result<ffi::AnyBuffer> softmax_d,      // [b, hq, max_seqlen_q]
-    int max_seqlen_q, int max_seqlen_k, double p_dropout,
-    double softmax_scale, bool zero_tensors, bool is_causal,
-    int window_size_left, int window_size_right, bool deterministic,
-    bool is_v3_atomic_fp32, int how_v3_bf16_cvt) {
+    int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale,
+    bool zero_tensors, bool is_causal, int window_size_left,
+    int window_size_right, bool deterministic, bool is_v3_atomic_fp32,
+    int how_v3_bf16_cvt) {
   // Get device index for tensor creation.
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
 
@@ -138,31 +138,31 @@ ffi::Error FmhaV3VarlenBwd_Bridge(
 
   try {
     auto results = aiter::torch_itfs::fmha_v3_varlen_bwd(
-        dout_tensor,                         // dout: [total_q, hq, d_v]
-        q_tensor,                            // q: [total_q, hq, d_q]
-        k_tensor,                            // k: [total_k, hk, d_q]
-        v_tensor,                            // v: [total_k, hk, d_v]
-        out_tensor,                          // out: [total_q, hq, d_v]
-        softmax_lse_tensor,                  // softmax_lse: [b, hq, sq]
-        cu_seqlens_q_tensor,                 // cu_seqlens_q: [b+1]
-        cu_seqlens_k_tensor,                 // cu_seqlens_k: [b+1]
-        max_seqlen_q,                        // max_seqlen_q
-        max_seqlen_k,                        // max_seqlen_k
-        p_dropout,                           // p_dropout
-        softmax_scale,                       // softmax_scale
-        zero_tensors,                        // zero_tensors
-        is_causal,                           // is_causal
-        window_size_left,                    // window_size_left
-        window_size_right,                   // window_size_right
-        deterministic,                       // deterministic
-        is_v3_atomic_fp32,                   // is_v3_atomic_fp32
-        how_v3_bf16_cvt,                     // how_v3_bf16_cvt
-        dq_provided_opt,                     // dq_ (optional pre-allocated dq)
-        dk_provided_opt,                     // dk_ (optional pre-allocated dk)
-        dv_provided_opt,                     // dv_ (optional pre-allocated dv)
-        alibi_slopes_opt,                    // alibi_slopes_ (optional)
-        rng_state_opt,                       // rng_state_ (optional)
-        gen_opt                              // gen_ (optional generator)
+        dout_tensor,         // dout: [total_q, hq, d_v]
+        q_tensor,            // q: [total_q, hq, d_q]
+        k_tensor,            // k: [total_k, hk, d_q]
+        v_tensor,            // v: [total_k, hk, d_v]
+        out_tensor,          // out: [total_q, hq, d_v]
+        softmax_lse_tensor,  // softmax_lse: [b, hq, sq]
+        cu_seqlens_q_tensor, // cu_seqlens_q: [b+1]
+        cu_seqlens_k_tensor, // cu_seqlens_k: [b+1]
+        max_seqlen_q,        // max_seqlen_q
+        max_seqlen_k,        // max_seqlen_k
+        p_dropout,           // p_dropout
+        softmax_scale,       // softmax_scale
+        zero_tensors,        // zero_tensors
+        is_causal,           // is_causal
+        window_size_left,    // window_size_left
+        window_size_right,   // window_size_right
+        deterministic,       // deterministic
+        is_v3_atomic_fp32,   // is_v3_atomic_fp32
+        how_v3_bf16_cvt,     // how_v3_bf16_cvt
+        dq_provided_opt,     // dq_ (optional pre-allocated dq)
+        dk_provided_opt,     // dk_ (optional pre-allocated dk)
+        dv_provided_opt,     // dv_ (optional pre-allocated dv)
+        alibi_slopes_opt,    // alibi_slopes_ (optional)
+        rng_state_opt,       // rng_state_ (optional)
+        gen_opt              // gen_ (optional generator)
     );
     // Copy results back to JAX output buffers
     // results = {dq, dk, dv, softmax_d}
@@ -221,8 +221,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>() // softmax_d: [b, hq, max_seqlen_q]
         .Attr<int>("max_seqlen_q")
         .Attr<int>("max_seqlen_k")
-        .Attr<double>("p_dropout")
-        .Attr<double>("softmax_scale")
+        .Attr<float>("p_dropout")
+        .Attr<float>("softmax_scale")
         .Attr<bool>("zero_tensors")
         .Attr<bool>("is_causal")
         .Attr<int>("window_size_left")

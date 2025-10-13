@@ -247,6 +247,194 @@ def _cached_mha_varlen_bwd_call(
     )
 
 
+def _cached_fmha_v3_varlen_fwd_call(
+    out_shape,
+    softmax_lse_shape,
+    p_shape,
+    rng_state_shape,
+    out_dtype,
+):
+    """Create JIT-compiled FFI call for FMHA V3 varlen forward kernel."""
+    call = jax.ffi.ffi_call(
+        "FmhaV3VarlenFwdJA",
+        (
+            jax.ShapeDtypeStruct(out_shape, out_dtype),
+            jax.ShapeDtypeStruct(softmax_lse_shape, jnp.float32),
+            jax.ShapeDtypeStruct(p_shape, jnp.uint8),
+            jax.ShapeDtypeStruct(rng_state_shape, jnp.int64),
+        ),
+        vmap_method="broadcast_all",
+    )
+
+    def _invoke(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        out_provided,
+        block_table,
+        bias,
+        alibi_slopes,
+        gen,
+        *,
+        max_seqlen_q,
+        max_seqlen_k,
+        min_seqlen_q,
+        p_dropout,
+        softmax_scale,
+        logits_soft_cap,
+        zero_tensors,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        return_softmax_lse,
+        return_dropout_randval,
+        how_v3_bf16_cvt,
+    ):
+        result = call(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            out_provided,
+            block_table,
+            bias,
+            alibi_slopes,
+            gen,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            min_seqlen_q=min_seqlen_q,
+            p_dropout=p_dropout,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            zero_tensors=zero_tensors,
+            is_causal=is_causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            return_softmax_lse=return_softmax_lse,
+            return_dropout_randval=return_dropout_randval,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
+        )
+
+        return result
+
+    return jax.jit(
+        _invoke,
+        static_argnames=(
+            "max_seqlen_q",
+            "max_seqlen_k",
+            "min_seqlen_q",
+            "p_dropout",
+            "softmax_scale",
+            "logits_soft_cap",
+            "zero_tensors",
+            "is_causal",
+            "window_size_left",
+            "window_size_right",
+            "return_softmax_lse",
+            "return_dropout_randval",
+            "how_v3_bf16_cvt",
+        ),
+    )
+
+
+def _cached_fmha_v3_varlen_bwd_call(
+    dq_shape,
+    dk_shape,
+    dv_shape,
+    softmax_d_shape,
+    grad_dtype,
+):
+    """Create JIT-compiled FFI call for FMHA V3 varlen backward kernel."""
+    call = jax.ffi.ffi_call(
+        "FmhaV3VarlenBwdJA",
+        (
+            jax.ShapeDtypeStruct(dq_shape, grad_dtype),
+            jax.ShapeDtypeStruct(dk_shape, grad_dtype),
+            jax.ShapeDtypeStruct(dv_shape, grad_dtype),
+            jax.ShapeDtypeStruct(softmax_d_shape, jnp.float32),
+        ),
+        vmap_method="broadcast_all",
+    )
+
+    def _invoke(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        dq,
+        dk,
+        dv,
+        alibi_slopes,
+        rng_state,
+        gen,
+        *,
+        max_seqlen_q,
+        max_seqlen_k,
+        p_dropout,
+        softmax_scale,
+        zero_tensors,
+        is_causal,
+        window_size_left,
+        window_size_right,
+        deterministic,
+        is_v3_atomic_fp32,
+        how_v3_bf16_cvt,
+    ):
+        result = call(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            dq,
+            dk,
+            dv,
+            alibi_slopes,
+            rng_state,
+            gen,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            p_dropout=p_dropout,
+            softmax_scale=softmax_scale,
+            zero_tensors=zero_tensors,
+            is_causal=is_causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            deterministic=deterministic,
+            is_v3_atomic_fp32=is_v3_atomic_fp32,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
+        )
+
+        return result
+
+    return jax.jit(
+        _invoke,
+        static_argnames=(
+            "max_seqlen_q",
+            "max_seqlen_k",
+            "p_dropout",
+            "softmax_scale",
+            "zero_tensors",
+            "is_causal",
+            "window_size_left",
+            "window_size_right",
+            "deterministic",
+            "is_v3_atomic_fp32",
+            "how_v3_bf16_cvt",
+        ),
+    )
+
+
 def mha_varlen_fwd(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -327,6 +515,93 @@ def mha_varlen_fwd(
         window_size_right=_static_int(window_size_right),
         return_softmax_lse=return_softmax_lse,
         return_dropout_randval=return_dropout_randval,
+    )
+
+    return list(results)
+
+
+def fmha_v3_varlen_fwd(
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    cu_seqlens_q: jnp.ndarray,
+    cu_seqlens_k: Optional[jnp.ndarray],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    p_dropout: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
+    out_provided: Optional[jnp.ndarray] = None,
+    block_table: Optional[jnp.ndarray] = None,
+    bias: Optional[jnp.ndarray] = None,
+    alibi_slopes: Optional[jnp.ndarray] = None,
+    gen: Optional[jnp.ndarray] = None,
+) -> List[jnp.ndarray]:
+    """FMHA V3 varlen forward kernel."""
+    _ensure_ffi_target_registered("FmhaV3VarlenFwdJA")
+
+    total_q, num_heads_q, head_size_q = q.shape
+    total_k, _, head_size_v = v.shape
+
+    # Handle optional tensors.
+    if cu_seqlens_k is None:
+        cu_seqlens_k = _empty_tensor(jnp.int32)
+    if out_provided is None:
+        out_provided = _empty_tensor(v.dtype)
+    if block_table is None:
+        block_table = _empty_tensor(jnp.int32)
+    if bias is None:
+        bias = _empty_tensor(jnp.float32)
+    if alibi_slopes is None:
+        alibi_slopes = _empty_tensor(jnp.float32)
+    if gen is None:
+        gen = _empty_tensor(jnp.int64)
+
+    out_shape = (total_q, num_heads_q, head_size_v)
+    softmax_lse_shape = (num_heads_q, total_q)
+    p_shape = (num_heads_q, total_q, max_seqlen_k)
+    rng_state_shape = (2,)
+
+    fn = _cached_fmha_v3_varlen_fwd_call(
+        out_shape,
+        softmax_lse_shape,
+        p_shape,
+        rng_state_shape,
+        v.dtype,  # Use v.dtype for output
+    )
+
+    results = fn(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        out_provided,
+        block_table,
+        bias,
+        alibi_slopes,
+        gen,
+        max_seqlen_q=_static_int(max_seqlen_q),
+        max_seqlen_k=_static_int(max_seqlen_k),
+        min_seqlen_q=_static_int(min_seqlen_q),
+        p_dropout=_static_float(p_dropout),
+        softmax_scale=_static_float(softmax_scale),
+        logits_soft_cap=_static_float(logits_soft_cap),
+        zero_tensors=zero_tensors,
+        is_causal=is_causal,
+        window_size_left=_static_int(window_size_left),
+        window_size_right=_static_int(window_size_right),
+        return_softmax_lse=return_softmax_lse,
+        return_dropout_randval=return_dropout_randval,
+        how_v3_bf16_cvt=_static_int(how_v3_bf16_cvt),
     )
 
     return list(results)
@@ -422,6 +697,100 @@ def mha_varlen_bwd(
     return results
 
 
+def fmha_v3_varlen_bwd(
+    dout: jnp.ndarray,
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    out: jnp.ndarray,
+    softmax_lse: jnp.ndarray,  # [batch, nheads, max_seqlen_q]
+    cu_seqlens_q: jnp.ndarray,
+    cu_seqlens_k: jnp.ndarray,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    p_dropout: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dq: Optional[jnp.ndarray] = None,
+    dk: Optional[jnp.ndarray] = None,
+    dv: Optional[jnp.ndarray] = None,
+    alibi_slopes: Optional[jnp.ndarray] = None,
+    rng_state: Optional[jnp.ndarray] = None,
+    gen: Optional[jnp.ndarray] = None,
+) -> List[jnp.ndarray]:
+    """FMHA V3 varlen backward kernel."""
+    _ensure_ffi_target_registered("FmhaV3VarlenBwdJA")
+
+    total_q, num_heads, head_size_q = q.shape
+    total_k, num_heads_k, _ = k.shape
+    head_size_v = v.shape[-1]
+    batch_size = cu_seqlens_q.shape[0] - 1
+
+    # Handle optional tensors
+    if dq is None:
+        dq = _empty_tensor(q.dtype)
+    if dk is None:
+        dk = _empty_tensor(k.dtype)
+    if dv is None:
+        dv = _empty_tensor(v.dtype)
+    if alibi_slopes is None:
+        alibi_slopes = _empty_tensor(jnp.float32)
+    if rng_state is None:
+        rng_state = _empty_tensor(jnp.int64)
+    if gen is None:
+        gen = _empty_tensor(jnp.int64)
+
+    # Output shapes
+    dq_shape = (total_q, num_heads, head_size_q)
+    dk_shape = (total_k, num_heads_k, head_size_q)
+    dv_shape = (total_k, num_heads_k, head_size_v)
+    softmax_d_shape = (batch_size, num_heads, max_seqlen_q)
+
+    fn = _cached_fmha_v3_varlen_bwd_call(
+        dq_shape,
+        dk_shape,
+        dv_shape,
+        softmax_d_shape,
+        q.dtype,
+    )
+
+    results = fn(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        dq,
+        dk,
+        dv,
+        alibi_slopes,
+        rng_state,
+        gen,
+        max_seqlen_q=_static_int(max_seqlen_q),
+        max_seqlen_k=_static_int(max_seqlen_k),
+        p_dropout=_static_float(p_dropout),
+        softmax_scale=_static_float(softmax_scale),
+        zero_tensors=zero_tensors,
+        is_causal=is_causal,
+        window_size_left=_static_int(window_size_left),
+        window_size_right=_static_int(window_size_right),
+        deterministic=deterministic,
+        is_v3_atomic_fp32=is_v3_atomic_fp32,
+        how_v3_bf16_cvt=_static_int(how_v3_bf16_cvt),
+    )
+
+    return results
+
+
 def _flash_attn_varlen_forward(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -469,31 +838,57 @@ def _flash_attn_varlen_forward(
         ret = ret and (q.dtype == dtypes.bf16)
         return ret
 
-    # if can_impl_fmha_v3_fwd():
-    result = mha_varlen_fwd(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_q,
-        dropout_p,
-        softmax_scale,
-        logits_soft_cap,
-        zero_tensors,
-        causal,
-        window_size_left,
-        window_size_right,
-        return_lse,
-        return_softmax,
-        out,
-        block_table,
-        bias,
-        alibi_slopes,
-        None,
-    )
+    if can_impl_fmha_v3_fwd():
+        result = fmha_v3_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            dropout_p,
+            softmax_scale,
+            logits_soft_cap,
+            zero_tensors,
+            causal,
+            window_size_left,
+            window_size_right,
+            return_lse,
+            return_softmax,
+            how_v3_bf16_cvt,
+            out,
+            block_table,
+            bias,
+            alibi_slopes,
+            None,
+        )
+    else:
+        result = mha_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            dropout_p,
+            softmax_scale,
+            logits_soft_cap,
+            zero_tensors,
+            causal,
+            window_size_left,
+            window_size_right,
+            return_lse,
+            return_softmax,
+            out,
+            block_table,
+            bias,
+            alibi_slopes,
+            None,
+        )
 
     return list(result)
 
@@ -522,32 +917,79 @@ def _flash_attn_varlen_backward(
     zero_tensors: bool = False,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Backward pass for varlen attention."""
+    (_, nhead_q, hdim_q) = q.shape
+    nhead_k = v.shape[-2]
+    hdim_v = v.shape[-1]
+
+    mask = causal and window_size_left == -1
+    nmask = not causal and window_size_left == -1 and window_size_right == -1
+
+    def can_impl_fmha_v3_bwd():
+        ret = alibi_slopes is None
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (not deterministic)
+        ret = ret and (hdim_q == hdim_v)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0)
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (mask or nmask)
+        return ret
+
     # LSE is already in 3D format from forward, no conversion needed
-    results = mha_varlen_bwd(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse_3d,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        zero_tensors,
-        causal,
-        window_size_left,
-        window_size_right,
-        deterministic,
-        None,  # dq
-        None,  # dk
-        None,  # dv
-        alibi_slopes,
-        rng_state,
-        None,  # gen
-    )
+    if can_impl_fmha_v3_bwd():
+        results = fmha_v3_varlen_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse_3d,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            zero_tensors,
+            causal,
+            window_size_left,
+            window_size_right,
+            deterministic,
+            is_v3_atomic_fp32,
+            how_v3_bf16_cvt,
+            None,  # dq
+            None,  # dk
+            None,  # dv
+            alibi_slopes,
+            rng_state,
+            None,  # gen
+        )
+    else:
+        results = mha_varlen_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse_3d,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            zero_tensors,
+            causal,
+            window_size_left,
+            window_size_right,
+            deterministic,
+            None,  # dq
+            None,  # dk
+            None,  # dv
+            alibi_slopes,
+            rng_state,
+            None,  # gen
+        )
 
     dq_grad, dk_grad, dv_grad, softmax_d = results
     return dq_grad, dk_grad, dv_grad, softmax_d
