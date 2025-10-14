@@ -27,7 +27,8 @@ AITER_SRC_DIR:= third_party/aiter
 AITER_HIP_DIR:= build/hipified_aiter
 AITER_INC    := $(AITER_HIP_DIR)/csrc/include
 
-TRITON_INC   := $(shell $(PYTHON3) -c 'import triton; print(f"{triton.__path__[0]}/backends/nvidia/include")')
+TRITON_INC   := $(shell $(PYTHON3) -c 'import importlib.util, os; m=importlib.util.find_spec("triton"); p=(f"{m.submodule_search_locations[0]}/backends/nvidia/include") if m else ""; print(p if p and os.path.isdir(p) else "")')
+TRITON_INC_FLAG := $(if $(wildcard $(TRITON_INC)),-I$(TRITON_INC),)
 JAX_FFI_INC  := $(shell $(PYTHON3) -c 'from jax import ffi; print(ffi.include_dir())')
 PYTHON_INC   := $(shell $(PYTHON3) -c 'import sysconfig; print(sysconfig.get_paths()["include"])')
 
@@ -41,7 +42,7 @@ CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
             -I$(TORCH_SITE) -I$(TORCH_INC) \
             -I$(TORCH_API_INC) -I$(TORCH_API_INC)/install/include \
             -I$(TORCH_SITE)/torch/csrc \
-            -I$(TRITON_INC) -I$(AITER_INC) \
+            $(TRITON_INC_FLAG) -I$(AITER_INC) \
             -I$(JAX_AITER_INC) \
             -fvisibility-inlines-hidden -fvisibility=hidden
 
