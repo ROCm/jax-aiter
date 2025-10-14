@@ -1,0 +1,19 @@
+name: Manual Print
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-runner:
+    runs-on: linux-mi355-4
+    steps:
+      - name: Print message
+        run: |
+          echo "Hello from CI (manual run)!"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "Actor: ${{ github.actor }}"
