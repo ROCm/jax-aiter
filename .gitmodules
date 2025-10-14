@@ -3,4 +3,5 @@
 	url = https://github.com/ROCm/aiter.git
 [submodule "third_party/pytorch"]
 	path = third_party/pytorch
-	url = https://github.com/pytorch/pytorch.git
+	url = https://github.com/ROCm/pytorch.git
+	branch = release/2.8
