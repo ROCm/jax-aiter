@@ -32,6 +32,7 @@ fi
 
 # 2) Configure a static, PIC, ROCm-only, minimal build
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
+  -DPYTORCH_ROCM_ARCH="gfx942;gfx950" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -112,6 +113,9 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
   -DUSE_GFLAGS=OFF \
   \
   -DUSE_ROCM_CK_GEMM=OFF \
+  -DUSE_CK_FLASH_ATTENTION=OFF \
+  -DCMAKE_DISABLE_FIND_PACKAGE_composable_kernel=ON \
+  -DUSE_ROCM_CK_SDPA=OFF \
   \
   -DUSE_FLASH_ATTENTION=OFF \
   -DUSE_MEM_EFF_ATTENTION=OFF \
