@@ -30,7 +30,8 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
+            "f'{get_asm_dir()}/gfx942/fmha_v3_fwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx950/fmha_v3_fwd/codegen.py --output_dir {{}}'"
         ]
     },
     "module_mha_fwd": {
@@ -119,7 +120,8 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx942/fmha_v3_bwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx950/fmha_v3_bwd/codegen.py --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
@@ -140,7 +142,8 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx942/fmha_v3_bwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx950/fmha_v3_bwd/codegen.py --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
@@ -161,7 +164,8 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
+            "f'{get_asm_dir()}/gfx942/fmha_v3_fwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx950/fmha_v3_fwd/codegen.py --output_dir {{}}'"
         ]
     },
     "module_mha_bwd": {
@@ -228,7 +232,8 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_fwd/codegen.py --output_dir {{}}'"
+            "f'{get_asm_dir()}/gfx942/fmha_v3_fwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx950/fmha_v3_fwd/codegen.py --output_dir {{}}'"
         ]
     },
     "libmha_bwd": {
@@ -247,7 +252,8 @@
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
-            "f'{get_asm_dir()}/fmha_v3_bwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx942/fmha_v3_bwd/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/gfx950/fmha_v3_bwd/codegen.py --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     }

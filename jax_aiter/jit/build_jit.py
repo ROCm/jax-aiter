@@ -46,6 +46,22 @@ def patch_aiter_core(core_module, jax_aiter_root):
     # Add JA_ROOT_DIR to the core module's globals.
     core_module.JA_ROOT_DIR = jax_aiter_root
 
+    # Override get_asm_dir to point to parent hsa directory.
+    # This allows us to reference arch-specific paths explicitly in optCompilerConfig.json.
+    orig_asm_dir = core_module.AITER_ASM_DIR
+    gfx_dir = orig_asm_dir.rstrip(os.sep)
+    hsa_dir = os.path.dirname(gfx_dir)  # .../hsa
+    core_module.AITER_ASM_DIR = hsa_dir
+    os.environ["AITER_ASM_DIR"] = hsa_dir
+
+    # Override the cached get_asm_dir function.
+    @functools.lru_cache(maxsize=1)
+    def get_asm_dir_ja():
+        return hsa_dir
+
+    core_module.get_asm_dir = get_asm_dir_ja
+    logger.info(f"Overridden AITER_ASM_DIR to: {hsa_dir}")
+
     # Override get_user_jit_dir to use JAX-AITER build directory.
     @functools.lru_cache(maxsize=1)
     def get_user_jit_dir_ja():
@@ -260,7 +276,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
             extra_ldflags.append("-ffunction-sections")
             extra_ldflags.append("-fdata-sections ")
             extra_ldflags.append("-Wl,--gc-sections")
-            extra_ldflags.append("-Wl,--cref")
             if not torch_exclude:
                 import torch
 
