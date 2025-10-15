@@ -471,6 +471,21 @@ def build_module(core_module, module_name, verbose=False):
             build_args.get("hipify", True),
         )
         logger.info(f"Successfully built {module_name}")
+
+        # Automatically copy libmha .so files to the parent directory for proper linking.
+        if module_name.startswith("libmha_"):
+            jit_build_dir = Path(core_module.get_user_jit_dir())
+            src_so = (
+                jit_build_dir / "build" / module_name / "build" / f"{module_name}.so"
+            )
+            dst_so = jit_build_dir / f"{module_name}.so"
+
+            if src_so.exists():
+                shutil.copy2(src_so, dst_so)
+                logger.info(f"Copied {module_name}.so to {jit_build_dir}")
+            else:
+                logger.warning(f"Expected .so file not found at {src_so}")
+
         return True
     except Exception as e:
         logger.error(f"Failed to build {module_name}: {e}")
