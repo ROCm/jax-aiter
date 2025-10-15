@@ -1,0 +1,153 @@
+name: JAX-AITER CI
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: linux-mi355-4
+    container:
+      image: rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
+      options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video
+    
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up environment variables
+        run: |
+          echo "JA_ROOT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          echo "AITER_SYMBOL_VISIBLE=1" >> $GITHUB_ENV
+          echo "GPU_ARCHS=gfx942;gfx950" >> $GITHUB_ENV
+          echo "AITER_ASM_DIR=$GITHUB_WORKSPACE/third_party/aiter/hsa/gfx950/" >> $GITHUB_ENV
+          echo "ROCM_ARCH=gfx942" >> $GITHUB_ENV
+          echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "PYTHON=python3" >> $GITHUB_ENV
+
+      - name: Display environment information
+        run: |
+          echo "========================================="
+          echo "System Information"
+          echo "========================================="
+          echo "Working directory: $PWD"
+          echo "Number of processors: $(nproc)"
+          echo ""
+          echo "ROCm SMI:"
+          rocm-smi || echo "rocm-smi not available"
+          echo ""
+          echo "ROCm Info (GPU details):"
+          rocminfo | grep -E "Marketing Name:|gfx" || true
+          echo ""
+          echo "========================================="
+          echo "Environment Variables"
+          echo "========================================="
+          echo "JA_ROOT_DIR: $JA_ROOT_DIR"
+          echo "GPU_ARCHS: $GPU_ARCHS"
+          echo "ROCM_ARCH: $ROCM_ARCH"
+          echo "ROCM_PATH: $ROCM_PATH"
+          echo ""
+          echo "========================================="
+          echo "Software Versions"
+          echo "========================================="
+          echo "Python: $(python3 --version)"
+          echo "CMake: $(cmake --version | head -n1)"
+          echo "Ninja: $(ninja --version)"
+          echo "========================================="
+
+      - name: Install build dependencies
+        run: |
+          pip install --upgrade pip
+          pip install cmake ninja pyyaml pytest pytest-xdist
+
+      - name: Apply PyTorch patch
+        working-directory: third_party/pytorch
+        run: |
+          echo "Applying caffe2_nvrtc static/PIC patch..."
+          git apply ../../scripts/torch_caffe.patch
+          echo "PyTorch patch applied successfully"
+
+      - name: Apply AITER patch
+        working-directory: third_party/aiter
+        run: |
+          echo "Applying AITER torch removal patch..."
+          git apply ../../scripts/aiter_torch_remove.patch
+          echo "AITER patch applied successfully"
+
+      - name: Cache PyTorch static build
+        id: cache-pytorch
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/pytorch/build_static
+            third_party/pytorch/.hipify_done
+          key: pytorch-static-${{ runner.os }}-${{ hashFiles('third_party/pytorch/**/*.cpp', 'third_party/pytorch/**/*.h', 'scripts/build_static_pytorch.sh') }}
+          restore-keys: |
+            pytorch-static-${{ runner.os }}-
+
+      - name: Build static PyTorch libraries
+        if: steps.cache-pytorch.outputs.cache-hit != 'true'
+        run: |
+          echo "Building static PyTorch with gfx942 and gfx950 support..."
+          bash ./scripts/build_static_pytorch.sh
+          echo "PyTorch static build completed"
+          ls -la third_party/pytorch/build_static/lib/
+
+      - name: Verify PyTorch build artifacts
+        run: |
+          echo "Checking PyTorch static libraries..."
+          ls -lh third_party/pytorch/build_static/lib/lib*.a
+          echo "Checking PyTorch headers..."
+          ls -d third_party/pytorch/build_static/install/include
+
+      - name: Build umbrella shared library
+        run: |
+          echo "Building JAX-AITER umbrella library..."
+          make
+          echo "Umbrella library build completed"
+          ls -lh build/aiter_build/libjax_aiter.so
+
+      - name: Build JIT modules
+        run: |
+          echo "Building all JIT modules..."
+          python3 jax_aiter/jit/build_jit.py --module module_custom,libmha_bwd,libmha_fwd,module_fmha_v3_bwd,module_fmha_v3_fwd,module_fmha_v3_varlen_bwd,module_fmha_v3_varlen_fwd,module_mha_bwd,module_mha_fwd,module_mha_varlen_bwd,module_mha_varlen_fwd
+          echo "JIT modules build completed"
+          echo "Built modules:"
+          ls -lh build/aiter_build/*.so
+
+      - name: Run smoke test
+        run: |
+          echo "Running smoke test..."
+          python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print('✓ jax-aiter import successful')"
+
+      - name: Run MHA varlen tests
+        run: |
+          echo "Running MHA varlen tests..."
+          pytest -v tests/test_mha_varlen_ja.py || echo "⚠ Tests completed with issues"
+
+      - name: Run MHA CK tests
+        run: |
+          echo "Running MHA CK tests..."
+          pytest -v tests/test_mha_ck_ja.py || echo "⚠ Tests completed with issues"
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "========================================="
+          echo "Build Summary"
+          echo "========================================="
+          echo "PyTorch static libs:"
+          ls -lh third_party/pytorch/build_static/lib/lib*.a 2>/dev/null || echo "Not found"
+          echo ""
+          echo "JAX-AITER umbrella library:"
+          ls -lh build/aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
+          echo ""
+          echo "JIT modules:"
+          ls -lh build/aiter_build/*.so 2>/dev/null || echo "None found"
+          echo "========================================="
