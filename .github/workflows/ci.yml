@@ -9,7 +9,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: linux-mi355-4
+    runs-on: smci355-ccs-aus-n15-13
 
     env:
       IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
@@ -45,8 +45,8 @@ jobs:
             --group-add=video \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
-            -v "${{ github.workspace }}:${WORKDIR}" \
-            -w "${WORKDIR}" \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w "/jax-aiter" \
             "$IMAGE" tail -f /dev/null
 
       - name: Ensure base tooling inside container (git, build tools, python deps)
@@ -65,20 +65,17 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             cat <<EOF >> /etc/profile.d/jax_aiter.sh
-            export JA_ROOT_DIR=${WORKDIR}
+            export JA_ROOT_DIR="/jax-aiter"
             export AITER_SYMBOL_VISIBLE=1
-            export GPU_ARCHS=gfx942;gfx950
-            export AITER_ASM_DIR=${WORKDIR}/third_party/aiter/hsa/gfx950/
-            export ROCM_ARCH=gfx942
-            export ROCM_PATH=/opt/rocm
-            export PYTHON=python3
+            export GPU_ARCHS="gfx942;gfx950"
+            export AITER_ASM_DIR="/jax-aiter/third_party/aiter/hsa/gfx950/"
             EOF
           '
 
       - name: Display environment information (in container)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            source /etc/profile.d/jax_aiter.sh
+            . /etc/profile.d/jax_aiter.sh
             echo "========================================="
             echo "System Information"
             echo "========================================="
