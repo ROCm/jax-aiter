@@ -9,7 +9,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: smci355-ccs-aus-n15-13
+    runs-on: [self-hosted, Linux, X64, smci355-ccs-aus-n15-13]
 
     env:
       IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
