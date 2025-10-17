@@ -136,75 +136,21 @@ jobs:
             git apply ../../scripts/aiter_torch_remove.patch
           '
 
-      - name: HIPify PyTorch sources (only)
+      # REMOVED: hipify-only step
+      # REMOVED: PyTorch cache steps
+
+      - name: Build static PyTorch (full)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            bash ./scripts/build_static_pytorch.sh --hipify-only --force-hipify
-            ls -l third_party/pytorch/.hipify_done
-          '
-
-      - name: Get PyTorch submodule SHA
-        id: pytorch_sha
-        run: echo "sha=$(git rev-parse HEAD:third_party/pytorch)" >> "$GITHUB_OUTPUT"
-
-      - name: Get AITER submodule SHA
-        id: aiter_sha
-        run: echo "sha=$(git rev-parse HEAD:third_party/aiter)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache PyTorch static build
-        id: cache-pytorch
-        uses: actions/cache@v4
-        with:
-          path: |
-            third_party/pytorch/build_static
-          key: >
-            pytorch-static-${{ runner.os }}-img=${{ env.IMAGE }}
-            -rocm=${{ env.ROCM_VERSION }}
-            -arch=${{ env.GPU_ARCHS }}
-            -submod=${{ steps.pytorch_sha.outputs.sha }}
-            -patch=${{ hashFiles('scripts/build_static_pytorch.sh', 'scripts/torch_caffe.patch') }}
-          restore-keys: |
-            pytorch-static-${{ runner.os }}-img=${{ env.IMAGE }}-rocm=${{ env.ROCM_VERSION }}-arch=${{ env.GPU_ARCHS }}-
-            pytorch-static-${{ runner.os }}-
-
-      - name: Build static PyTorch (if cache miss)
-        if: steps.cache-pytorch.outputs.cache-hit != 'true'
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            if [ -f third_party/pytorch/build_static/lib/libc10.a ] && [ -d third_party/pytorch/build_static/install/include ]; then
-              echo "[pytorch-static] cache warm, skipping rebuild."
-              exit 0
-            fi
+            # Clean any previous build_static to avoid partial/stale state
+            rm -rf third_party/pytorch/build_static
             bash ./scripts/build_static_pytorch.sh
             ls -la third_party/pytorch/build_static/lib/ || true
+            # Sanity: ensure generated headers exist
+            test -f third_party/pytorch/build_static/aten/src/ATen/hip/HIPConfig.h
+            test -f third_party/pytorch/build_static/torch/csrc/autograd/generated/variable_factories.h
           '
-
-      - name: Verify PyTorch build artifacts
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            ls -lh third_party/pytorch/build_static/lib/lib*.a
-            ls -d third_party/pytorch/build_static/install/include
-          '
-
-      - name: Cache AITER artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            build/hipified_aiter
-            build/aiter_build
-          key: >
-            aiter-${{ runner.os }}-img=${{ env.IMAGE }}
-            -rocm=${{ env.ROCM_VERSION }}
-            -arch=${{ env.GPU_ARCHS }}
-            -asm=${{ env.AITER_ASM_DIR }}
-            -submod=${{ steps.aiter_sha.outputs.sha }}
-            -patch=${{ hashFiles('scripts/aiter_torch_remove.patch') }}
-          restore-keys: |
-            aiter-${{ runner.os }}-img=${{ env.IMAGE }}-rocm=${{ env.ROCM_VERSION }}-arch=${{ env.GPU_ARCHS }}-
-            aiter-${{ runner.os }}-
 
       - name: Build umbrella shared library
         run: |
@@ -220,6 +166,8 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
             umask 0002
+            # Ensure autograd generated headers are on include path for JIT builds
+            export JAX_AITER_EXTRA_TORCH_INC="-Ithird_party/pytorch/build_static/torch/csrc"
             python3 jax_aiter/jit/build_jit.py --module module_custom,libmha_bwd,libmha_fwd,module_fmha_v3_bwd,module_fmha_v3_fwd,module_fmha_v3_varlen_bwd,module_fmha_v3_varlen_fwd,module_mha_bwd,module_mha_fwd,module_mha_varlen_bwd,module_mha_varlen_fwd
             ls -lh build/aiter_build/*.so
           '
