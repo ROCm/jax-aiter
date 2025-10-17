@@ -32,6 +32,10 @@ fi
 
 # 2) Configure a static, PIC, ROCm-only, minimal build
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
+  -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+  -DCMAKE_INSTALL_INCLUDEDIR=include \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_INSTALL_BINDIR=bin \
   -DPYTORCH_ROCM_ARCH="gfx942;gfx950" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
