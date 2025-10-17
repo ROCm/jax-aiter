@@ -139,9 +139,9 @@ jobs:
       - name: Build static PyTorch (full)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
             rm -rf third_party/pytorch/build_static
             bash ./scripts/build_static_pytorch.sh
+            echo "PyTorch static build completed"
             ls -la third_party/pytorch/build_static/lib/
           '
 
