@@ -17,7 +17,7 @@ jobs:
       WORKDIR: /workspace
       JA_ROOT_DIR: /jax-aiter
       AITER_SYMBOL_VISIBLE: "1"
-      GPU_ARCHS: "gfx942;gfx950"           # ← kept semicolon for build compatibility
+      GPU_ARCHS: "gfx942;gfx950"
       AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/gfx950
       ROCM_VERSION: 7.0.2
 
@@ -28,10 +28,20 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Detect workspace owner uid/gid
+        id: owner
+        run: |
+          set -euo pipefail
+          pair="$(stat -c '%u:%g' "${{ github.workspace }}")"
+          echo "uid=${pair%%:*}" >> "$GITHUB_OUTPUT"
+          echo "gid=${pair##*:}" >> "$GITHUB_OUTPUT"
+          echo "Host user: $(id -un)  uid=${pair%%:*} gid=${pair##*:}"
+
       - name: Print host info
         run: |
           set -euxo pipefail
           whoami
+          id -u; id -g
           uname -a
           docker --version
           rocm-smi || true
@@ -43,6 +53,7 @@ jobs:
         run: |
           set -euxo pipefail
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          mkdir -p "${{ github.workspace }}/.home"  # HOME for the non-root user
           docker run -d --name "$CONTAINER_NAME" \
             --network=host \
             --device=/dev/kfd \
@@ -52,17 +63,20 @@ jobs:
             --group-add=video \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
+            --user "${{ steps.owner.outputs.uid }}:${{ steps.owner.outputs.gid }}" \
+            -e HOME=/home/runner \
             -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
             -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
             -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
             -v "${{ github.workspace }}:/jax-aiter" \
+            -v "${{ github.workspace }}/.home:/home/runner" \
             -w "/jax-aiter" \
             "$IMAGE" tail -f /dev/null
 
-      - name: Ensure base tooling inside container
+      - name: Ensure base tooling inside container (root for apt)
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
+          docker exec --user 0:0 "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -72,13 +86,24 @@ jobs:
             git --version
           '
 
-      - name: Display environment information
+      - name: Mark repos safe for Git (inside container)
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -eux
+            git config --global --add safe.directory /jax-aiter
+            git config --global --add safe.directory /jax-aiter/third_party/pytorch
+            git config --global --add safe.directory /jax-aiter/third_party/aiter
+          '
+
+      - name: Display environment information (in container)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
             echo "========================================="
             echo "System Information"
             echo "========================================="
+            echo "Container whoami: $(whoami || true)"
+            echo "Container uid: $(id -u), gid: $(id -g)"
             echo "Working directory: $PWD"
             echo "Processors: $(nproc)"
             echo ""
@@ -116,7 +141,6 @@ jobs:
             git apply ../../scripts/aiter_torch_remove.patch
           '
 
-      # Cache keys made consistent with git SHAs
       - name: Get PyTorch submodule SHA
         id: pytorch_sha
         run: echo "sha=$(git rev-parse HEAD:third_party/pytorch)" >> "$GITHUB_OUTPUT"
@@ -142,6 +166,11 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
+            # Optional quick sentinel to skip if cache is already warm (belt & suspenders).
+            if [ -f third_party/pytorch/build_static/lib/libc10.a ] && [ -d third_party/pytorch/build_static/install/include ]; then
+              echo "[pytorch-static] cache warm, skipping rebuild."
+              exit 0
+            fi
             bash ./scripts/build_static_pytorch.sh
             ls -la third_party/pytorch/build_static/lib/ || true
           '
@@ -169,6 +198,7 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
+            umask 0002
             make
             ls -lh build/aiter_build/libjax_aiter.so
           '
@@ -177,6 +207,7 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
+            umask 0002
             python3 jax_aiter/jit/build_jit.py --module module_custom,libmha_bwd,libmha_fwd,module_fmha_v3_bwd,module_fmha_v3_fwd,module_fmha_v3_varlen_bwd,module_fmha_v3_varlen_fwd,module_mha_bwd,module_mha_fwd,module_mha_varlen_bwd,module_mha_varlen_fwd
             ls -lh build/aiter_build/*.so
           '
@@ -185,6 +216,7 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
+            umask 0002
             make ja_mods
             ls -lh build/jax_aiter_build/*.so
           '
