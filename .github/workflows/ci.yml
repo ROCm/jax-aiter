@@ -136,12 +136,11 @@ jobs:
             git apply ../../scripts/aiter_torch_remove.patch
           '
 
-      # NEW: fast hipify-only step
       - name: HIPify PyTorch sources (only)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            bash ./scripts/build_static_pytorch.sh --hipify-only
+            bash ./scripts/build_static_pytorch.sh --hipify-only --force-hipify
             ls -l third_party/pytorch/.hipify_done
           '
 
@@ -159,7 +158,6 @@ jobs:
         with:
           path: |
             third_party/pytorch/build_static
-            third_party/pytorch/.hipify_done
           key: >
             pytorch-static-${{ runner.os }}-img=${{ env.IMAGE }}
             -rocm=${{ env.ROCM_VERSION }}
