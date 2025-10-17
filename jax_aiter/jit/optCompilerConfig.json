@@ -1,7 +1,6 @@
 {
     "module_custom": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/custom/custom_ja.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/custom.cu'",
             "f'{AITER_CSRC_DIR}/kernels/custom_kernels.cu'"
         ],
@@ -14,7 +13,6 @@
     },
     "module_fmha_v3_fwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/asm_mha_fwd/asm_mha_fwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd.cu'"
         ],
@@ -36,7 +34,6 @@
     },
     "module_mha_fwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/ck_fused_attn_fwd/ck_fused_attn_fwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_fwd_kernels.cu'"
         ],
@@ -58,7 +55,6 @@
     },
     "module_mha_varlen_fwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/ck_mha_varlen_fwd/ck_mha_varlen_fwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_fwd_kernels.cu'"
         ],
@@ -82,7 +78,6 @@
     },
     "module_mha_batch_prefill": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/ck_mha_batch_prefill/ck_mha_batch_prefill_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_batch_prefill_kernels.cu'"
         ],
@@ -105,7 +100,6 @@
     },
     "module_fmha_v3_bwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/asm_mha_bwd/asm_mha_bwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cu'"
         ],
@@ -127,7 +121,6 @@
     },
     "module_fmha_v3_varlen_bwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/asm_mha_varlen_bwd/asm_mha_varlen_bwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_bwd.cu'"
         ],
@@ -149,7 +142,6 @@
     },
     "module_fmha_v3_varlen_fwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/asm_mha_varlen_fwd/asm_mha_varlen_fwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_fwd.cu'"
         ],
@@ -170,7 +162,6 @@
     },
     "module_mha_bwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/ck_fused_attn_bwd/ck_fused_attn_bwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'"
         ],
@@ -192,7 +183,6 @@
     },
     "module_mha_varlen_bwd": {
         "srcs": [
-            "f'{JA_ROOT_DIR}/csrc/ffi/ck_mha_varlen_bwd/ck_mha_varlen_bwd_ja.cu'",
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'"
         ],
