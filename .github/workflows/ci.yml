@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euxo pipefail
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          mkdir -p "${{ github.workspace }}/.home"  # HOME for the non-root user
+          mkdir -p "${{ github.workspace }}/.home"
           docker run -d --name "$CONTAINER_NAME" \
             --network=host \
             --device=/dev/kfd \
@@ -69,6 +69,8 @@ jobs:
             -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
             -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
+            -e ROCM_VERSION="${{ env.ROCM_VERSION }}" \
+            -e ROCM_PATH="/opt/rocm-${{ env.ROCM_VERSION }}" \
             -v "${{ github.workspace }}:/jax-aiter" \
             -v "${{ github.workspace }}/.home:/home/runner" \
             -w "/jax-aiter" \
@@ -95,7 +97,7 @@ jobs:
             git config --global --add safe.directory /jax-aiter/third_party/aiter
           '
 
-      - name: Display environment information (in container)
+      - name: Display environment (in container)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
@@ -114,14 +116,7 @@ jobs:
             echo "========================================="
             echo "Environment Variables"
             echo "========================================="
-            env | grep -E "JA_ROOT_DIR|GPU_ARCHS|AITER_ASM_DIR|ROCM_PATH|ROCM_ARCH" || true
-            echo ""
-            echo "========================================="
-            echo "Software Versions"
-            echo "========================================="
-            echo "Python: $(python3 --version)"
-            echo "CMake: $(cmake --version | head -n1 || true)"
-            echo "Ninja: $(ninja --version || true)"
+            env | grep -E "JA_ROOT_DIR|GPU_ARCHS|AITER_ASM_DIR|ROCM_PATH|ROCM_VERSION" || true
             echo "========================================="
           '
 
@@ -141,6 +136,15 @@ jobs:
             git apply ../../scripts/aiter_torch_remove.patch
           '
 
+      # NEW: fast hipify-only step
+      - name: HIPify PyTorch sources (only)
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            bash ./scripts/build_static_pytorch.sh --hipify-only
+            ls -l third_party/pytorch/.hipify_done
+          '
+
       - name: Get PyTorch submodule SHA
         id: pytorch_sha
         run: echo "sha=$(git rev-parse HEAD:third_party/pytorch)" >> "$GITHUB_OUTPUT"
@@ -156,9 +160,14 @@ jobs:
           path: |
             third_party/pytorch/build_static
             third_party/pytorch/.hipify_done
-          key: pytorch-static-${{ runner.os }}-${{ steps.pytorch_sha.outputs.sha }}-${{ hashFiles('scripts/build_static_pytorch.sh') }}
+          key: >
+            pytorch-static-${{ runner.os }}-img=${{ env.IMAGE }}
+            -rocm=${{ env.ROCM_VERSION }}
+            -arch=${{ env.GPU_ARCHS }}
+            -submod=${{ steps.pytorch_sha.outputs.sha }}
+            -patch=${{ hashFiles('scripts/build_static_pytorch.sh', 'scripts/torch_caffe.patch') }}
           restore-keys: |
-            pytorch-static-${{ runner.os }}-${{ steps.pytorch_sha.outputs.sha }}-
+            pytorch-static-${{ runner.os }}-img=${{ env.IMAGE }}-rocm=${{ env.ROCM_VERSION }}-arch=${{ env.GPU_ARCHS }}-
             pytorch-static-${{ runner.os }}-
 
       - name: Build static PyTorch (if cache miss)
@@ -166,7 +175,6 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            # Optional quick sentinel to skip if cache is already warm (belt & suspenders).
             if [ -f third_party/pytorch/build_static/lib/libc10.a ] && [ -d third_party/pytorch/build_static/install/include ]; then
               echo "[pytorch-static] cache warm, skipping rebuild."
               exit 0
@@ -189,9 +197,15 @@ jobs:
           path: |
             build/hipified_aiter
             build/aiter_build
-          key: aiter-${{ runner.os }}-rocm${{ env.ROCM_VERSION }}-gfx-${{ env.GPU_ARCHS }}-${{ steps.aiter_sha.outputs.sha }}
+          key: >
+            aiter-${{ runner.os }}-img=${{ env.IMAGE }}
+            -rocm=${{ env.ROCM_VERSION }}
+            -arch=${{ env.GPU_ARCHS }}
+            -asm=${{ env.AITER_ASM_DIR }}
+            -submod=${{ steps.aiter_sha.outputs.sha }}
+            -patch=${{ hashFiles('scripts/aiter_torch_remove.patch') }}
           restore-keys: |
-            aiter-${{ runner.os }}-rocm${{ env.ROCM_VERSION }}-gfx-${{ env.GPU_ARCHS }}-
+            aiter-${{ runner.os }}-img=${{ env.IMAGE }}-rocm=${{ env.ROCM_VERSION }}-arch=${{ env.GPU_ARCHS }}-
             aiter-${{ runner.os }}-
 
       - name: Build umbrella shared library
