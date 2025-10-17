@@ -1,76 +1,38 @@
 #!/usr/bin/env bash
 # scripts/build_static_pytorch.sh
 # Static-only, PIC PyTorch build for ROCm, minimized to c10/torch_cpu/torch_hip
-# Modes:
-#   --hipify-only   : run only HIPify step and exit
-#   --force-hipify  : re-run HIPify even if sentinel exists
-#
-# Env vars honored:
-#   GPU_ARCHS      : "gfx942;gfx950" (semicolon-separated list)
-#   ROCM_ARCH      : single arch for some CMake knobs (default gfx942)
-#   ROCM_PATH      : ROCm root (default /opt/rocm)
-#   PYTHON         : python interpreter (default python3)
-#   JOBS           : parallel build jobs (default nproc)
 
-set -euo pipefail
+set -euxo pipefail
 
-# -------- parse flags --------
-HIPIFY_ONLY=0
-FORCE_HIPIFY=0
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --hipify-only) HIPIFY_ONLY=1; shift ;;
-    --force-hipify) FORCE_HIPIFY=1; shift ;;
-    *) echo "Unknown arg: $1"; exit 2 ;;
-  esac
-done
-
-# -------- env / defaults --------
-ROCM_ARCH="${ROCM_ARCH:-gfx942}"
-ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
-PYTHON="${PYTHON:-python3}"
-JOBS="${JOBS:-$(nproc)}"
-GPU_ARCHS="${GPU_ARCHS:-gfx942;gfx950}"
+ROCM_ARCH=${ROCM_ARCH:-gfx942}
+ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+PYTHON=${PYTHON:-python3}
+JOBS=${JOBS:-$(nproc)}
 
 SRC_DIR="$(realpath "./third_party/pytorch")"
 BUILD_DIR="$SRC_DIR/build_static"
 INSTALL_DIR="$BUILD_DIR/install"
-SENTINEL="$SRC_DIR/.hipify_done"
 
-echo "===== PyTorch ROCm static build driver ====="
-echo "GPU_ARCHS      : $GPU_ARCHS"
-echo "ROCM_ARCH      : $ROCM_ARCH"
-echo "ROCM_PATH      : $ROCM_PATH"
-echo "PYTHON         : $PYTHON"
-echo "JOBS           : $JOBS"
-echo "SRC_DIR        : $SRC_DIR"
-echo "BUILD_DIR      : $BUILD_DIR"
-echo "INSTALL_DIR    : $INSTALL_DIR"
-echo "HIPIFY_ONLY    : $HIPIFY_ONLY"
-echo "FORCE_HIPIFY   : $FORCE_HIPIFY"
-echo "============================================"
+echo "ROCm arch       : $ROCM_ARCH"
+echo "ROCm path       : $ROCM_PATH"
+echo "PyTorch source  : $SRC_DIR"
+echo "Build directory : $BUILD_DIR"
+echo "Install prefix  : $INSTALL_DIR"
+echo "Jobs            : $JOBS"
 echo
 
-# -------- step 1: HIPify (idempotent; can be forced) --------
-if [[ $FORCE_HIPIFY -eq 1 || ! -f "$SENTINEL" ]]; then
-  echo "[HIPIFY] Running HIPify on PyTorch sources (in-place)..."
+# 1) HIPify once (idempotent)
+if [ ! -f "$SRC_DIR/.hipify_done" ]; then
+  echo "HIPifying PyTorch sources (in-place)"
   "$PYTHON" "$SRC_DIR/tools/amd_build/build_amd.py" --project-directory="$SRC_DIR"
-  date -u +"%Y-%m-%dT%H:%M:%SZ" > "$SENTINEL"
-  echo "[HIPIFY] Complete ($(cat "$SENTINEL"))"
-else
-  echo "[HIPIFY] Skipped (found $SENTINEL). Use --force-hipify to re-run."
+  touch "$SRC_DIR/.hipify_done"
+  echo "HIPify complete"
+  echo
 fi
 
-# Early exit if user requested hipify-only mode
-if [[ $HIPIFY_ONLY -eq 1 ]]; then
-  echo "[MODE] --hipify-only requested; exiting after HIPify."
-  exit 0
-fi
-
-# -------- step 2: CMake configure --------
-echo "[CMAKE] Configuring static, PIC, ROCm-only build..."
+# 2) Configure a static, PIC, ROCm-only, minimal build
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
-  -DPYTORCH_ROCM_ARCH="${GPU_ARCHS}" \
+  -DPYTORCH_ROCM_ARCH="gfx942;gfx950" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -162,11 +124,8 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
   -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections" \
   -DCMAKE_CXX_FLAGS="-Wno-stringop-overflow -ffunction-sections -fdata-sections -DUSE_DIRECT_NVRTC"
 
-# -------- step 3: build + install just what we need --------
-echo "[BUILD] c10 torch_cpu torch_hip caffe2_nvrtc ..."
+# 3) Build and install just what we need for linking
 cmake --build "$BUILD_DIR" --target c10 torch_cpu torch_hip caffe2_nvrtc -j"$JOBS"
-
-echo "[INSTALL] to $INSTALL_DIR ..."
 cmake --install "$BUILD_DIR" --prefix "$INSTALL_DIR"
 
 echo
@@ -174,4 +133,3 @@ echo "Static libraries installed:"
 ls -1 "$INSTALL_DIR/lib/"lib{c10,torch_*}.a || true
 echo "Headers installed under:"
 echo "  $INSTALL_DIR/include"
-echo "[DONE]"

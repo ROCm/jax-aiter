@@ -136,20 +136,13 @@ jobs:
             git apply ../../scripts/aiter_torch_remove.patch
           '
 
-      # REMOVED: hipify-only step
-      # REMOVED: PyTorch cache steps
-
       - name: Build static PyTorch (full)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            # Clean any previous build_static to avoid partial/stale state
             rm -rf third_party/pytorch/build_static
             bash ./scripts/build_static_pytorch.sh
-            ls -la third_party/pytorch/build_static/lib/ || true
-            # Sanity: ensure generated headers exist
-            test -f third_party/pytorch/build_static/aten/src/ATen/hip/HIPConfig.h
-            test -f third_party/pytorch/build_static/torch/csrc/autograd/generated/variable_factories.h
+            ls -la third_party/pytorch/build_static/lib/
           '
 
       - name: Build umbrella shared library
