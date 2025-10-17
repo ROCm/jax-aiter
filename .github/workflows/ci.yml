@@ -16,7 +16,7 @@ jobs:
       CONTAINER_NAME: rv_aiter_ci
       WORKDIR: /workspace
       JA_ROOT_DIR: /jax-aiter
-      AITER_SYMBOL_VISIBLE: "1"
+      AITER_SYMBOL_VISIBLE: 1
       GPU_ARCHS: "gfx942;gfx950"
       AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/gfx950
       ROCM_VERSION: 7.0.2
@@ -27,15 +27,6 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-
-      - name: Detect workspace owner uid/gid
-        id: owner
-        run: |
-          set -euo pipefail
-          pair="$(stat -c '%u:%g' "${{ github.workspace }}")"
-          echo "uid=${pair%%:*}" >> "$GITHUB_OUTPUT"
-          echo "gid=${pair##*:}" >> "$GITHUB_OUTPUT"
-          echo "Host user: $(id -un)  uid=${pair%%:*} gid=${pair##*:}"
 
       - name: Print host info
         run: |
@@ -53,7 +44,6 @@ jobs:
         run: |
           set -euxo pipefail
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
-          mkdir -p "${{ github.workspace }}/.home"
           docker run -d --name "$CONTAINER_NAME" \
             --network=host \
             --device=/dev/kfd \
@@ -63,8 +53,6 @@ jobs:
             --group-add=video \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
-            --user "${{ steps.owner.outputs.uid }}:${{ steps.owner.outputs.gid }}" \
-            -e HOME=/home/runner \
             -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
             -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
@@ -72,13 +60,12 @@ jobs:
             -e ROCM_VERSION="${{ env.ROCM_VERSION }}" \
             -e ROCM_PATH="/opt/rocm-${{ env.ROCM_VERSION }}" \
             -v "${{ github.workspace }}:/jax-aiter" \
-            -v "${{ github.workspace }}/.home:/home/runner" \
             -w "/jax-aiter" \
             "$IMAGE" tail -f /dev/null
 
-      - name: Ensure base tooling inside container (root for apt)
+      - name: Ensure base tooling inside container
         run: |
-          docker exec --user 0:0 "$CONTAINER_NAME" bash -lc '
+          docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -139,10 +126,14 @@ jobs:
       - name: Build static PyTorch (full)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
             rm -rf third_party/pytorch/build_static
             bash ./scripts/build_static_pytorch.sh
             echo "PyTorch static build completed"
             ls -la third_party/pytorch/build_static/lib/
+            # Sanity: generated headers present
+            test -f third_party/pytorch/build_static/aten/src/ATen/hip/HIPConfig.h
+            test -f third_party/pytorch/build_static/torch/csrc/autograd/generated/variable_factories.h
           '
 
       - name: Build umbrella shared library
