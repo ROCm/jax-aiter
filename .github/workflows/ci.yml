@@ -101,7 +101,7 @@ jobs:
             echo "========================================="
             echo "Environment Variables"
             echo "========================================="
-            env | grep -E "JA_ROOT_DIR|GPU_ARCHS|AITER_ASM_DIR|ROCM_PATH|ROCM_VERSION" || true
+            env
             echo "========================================="
           '
 
