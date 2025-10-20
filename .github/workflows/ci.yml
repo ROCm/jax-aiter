@@ -216,6 +216,6 @@ jobs:
             echo "========================================="
           '
 
-      - name: Cleanup container
-        if: always()
-        run: docker rm -f "$CONTAINER_NAME" || true
+      # - name: Cleanup container
+      #   if: always()
+      #   run: docker rm -f "$CONTAINER_NAME" || true
