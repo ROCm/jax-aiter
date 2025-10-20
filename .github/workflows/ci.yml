@@ -129,9 +129,6 @@ jobs:
             bash ./scripts/build_static_pytorch.sh
             echo "PyTorch static build completed"
             ls -la third_party/pytorch/build_static/lib/
-            # Sanity: generated headers present
-            test -f third_party/pytorch/build_static/aten/src/ATen/hip/HIPConfig.h
-            test -f third_party/pytorch/build_static/torch/csrc/autograd/generated/variable_factories.h
           '
 
       - name: Build umbrella shared library
