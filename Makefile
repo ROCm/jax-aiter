@@ -71,7 +71,7 @@ LDFLAGS := -Wl,--whole-archive \
   -Wl,--no-gnu-unique \
   -Wl,-soname,libjax_aiter.so
 
-OUT_SO := build/aiter_build/libjax_aiter.so
+OUT_SO := build/jax_aiter_build/libjax_aiter.so
 
 # JA modules directory and flags.
 JA_BUILD_DIR := build/jax_aiter_build
@@ -117,7 +117,7 @@ configure:
 %/: 
 	mkdir -p $@
 
-$(OUT_SO): build/aiter_build/
+$(OUT_SO): build/jax_aiter_build/
 	$(HIPCC) -shared -fPIC $(CXXFLAGS) $(LDFLAGS) -o $@
 
 # JA module rules.
@@ -152,5 +152,5 @@ $(JA_BUILD_DIR)/ck_mha_batch_prefill_ja.so: csrc/ffi/ck_mha_batch_prefill/ck_mha
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
 
 clean:
-	rm -rf build/jax_aiter_build
-	@echo "Cleaned build/jax_aiter_build/ directory"
+	rm -rf build/jax_aiter_build build/aiter_build
+	@echo "Cleaned build directories"

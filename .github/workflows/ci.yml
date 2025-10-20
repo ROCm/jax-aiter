@@ -28,6 +28,10 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Get third_party/aiter submodule SHA
+        id: aiter_sha
+        run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Print host info
         run: |
           set -euxo pipefail
@@ -136,8 +140,14 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
             make
-            ls -lh build/aiter_build/libjax_aiter.so
+            ls -lh build/jax_aiter_build/libjax_aiter.so
           '
+
+      - name: Restore AITER JIT modules cache
+        uses: actions/cache@v4
+        with:
+          path: build/aiter_build
+          key: aiter-so-${{ steps.aiter_sha.outputs.sha }}-${{ hashFiles('jax_aiter/jit/*') }}
 
       - name: Build JIT modules
         run: |
@@ -205,7 +215,7 @@ jobs:
             echo "========================================="
             echo "PyTorch static libs:"; ls -lh third_party/pytorch/build_static/lib/lib*.a 2>/dev/null || echo "Not found"
             echo ""
-            echo "JAX-AITER umbrella library:"; ls -lh build/aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
+            echo "JAX-AITER umbrella library:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
             echo ""
             echo "AITER modules:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None found"
             echo ""

@@ -30,12 +30,12 @@ def get_package_install_dir() -> Path:
     return Path(jax_aiter.__file__).parent
 
 
-def get_repo_root() -> Path:
+def get_lib_root() -> Path:
     # Prefer explicit env for local builds,
     # otherwise fall back to common repo layout.
     root = os.environ.get("JA_ROOT_DIR")
     if root:
-        return Path(root).resolve() / "build" / "aiter_build"
+        return Path(root).resolve() / "build"
     elif get_packaged_lib_dir():
         return get_packaged_lib_dir() / "_lib"
 
@@ -46,16 +46,7 @@ def get_repo_root() -> Path:
 
 def get_umbrella_lib() -> Path:
     """Get the path to the umbrella shared library."""
-    return get_repo_root() / "libjax_aiter.so"
-
-
-def get_local_lib_dirs() -> list[Path]:
-    """Get directories where locally built .so files are expected."""
-    root = get_repo_root()
-    return [
-        root / "build" / "bin",
-        root / "build" / "aiter_build",
-    ]
+    return get_lib_root() / "jax_aiter_build" / "libjax_aiter.so"
 
 
 def set_aiter_asm_dir():

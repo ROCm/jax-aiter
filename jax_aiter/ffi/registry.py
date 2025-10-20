@@ -87,8 +87,7 @@ def load_thin_modules():
     if not _umbrella_handle:
         raise RuntimeError("Umbrella library must be loaded first")
 
-    umbrella_path = ja_config.get_umbrella_lib()
-    build_root = umbrella_path.parent.parent  # .../build
+    build_root = ja_config.get_lib_root()
     aiter_dir = build_root / "aiter_build"
     ja_dir = build_root / "jax_aiter_build"
 
@@ -97,7 +96,6 @@ def load_thin_modules():
         if not dir_path.exists():
             logger.info(f"{tag} directory not found: {dir_path}")
             return
-        
         for module_so in sorted(dir_path.glob("*.so")):
             try:
                 if module_so.name == "libjax_aiter.so":

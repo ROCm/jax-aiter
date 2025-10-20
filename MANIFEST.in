@@ -1,5 +1,5 @@
 # Include compiled libraries in source distribution
-recursive-include jax_aiter/build *.so
+recursive-include jax_aiter/_lib *.so
 
 # Include HSA kernel files
 recursive-include jax_aiter/_hsa *.co
