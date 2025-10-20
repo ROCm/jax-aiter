@@ -51,9 +51,9 @@ LDFLAGS := -Wl,--whole-archive \
     $(TORCH_STATIC_LIBDIR)/libtorch_hip.a \
     $(TORCH_STATIC_LIBDIR)/libc10.a \
     $(TORCH_STATIC_LIBDIR)/libc10_hip.a \
-    $(TORCH_STATIC_LIBDIR)/libcaffe2_nvrtc.a \
   -Wl,--no-whole-archive \
   -Wl,--start-group \
+    $(TORCH_STATIC_LIBDIR)/libcaffe2_nvrtc.a \
     $(TORCH_STATIC_LIBDIR)/libcpuinfo.a \
     $(SLEEF_LIBDIR)/libsleef.a \
     $(TORCH_STATIC_LIBDIR)/libprotobuf-lite.a \
