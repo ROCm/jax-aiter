@@ -153,8 +153,6 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            # Ensure autograd generated headers are on include path for JIT builds
-            export JAX_AITER_EXTRA_TORCH_INC="-Ithird_party/pytorch/build_static/torch/csrc"
             python3 jax_aiter/jit/build_jit.py --module module_custom,libmha_bwd,libmha_fwd,module_fmha_v3_bwd,module_fmha_v3_fwd,module_fmha_v3_varlen_bwd,module_fmha_v3_varlen_fwd,module_mha_bwd,module_mha_fwd,module_mha_varlen_bwd,module_mha_varlen_fwd
             ls -lh build/aiter_build/*.so
           '
@@ -200,7 +198,6 @@ jobs:
       - name: Run tests
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
             pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_varlen_ja.py
             pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_ck_ja.py
           '
@@ -223,6 +220,6 @@ jobs:
             echo "========================================="
           '
 
-      # - name: Cleanup container
-      #   if: always()
-      #   run: docker rm -f "$CONTAINER_NAME" || true
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true

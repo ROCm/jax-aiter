@@ -69,7 +69,7 @@ def _normalize_window_size(
     wr = -1 if window_size_right >= seqlen_k else window_size_right
     return wl, wr
 
-
+can_use_v3_fwd = False
 def _can_impl_fmha_v3_fwd(
     q,
     k,
@@ -99,6 +99,8 @@ def _can_impl_fmha_v3_fwd(
     ret = ret and (nhead_q % nhead_k == 0)
     ret = ret and (not swa)
     ret = ret and (q.dtype == dtypes.bf16)
+    global can_use_v3_fwd
+    can_use_v3_fwd = ret
     return ret
 
 
@@ -994,7 +996,7 @@ def _flash_attn_backward(
         alibi_slopes,
         deterministic,
         is_v3_atomic_fp32,
-    )
+    ) & can_use_v3_fwd
 
     try:
         if can_impl_fmha_v3_bwd_:
