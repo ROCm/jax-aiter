@@ -1,0 +1,11 @@
+# Include compiled libraries in source distribution
+recursive-include jax_aiter/_lib *.so
+
+# Include HSA kernel files
+recursive-include jax_aiter/_hsa *.co
+recursive-include jax_aiter/_hsa *.csv
+recursive-include jax_aiter/_hsa *.py
+
+# Include README and license
+include README.md
+include LICENSE

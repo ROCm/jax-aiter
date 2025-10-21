@@ -121,15 +121,18 @@ cmake -S "$SRC_DIR" -B "$BUILD_DIR" -GNinja \
   -DUSE_MEM_EFF_ATTENTION=OFF \
   -DUSE_AOTRITON=OFF \
   \
+  -DFMT_INSTALL=OFF \
+  -DFMT_TEST=OFF \
+  -DFMT_DOC=OFF \
+  -DFMT_HEADER_ONLY=ON \
+  \
   -DCMAKE_C_FLAGS="-ffunction-sections -fdata-sections" \
   -DCMAKE_CXX_FLAGS="-Wno-stringop-overflow -ffunction-sections -fdata-sections -DUSE_DIRECT_NVRTC"
 
 # 3) Build and install just what we need for linking
-cmake --build "$BUILD_DIR" --target c10 torch_cpu torch_hip caffe2_nvrtc -j"$JOBS"
+cmake --build "$BUILD_DIR" --target c10 torch_cpu torch_hip caffe2_nvrtc torch -j"$JOBS"
 cmake --install "$BUILD_DIR" --prefix "$INSTALL_DIR"
 
 echo
 echo "Static libraries installed:"
 ls -1 "$INSTALL_DIR/lib/"lib{c10,torch_*}.a || true
-echo "Headers installed under:"
-echo "  $INSTALL_DIR/include"

@@ -24,23 +24,23 @@ _jax_initialized = False
 
 # Symbol to module mapping.
 SYMBOL_TO_MODULE_MAP = {
-    # module_custom.so symbols.
-    "LLMM1JA": "module_custom.so",
-    "LLZZJA": "module_custom.so",
-    "MMCustomGPUJA": "module_custom.so",
-    "WvSplitKJA": "module_custom.so",
-    "WvSplitKQJA": "module_custom.so",
-    "WvSplitKSmallJA": "module_custom.so",
-    # Individual module symbols.
-    "FmhaV3BwdJA": "module_fmha_v3_bwd.so",
-    "FmhaV3FwdJA": "module_fmha_v3_fwd.so",
-    "FmhaV3VarlenBwdJA": "module_fmha_v3_varlen_bwd.so",
-    "FmhaV3VarlenFwdJA": "module_fmha_v3_varlen_fwd.so",
-    "MhaBatchPrefillJA": "module_mha_batch_prefill.so",
-    "MhaBwdJA": "module_mha_bwd.so",
-    "MhaFwdJA": "module_mha_fwd.so",
-    "MhaVarlenFwdJA": "module_mha_varlen_fwd.so",
-    "MhaVarlenBwdJA": "module_mha_varlen_bwd.so",
+    # JA custom symbols -> custom_ja.so
+    "LLMM1JA": "custom_ja.so",
+    "LLZZJA": "custom_ja.so",
+    "MMCustomGPUJA": "custom_ja.so",
+    "WvSplitKJA": "custom_ja.so",
+    "WvSplitKQJA": "custom_ja.so",
+    "WvSplitKSmallJA": "custom_ja.so",
+    # JA MHA symbols -> *_ja.so
+    "FmhaV3BwdJA": "asm_mha_bwd_ja.so",
+    "FmhaV3FwdJA": "asm_mha_fwd_ja.so",
+    "FmhaV3VarlenBwdJA": "asm_mha_varlen_bwd_ja.so",
+    "FmhaV3VarlenFwdJA": "asm_mha_varlen_fwd_ja.so",
+    "MhaBatchPrefillJA": "ck_mha_batch_prefill_ja.so",
+    "MhaBwdJA": "ck_fused_attn_bwd_ja.so",
+    "MhaFwdJA": "ck_fused_attn_fwd_ja.so",
+    "MhaVarlenFwdJA": "ck_mha_varlen_fwd_ja.so",
+    "MhaVarlenBwdJA": "ck_mha_varlen_bwd_ja.so",
 }
 
 
@@ -81,27 +81,33 @@ def load_umbrella_library():
 
 
 def load_thin_modules():
-    """Load thin modules in main namespace."""
+    """Load thin modules in main namespace from AITER and JA build directories."""
     global _module_handles
 
     if not _umbrella_handle:
         raise RuntimeError("Umbrella library must be loaded first")
 
-    lib_dir = ja_config.get_repo_root()
-    if not lib_dir.exists():
-        logger.warning(f"Module directory not found: {lib_dir}")
-        return
+    build_root = ja_config.get_lib_root()
+    aiter_dir = build_root / "aiter_build"
+    ja_dir = build_root / "jax_aiter_build"
 
-    # Search for *.so files in configured directories.
-    for module_so in sorted(lib_dir.glob("*.so")):
-        try:
-            if module_so.name == "libjax_aiter.so":
-                continue
-            module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
-            _module_handles[module_so.name] = module_handle
-            logger.info(f"Loaded thin module: {module_so}")
-        except Exception as e:
-            logger.warning(f"Could not load {module_so}: {e}")
+    def _load_dir(dir_path, tag):
+        """Load all .so files from a directory."""
+        if not dir_path.exists():
+            logger.info(f"{tag} directory not found: {dir_path}")
+            return
+        for module_so in sorted(dir_path.glob("*.so")):
+            try:
+                if module_so.name == "libjax_aiter.so":
+                    continue
+                module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
+                _module_handles[module_so.name] = module_handle
+            except Exception as e:
+                logger.warning(f"Could not load {module_so}: {e}")
+
+    # Load AITER modules first, then JA modules
+    _load_dir(aiter_dir, "aiter")
+    _load_dir(ja_dir, "ja")
 
 
 def resolve_symbol(target_name: str) -> int:

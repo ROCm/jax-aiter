@@ -104,15 +104,15 @@ Key paths (from Makefile):
 - Include dirs: JAX FFI, PyTorch, and csrc/common are used
 
 
-### 4) Build JAX-AITER JIT modules
+### 4) Build AITER JIT modules
 
-Build specific modules (example: varlen fwd+bwd):
+Build specific AITER modules (example: varlen fwd+bwd):
 
 ```bash
 python3 jax_aiter/jit/build_jit.py --module module_fmha_v3_varlen_fwd,module_fmha_v3_varlen_bwd
 ```
 
-Build all configured modules:
+Build all configured AITER modules:
 
 ```bash
 python3 jax_aiter/jit/build_jit.py
@@ -125,7 +125,21 @@ Notes:
 - build_jit.py patches AITER's core to redirect user JIT dir to build/aiter_build and inject PyTorch/JAX-FFI include paths.
 - Ensure static PyTorch build completed first; headers and libs expected under third_party/pytorch/build_static and build_static/install/include.
 
-### 5) Test / Verify
+### 5) Build JAX-AITER modules
+
+Build JAX-AITER frontend modules that bridge JAX FFI to AITER:
+
+```bash
+make ja_mods
+```
+
+Outputs (.so) are placed under build/jax_aiter_build/.
+
+Notes:
+- JA modules are thin host-only frontends that call into AITER implementations
+- They must be built after the umbrella and AITER modules
+
+### 6) Test / Verify
 
 Smoke test:
 
@@ -133,9 +147,13 @@ Smoke test:
 python -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print('jax-aiter import OK')"
 ```
 
-Run tests (requires JAX ROCm and GPU):
+Run tests (requires JAX ROCm, Pytorch and GPU):
+
+Pytorch is a test time dependency and requires to test with the baseline.
 
 ```Bash
+pip install --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0/torch==2.8.0+rocm7.0.0.git64359f59
+python3 setup.py # both aiter and jax aiter.
 pip install pytest-xdist
 ```
 

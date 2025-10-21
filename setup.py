@@ -13,29 +13,34 @@ README = README_FILE.read_text(encoding="utf-8") if README_FILE.exists() else ""
 PKG_LIB_DIR = Path("jax_aiter/_lib")
 PKG_HSA_DIR = Path("jax_aiter/_hsa")
 # many .so files; we'll exclude aiter_build/build/**
-SO_DIR = Path("build/aiter_build")
+SO_DIR = Path("build")
 HSA_DIR = Path("third_party/aiter/hsa")
 
 
-def _should_skip(p: Path) -> bool:
-    """Skip files in aiter_build/build/** subdirectory"""
-    parts = p.parts
-    if "aiter_build" in parts:
-        i = parts.index("aiter_build")
-        if "build" in parts[i + 1 :]:
-            return True
-    return False
-
-
 def _copy_libs() -> int:
-    """Copy prebuilt .so files into jax_aiter/_lib, excluding aiter_build/build/**."""
+    """Copy prebuilt .so files into jax_aiter/_lib/{aiter_build,jax_aiter_build}.
+
+    Copies only top-level *.so from build/aiter_build and build/jax_aiter_build
+    into jax_aiter/_lib preserving the directory names. This matches the runtime
+    expectations in ja_compat.config and ffi.registry.
+    """
     PKG_LIB_DIR.mkdir(parents=True, exist_ok=True)
     n = 0
-    for so in SO_DIR.rglob("*.so"):
-        if _should_skip(so):
+
+    for name in ("aiter_build", "jax_aiter_build"):
+        src_dir = SO_DIR / name
+        if not src_dir.exists():
+            print(f"Warning: source directory not found: {src_dir}, skipping")
             continue
-        shutil.copy2(so, PKG_LIB_DIR / so.name)
-        n += 1
+
+        dst_dir = PKG_LIB_DIR / name
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy only top-level .so files; registry uses dir.glob("*.so")
+        for so in sorted(src_dir.glob("*.so")):
+            shutil.copy2(so, dst_dir / so.name)
+            n += 1
+
     return n
 
 
@@ -122,7 +127,7 @@ setup(
     package_data={
         # Wheel inclusion: include the copied .so files and HSA kernels.
         "jax_aiter": [
-            "_lib/*.so",
+            "_lib/**/*.so",
             "_hsa/**/*.co",
             "_hsa/**/*.csv",
             "_hsa/**/*.py",

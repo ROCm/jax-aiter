@@ -9,11 +9,18 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: linux-mi355-4
-    container:
-      image: rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
-      options: --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined --group-add video
-    
+    runs-on: [self-hosted, Linux, X64]
+
+    env:
+      IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
+      CONTAINER_NAME: rv_aiter_ci
+      WORKDIR: /workspace
+      JA_ROOT_DIR: /jax-aiter
+      AITER_SYMBOL_VISIBLE: 1
+      GPU_ARCHS: "gfx942;gfx950"
+      AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/gfx950
+      ROCM_VERSION: 7.0.2
+
     steps:
       - name: Checkout repository with submodules
         uses: actions/checkout@v4
@@ -21,133 +28,201 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Set up environment variables
-        run: |
-          echo "JA_ROOT_DIR=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-          echo "AITER_SYMBOL_VISIBLE=1" >> $GITHUB_ENV
-          echo "GPU_ARCHS=gfx942;gfx950" >> $GITHUB_ENV
-          echo "AITER_ASM_DIR=$GITHUB_WORKSPACE/third_party/aiter/hsa/gfx950/" >> $GITHUB_ENV
-          echo "ROCM_ARCH=gfx942" >> $GITHUB_ENV
-          echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
-          echo "PYTHON=python3" >> $GITHUB_ENV
+      - name: Get third_party/aiter submodule SHA
+        id: aiter_sha
+        run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Display environment information
+      - name: Print host info
         run: |
-          echo "========================================="
-          echo "System Information"
-          echo "========================================="
-          echo "Working directory: $PWD"
-          echo "Number of processors: $(nproc)"
-          echo ""
-          echo "ROCm SMI:"
-          rocm-smi || echo "rocm-smi not available"
-          echo ""
-          echo "ROCm Info (GPU details):"
-          rocminfo | grep -E "Marketing Name:|gfx" || true
-          echo ""
-          echo "========================================="
-          echo "Environment Variables"
-          echo "========================================="
-          echo "JA_ROOT_DIR: $JA_ROOT_DIR"
-          echo "GPU_ARCHS: $GPU_ARCHS"
-          echo "ROCM_ARCH: $ROCM_ARCH"
-          echo "ROCM_PATH: $ROCM_PATH"
-          echo ""
-          echo "========================================="
-          echo "Software Versions"
-          echo "========================================="
-          echo "Python: $(python3 --version)"
-          echo "CMake: $(cmake --version | head -n1)"
-          echo "Ninja: $(ninja --version)"
-          echo "========================================="
+          set -euxo pipefail
+          whoami
+          id -u; id -g
+          uname -a
+          docker --version
+          rocm-smi || true
 
-      - name: Install build dependencies
+      - name: Pull container image
+        run: docker pull "$IMAGE"
+
+      - name: Launch build container (ROCm + big shm + devices + env)
         run: |
-          pip install --upgrade pip
-          pip install cmake ninja pyyaml pytest pytest-xdist
+          set -euxo pipefail
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host \
+            --device=/dev/kfd \
+            --device=/dev/dri \
+            --ipc=host \
+            --shm-size=64G \
+            --group-add=video \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
+            -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w "/jax-aiter" \
+            "$IMAGE" tail -f /dev/null
+
+      - name: Ensure base tooling inside container
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              git ca-certificates curl build-essential pkg-config
+            python3 -m pip install --upgrade pip
+            python3 -m pip install cmake ninja pyyaml pytest pytest-xdist
+            git --version
+          '
+
+      - name: Mark repos safe for Git (inside container)
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -eux
+            git config --global --add safe.directory /jax-aiter
+            git config --global --add safe.directory /jax-aiter/third_party/pytorch
+            git config --global --add safe.directory /jax-aiter/third_party/aiter
+          '
+
+      - name: Display environment (in container)
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            echo "========================================="
+            echo "System Information"
+            echo "========================================="
+            echo "Container whoami: $(whoami || true)"
+            echo "Container uid: $(id -u), gid: $(id -g)"
+            echo "Working directory: $PWD"
+            echo "Processors: $(nproc)"
+            echo ""
+            echo "ROCm SMI:"; rocm-smi || echo "rocm-smi not available"
+            echo ""
+            echo "ROCm Info (GPU details):"; rocminfo | grep -E "Marketing Name:|gfx" || true
+            echo ""
+            echo "========================================="
+            echo "Environment Variables"
+            echo "========================================="
+            env
+            echo "========================================="
+          '
 
       - name: Apply PyTorch patch
-        working-directory: third_party/pytorch
         run: |
-          echo "Applying caffe2_nvrtc static/PIC patch..."
-          git apply ../../scripts/torch_caffe.patch
-          echo "PyTorch patch applied successfully"
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            cd third_party/pytorch
+            git apply ../../scripts/torch_caffe.patch
+          '
 
       - name: Apply AITER patch
-        working-directory: third_party/aiter
         run: |
-          echo "Applying AITER torch removal patch..."
-          git apply ../../scripts/aiter_torch_remove.patch
-          echo "AITER patch applied successfully"
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            cd third_party/aiter
+            git apply ../../scripts/aiter_torch_remove.patch
+          '
 
-      - name: Cache PyTorch static build
-        id: cache-pytorch
-        uses: actions/cache@v4
-        with:
-          path: |
-            third_party/pytorch/build_static
-            third_party/pytorch/.hipify_done
-          key: pytorch-static-${{ runner.os }}-${{ hashFiles('third_party/pytorch/**/*.cpp', 'third_party/pytorch/**/*.h', 'scripts/build_static_pytorch.sh') }}
-          restore-keys: |
-            pytorch-static-${{ runner.os }}-
-
-      - name: Build static PyTorch libraries
-        if: steps.cache-pytorch.outputs.cache-hit != 'true'
+      - name: Build static PyTorch (full)
         run: |
-          echo "Building static PyTorch with gfx942 and gfx950 support..."
-          bash ./scripts/build_static_pytorch.sh
-          echo "PyTorch static build completed"
-          ls -la third_party/pytorch/build_static/lib/
-
-      - name: Verify PyTorch build artifacts
-        run: |
-          echo "Checking PyTorch static libraries..."
-          ls -lh third_party/pytorch/build_static/lib/lib*.a
-          echo "Checking PyTorch headers..."
-          ls -d third_party/pytorch/build_static/install/include
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            rm -rf third_party/pytorch/build_static
+            bash ./scripts/build_static_pytorch.sh
+            echo "PyTorch static build completed"
+            ls -la third_party/pytorch/build_static/lib/
+          '
 
       - name: Build umbrella shared library
         run: |
-          echo "Building JAX-AITER umbrella library..."
-          make
-          echo "Umbrella library build completed"
-          ls -lh build/aiter_build/libjax_aiter.so
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            make
+            ls -lh build/jax_aiter_build/libjax_aiter.so
+          '
+
+      - name: Restore AITER JIT modules cache
+        uses: actions/cache@v4
+        with:
+          path: build/aiter_build
+          key: aiter-so-${{ steps.aiter_sha.outputs.sha }}-${{ hashFiles('jax_aiter/jit/*') }}
 
       - name: Build JIT modules
         run: |
-          echo "Building all JIT modules..."
-          python3 jax_aiter/jit/build_jit.py --module module_custom,libmha_bwd,libmha_fwd,module_fmha_v3_bwd,module_fmha_v3_fwd,module_fmha_v3_varlen_bwd,module_fmha_v3_varlen_fwd,module_mha_bwd,module_mha_fwd,module_mha_varlen_bwd,module_mha_varlen_fwd
-          echo "JIT modules build completed"
-          echo "Built modules:"
-          ls -lh build/aiter_build/*.so
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            # Ensure autograd generated headers are on include path for JIT builds
+            export JAX_AITER_EXTRA_TORCH_INC="-Ithird_party/pytorch/build_static/torch/csrc"
+            python3 jax_aiter/jit/build_jit.py --module module_custom,libmha_bwd,libmha_fwd,module_fmha_v3_bwd,module_fmha_v3_fwd,module_fmha_v3_varlen_bwd,module_fmha_v3_varlen_fwd,module_mha_bwd,module_mha_fwd,module_mha_varlen_bwd,module_mha_varlen_fwd
+            ls -lh build/aiter_build/*.so
+          '
+
+      - name: Build JA frontend modules
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            make ja_mods
+            ls -lh build/jax_aiter_build/*.so
+          '
+
+      - name: Install ROCm PyTorch runtime wheel
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            python3 -m pip install --upgrade pip
+            pip install --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0/ \
+              torch==2.8.0+rocm7.0.0.git64359f59
+          '
+
+      - name: Install AITER
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            pip install third_party/aiter
+          '
+
+      - name: Install JAX-AITER
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            pip install .
+          '
 
       - name: Run smoke test
         run: |
-          echo "Running smoke test..."
-          python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print('✓ jax-aiter import successful')"
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print(\"jax-aiter import successful\")"
+          '
 
-      - name: Run MHA varlen tests
+      - name: Run tests
         run: |
-          echo "Running MHA varlen tests..."
-          pytest -v tests/test_mha_varlen_ja.py || echo "⚠ Tests completed with issues"
-
-      - name: Run MHA CK tests
-        run: |
-          echo "Running MHA CK tests..."
-          pytest -v tests/test_mha_ck_ja.py || echo "⚠ Tests completed with issues"
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_varlen_ja.py
+            pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_ck_ja.py
+          '
 
       - name: Build summary
         if: always()
         run: |
-          echo "========================================="
-          echo "Build Summary"
-          echo "========================================="
-          echo "PyTorch static libs:"
-          ls -lh third_party/pytorch/build_static/lib/lib*.a 2>/dev/null || echo "Not found"
-          echo ""
-          echo "JAX-AITER umbrella library:"
-          ls -lh build/aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
-          echo ""
-          echo "JIT modules:"
-          ls -lh build/aiter_build/*.so 2>/dev/null || echo "None found"
-          echo "========================================="
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euxo pipefail
+            echo "========================================="
+            echo "Build Summary"
+            echo "========================================="
+            echo "PyTorch static libs:"; ls -lh third_party/pytorch/build_static/lib/lib*.a 2>/dev/null || echo "Not found"
+            echo ""
+            echo "JAX-AITER umbrella library:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
+            echo ""
+            echo "AITER modules:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None found"
+            echo ""
+            echo "JA modules:"; ls -lh build/jax_aiter_build/*.so 2>/dev/null || echo "None found"
+            echo "========================================="
+          '
+
+      # - name: Cleanup container
+      #   if: always()
+      #   run: docker rm -f "$CONTAINER_NAME" || true
