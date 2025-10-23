@@ -144,12 +144,24 @@ jobs:
           '
 
       - name: Restore AITER JIT modules cache
+        id: aiter_cache
         uses: actions/cache@v4
         with:
           path: build/aiter_build
-          key: aiter-so-${{ steps.aiter_sha.outputs.sha }}-${{ hashFiles('jax_aiter/jit/*') }}
+          key: aiter-so-${{ runner.os }}-img-${{ hashFiles(format('{0}', env.IMAGE)) }}-rocm-${{ env.ROCM_VERSION }}-archs-${{ hashFiles(format('{0}', env.GPU_ARCHS)) }}-aiter-${{ steps.aiter_sha.outputs.sha }}-jit-${{ hashFiles('jax_aiter/jit/**') }}-cfg-${{ hashFiles('scripts/**') }}
+
+      - name: Check if JIT outputs exist
+        id: have_jit
+        run: |
+          set -euo pipefail
+          if [ -d build/aiter_build ] && [ -n "$(ls -A build/aiter_build/*.so 2>/dev/null)" ]; then
+            echo "count=$(ls build/aiter_build/*.so 2>/dev/null | wc -l)"
+          else
+            echo "count=0"
+          fi >> "$GITHUB_OUTPUT"
 
       - name: Build JIT modules
+        if: steps.aiter_cache.outputs.cache-hit != 'true' || steps.have_jit.outputs.count == '0'
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
