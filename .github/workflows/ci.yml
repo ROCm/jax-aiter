@@ -41,6 +41,17 @@ jobs:
           docker --version
           rocm-smi || true
 
+      - name: Restore AITER JIT modules cache
+        id: aiter_cache
+        uses: actions/cache@v4
+        with:
+          path: build/aiter_build
+          key: >
+            aiter-so-${{ runner.os }}
+            -aiter-${{ steps.aiter_sha.outputs.sha }}
+            -jit-${{ hashFiles('jax_aiter/jit/**') }}
+            -cfg-${{ hashFiles('scripts/**','**/optCompilerConfig.json') }}
+
       - name: Pull container image
         run: docker pull "$IMAGE"
 
@@ -142,17 +153,6 @@ jobs:
             make
             ls -lh build/jax_aiter_build/libjax_aiter.so
           '
-
-      - name: Restore AITER JIT modules cache
-        id: aiter_cache
-        uses: actions/cache@v4
-        with:
-          path: build/aiter_build
-          key: >
-            aiter-so-${{ runner.os }}
-            -aiter-${{ steps.aiter_sha.outputs.sha }}
-            -jit-${{ hashFiles('jax_aiter/jit/**') }}
-            -cfg-${{ hashFiles('scripts/**','**/optCompilerConfig.json') }}
 
       - name: Check if JIT outputs exist
         id: have_jit
