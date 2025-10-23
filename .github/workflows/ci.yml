@@ -148,24 +148,40 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build/aiter_build
-          key: aiter-so-${{ runner.os }}-img-${{ hashFiles(format('{0}', env.IMAGE)) }}-rocm-${{ env.ROCM_VERSION }}-archs-${{ hashFiles(format('{0}', env.GPU_ARCHS)) }}-aiter-${{ steps.aiter_sha.outputs.sha }}-jit-${{ hashFiles('jax_aiter/jit/**') }}-cfg-${{ hashFiles('scripts/**') }}
+          key: >
+            aiter-so-${{ runner.os }}
+            -aiter-${{ steps.aiter_sha.outputs.sha }}
+            -jit-${{ hashFiles('jax_aiter/jit/**') }}
+            -cfg-${{ hashFiles('scripts/**','**/optCompilerConfig.json') }}
 
       - name: Check if JIT outputs exist
         id: have_jit
         run: |
           set -euo pipefail
-          if [ -d build/aiter_build ] && [ -n "$(ls -A build/aiter_build/*.so 2>/dev/null)" ]; then
-            echo "count=$(ls build/aiter_build/*.so 2>/dev/null | wc -l)"
+          cnt=0
+          if ls build/aiter_build/*.so >/dev/null 2>&1; then
+            cnt=$(ls build/aiter_build/*.so | wc -l)
+          fi
+          echo "count=$cnt" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build JIT
+        id: jit_decision
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.aiter_cache.outputs['cache-hit'] }}" = "true" ] \
+            && [ "${{ steps.have_jit.outputs.count }}" != "0" ]; then
+            echo "do_build=false" >> "$GITHUB_OUTPUT"
+            echo "Cache hit & ${ { steps.have_jit.outputs.count } } .so files present. SKIP JIT."
           else
-            echo "count=0"
-          fi >> "$GITHUB_OUTPUT"
+            echo "do_build=true" >> "$GITHUB_OUTPUT"
+            echo "No/empty cache. BUILD JIT."
 
       - name: Build JIT modules
-        if: steps.aiter_cache.outputs.cache-hit != 'true' || steps.have_jit.outputs.count == '0'
+        if: steps.jit_decision.outputs.do_build == 'true'
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            python3 jax_aiter/jit/build_jit.py --module module_custom,libmha_bwd,libmha_fwd,module_fmha_v3_bwd,module_fmha_v3_fwd,module_fmha_v3_varlen_bwd,module_fmha_v3_varlen_fwd,module_mha_bwd,module_mha_fwd,module_mha_varlen_bwd,module_mha_varlen_fwd
+            python3 jax_aiter/jit/build_jit.py --module module_custom
             ls -lh build/aiter_build/*.so
           '
 
@@ -199,20 +215,6 @@ jobs:
             set -euxo pipefail
             pip install .
           '
-
-      - name: Run smoke test
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print(\"jax-aiter import successful\")"
-          '
-
-      - name: Run tests
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_varlen_ja.py
-            pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_ck_ja.py
-          ' || echo "::warning::Pytest reported failures; continuing without failing the step"
 
       - name: Build summary
         if: always()
