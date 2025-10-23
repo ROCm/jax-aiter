@@ -166,15 +166,20 @@ jobs:
 
       - name: Decide whether to build JIT
         id: jit_decision
+        shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ steps.aiter_cache.outputs['cache-hit'] }}" = "true" ] \
-            && [ "${{ steps.have_jit.outputs.count }}" != "0" ]; then
+          cache_hit='${{ steps.aiter_cache.outputs.cache-hit }}'   # "true" if hit, empty if miss
+          have_count='${{ steps.have_jit.outputs.count }}'         # "0" or a number
+
+          # Treat empty cache_hit as "false"
+          if [[ "${cache_hit:-}" == "true" && "${have_count}" != "0" ]]; then
             echo "do_build=false" >> "$GITHUB_OUTPUT"
-            echo "Cache hit & ${ { steps.have_jit.outputs.count } } .so files present. SKIP JIT."
+            echo "Cache hit & ${have_count} .so files present. SKIP JIT."
           else
             echo "do_build=true" >> "$GITHUB_OUTPUT"
-            echo "No/empty cache. BUILD JIT."
+            echo "No/empty cache (cache_hit=${cache_hit:-<none>}, count=${have_count}). BUILD JIT."
+          fi
 
       - name: Build JIT modules
         if: steps.jit_decision.outputs.do_build == 'true'
