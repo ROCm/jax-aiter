@@ -1,10 +1,9 @@
-name: JAX-AITER CI
+name: JAX-AITER Nightly CI
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches:
-      - main
+  schedule:
+    - cron: '0 1 * * *'  # 01:00 UTC daily.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -12,7 +11,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: [linux-mi355-4]
+    runs-on: [linux-mi355-8]
 
     env:
       IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
@@ -31,10 +30,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Get third_party/aiter submodule SHA
-        id: aiter_sha
-        run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
       - name: Print host info
         run: |
           set -euxo pipefail
@@ -43,17 +38,6 @@ jobs:
           uname -a
           docker --version
           rocm-smi || true
-
-      - name: Restore AITER JIT modules cache
-        id: aiter_cache
-        uses: actions/cache@v4
-        with:
-          path: build/aiter_build
-          key: >
-            aiter-so-${{ runner.os }}
-            -aiter-${{ steps.aiter_sha.outputs.sha }}
-            -jit-${{ hashFiles('jax_aiter/jit/**') }}
-            -cfg-${{ hashFiles('scripts/**','**/optCompilerConfig.json') }}
 
       - name: Pull container image
         run: docker pull "$IMAGE"
@@ -157,35 +141,7 @@ jobs:
             ls -lh build/jax_aiter_build/libjax_aiter.so
           '
 
-      - name: Check if JIT outputs exist
-        id: have_jit
-        run: |
-          set -euo pipefail
-          cnt=0
-          if ls build/aiter_build/*.so >/dev/null 2>&1; then
-            cnt=$(ls build/aiter_build/*.so | wc -l)
-          fi
-          echo "count=$cnt" >> "$GITHUB_OUTPUT"
-
-      - name: Decide whether to build JIT
-        id: jit_decision
-        shell: bash
-        run: |
-          set -euo pipefail
-          cache_hit='${{ steps.aiter_cache.outputs.cache-hit }}'   # "true" if hit, empty if miss
-          have_count='${{ steps.have_jit.outputs.count }}'         # "0" or a number
-
-          # Treat empty cache_hit as "false"
-          if [[ "${cache_hit:-}" == "true" && "${have_count}" != "0" ]]; then
-            echo "do_build=false" >> "$GITHUB_OUTPUT"
-            echo "Cache hit & ${have_count} .so files present. SKIP JIT."
-          else
-            echo "do_build=true" >> "$GITHUB_OUTPUT"
-            echo "No/empty cache (cache_hit=${cache_hit:-<none>}, count=${have_count}). BUILD JIT."
-          fi
-
       - name: Build JIT modules
-        if: steps.jit_decision.outputs.do_build == 'true'
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
