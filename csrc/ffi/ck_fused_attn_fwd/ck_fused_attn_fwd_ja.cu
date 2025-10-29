@@ -24,7 +24,8 @@ mha_fwd(at::Tensor &q,       // [b, sq, hq, d]
         const at::Tensor &v, // [b, sk, hk, d_v]
         float p_dropout, float softmax_scale, bool is_causal,
         int window_size_left, int window_size_right, bool return_softmax_lse,
-        bool return_dropout_randval,
+        bool return_dropout_randval, std::optional<at::Tensor> cu_seqlens_q_,
+        std::optional<at::Tensor> cu_seqlens_kv_,
         std::optional<at::Tensor> out_,                // [b, sq, hq, d_v]
         std::optional<const at::Tensor> bias_,         // [sq, sk]
         std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
@@ -38,6 +39,8 @@ namespace jax_aiter {
 
 ffi::Error MhaFwd_Bridge(
     hipStream_t stream, ffi::AnyBuffer q, ffi::AnyBuffer k, ffi::AnyBuffer v,
+    std::optional<ffi::AnyBuffer> cu_seqlens_q_,
+    std::optional<ffi::AnyBuffer> cu_seqlens_kv_,
     std::optional<ffi::AnyBuffer> out_, std::optional<ffi::AnyBuffer> bias_,
     std::optional<ffi::AnyBuffer> alibi_slopes_,
     std::optional<ffi::AnyBuffer> gen_, // <-- 2x int64: [seed, offset]
@@ -85,6 +88,18 @@ ffi::Error MhaFwd_Bridge(
                 ::jax_aiter::wrap_any_buffer(*alibi_slopes_, dev_idx))
           : std::nullopt;
 
+  std::optional<at::Tensor> cu_seqlens_q_opt =
+      (cu_seqlens_q_.has_value() && cu_seqlens_q_->size_bytes() > 0)
+          ? std::make_optional(
+                ::jax_aiter::wrap_any_buffer(*cu_seqlens_q_, dev_idx))
+          : std::nullopt;
+
+  std::optional<at::Tensor> cu_seqlens_kv_opt =
+      (cu_seqlens_kv_.has_value() && cu_seqlens_kv_->size_bytes() > 0)
+          ? std::make_optional(
+                ::jax_aiter::wrap_any_buffer(*cu_seqlens_kv_, dev_idx))
+          : std::nullopt;
+
   std::optional<at::Generator> gen_opt = std::nullopt;
   // Handle generator parameter - extract from JAX buffer if provided.
   if (gen_.has_value() &&
@@ -116,6 +131,8 @@ ffi::Error MhaFwd_Bridge(
         window_size_right,      // window_size_right
         return_softmax_lse,     // return_softmax_lse
         return_dropout_randval, // return_dropout_randval
+        cu_seqlens_q_opt,       // cu_seqlens_q_ (optional for varlen)
+        cu_seqlens_kv_opt,      // cu_seqlens_kv_ (optional for varlen)
         out_provided_opt,       // out_ (optional pre-allocated output)
         bias_opt,               // bias_ (optional)
         alibi_slopes_opt,       // alibi_slopes_ (optional)
@@ -123,16 +140,15 @@ ffi::Error MhaFwd_Bridge(
     );
   } catch (const c10::Error &e) {
     return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("fmha_v3_fwd PyTorch error: ") +
+                      std::string("mha_fwd PyTorch error: ") +
                           e.what_without_backtrace());
   } catch (const std::exception &e) {
     const char *what_msg = e.what();
-    std::fprintf(stderr,
-                 "[FMHA_FWD] Exception caught - type: %s, message: %s\n",
+    std::fprintf(stderr, "[MHA_FWD] Exception caught - type: %s, message: %s\n",
                  typeid(e).name(), what_msg ? what_msg : "null");
     std::fflush(stderr);
     return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("fmha_v3_fwd: ") +
+                      std::string("mha_fwd: ") +
                           (what_msg ? what_msg : "unknown error"));
   }
 
@@ -187,6 +203,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // q: [batch, seqlen_q, nhead, hdim_q]
         .Arg<ffi::AnyBuffer>() // k: [batch, seqlen_kv, nhead, hdim_q]
         .Arg<ffi::AnyBuffer>() // v: [batch, seqlen_kv, nhead, hdim_v]
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_q (optional, for varlen)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_kv (optional, for varlen)
         .Arg<ffi::AnyBuffer>() // out_provided (optional)
         .Arg<ffi::AnyBuffer>() // bias (optional)
         .Arg<ffi::AnyBuffer>() // alibi_slopes (optional)

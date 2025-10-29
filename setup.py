@@ -118,7 +118,7 @@ setup(
     license="MIT",
     packages=find_packages(include=["jax_aiter", "jax_aiter.*"]),
     include_package_data=True,  # picks up MANIFEST.in entries for sdist.
-    python_requires=">=3.10",
+    python_requires="~=3.12",
     install_requires=[],
     extras_require={
         "dev": ["pytest", "black", "flake8"],
@@ -143,7 +143,7 @@ setup(
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.12",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Topic :: Software Development :: Libraries",
     ],

@@ -15,7 +15,7 @@ jobs:
     runs-on: [linux-mi355-4]
 
     env:
-      IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
+      IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.12-ubu24
       CONTAINER_NAME: rv_aiter_ci
       WORKDIR: /workspace
       JA_ROOT_DIR: /jax-aiter
@@ -86,8 +86,7 @@ jobs:
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               git ca-certificates curl build-essential pkg-config
-            python3 -m pip install --upgrade pip
-            python3 -m pip install cmake ninja pyyaml pytest pytest-xdist
+            python3 -m pip install --break-system-packages cmake ninja pyyaml pytest pytest-xdist
             git --version
           '
 
@@ -136,7 +135,7 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
             cd third_party/aiter
-            git apply ../../scripts/aiter_torch_remove.patch
+            git apply ../../scripts/aiter.patch
           '
 
       - name: Build static PyTorch (full)
@@ -205,23 +204,23 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            python3 -m pip install --upgrade pip
-            pip install --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0/ \
-              torch==2.8.0+rocm7.0.0.git64359f59
+            python3 -m pip install --break-system-packages \
+             --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/ \
+             'torch==2.8.0+rocm7.0.2.lw.git245bf6ed'
           '
 
       - name: Install AITER
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            pip install third_party/aiter
+            pip install --break-system-packages third_party/aiter
           '
 
       - name: Install JAX-AITER
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            pip install .
+            pip install --break-system-packages .
           '
 
       - name: Run smoke test

@@ -1,0 +1,22 @@
+diff --git a/aiter/jit/utils/cpp_extension.py b/aiter/jit/utils/cpp_extension.py
+index 5f66a477..44e1b335 100644
+--- a/aiter/jit/utils/cpp_extension.py
++++ b/aiter/jit/utils/cpp_extension.py
+@@ -1551,12 +1551,12 @@ def _write_ninja_file_to_build_library(
+     # But we can't use this now because all aiter op based on torch
+     # which means pybind11 related build flags must from torch now
+     common_cflags = []
+-    if torch_exclude and is_python_module:
+-        import pybind11
++    #if torch_exclude and is_python_module:
++    #    import pybind11
+ 
+-        extra_include_paths.append(pybind11.get_include())
+-        common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
+-        common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
++    #   extra_include_paths.append(pybind11.get_include())
++    #   common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
++    #   common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+ 
+     # sysconfig.get_path('include') gives us the location of Python.h
+     # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
