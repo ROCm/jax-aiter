@@ -69,7 +69,10 @@ def _normalize_window_size(
     wr = -1 if window_size_right >= seqlen_k else window_size_right
     return wl, wr
 
+
 can_use_v3_fwd = False
+
+
 def _can_impl_fmha_v3_fwd(
     q,
     k,
@@ -94,8 +97,8 @@ def _can_impl_fmha_v3_fwd(
     ret = alibi_slopes is None
     ret = ret and (bias is None)
     ret = ret and (dropout_p == 0.0)
-    ret = ret and (hdim_q == hdim_v)
-    ret = ret and (hdim_q == 128)
+    ret = ret and (hdim_v == 128)
+    ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
     ret = ret and (nhead_q % nhead_k == 0)
     ret = ret and (not swa)
     ret = ret and (q.dtype == dtypes.bf16)
@@ -208,6 +211,7 @@ def can_impl_fmha_v3_bwd(
         hd64_case = (hdim_q == 64 and is_v3_atomic_fp32 == False) and npssk
 
         ret = hd128_case or hd64_case
+        ret &= not swa
         return ret
 
     def pssk():
@@ -220,6 +224,7 @@ def can_impl_fmha_v3_bwd(
         ret &= nmask or (
             mask and seqlen_q == seqlen_k
         )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= not swa
 
         return ret
 
@@ -239,6 +244,7 @@ def can_impl_fmha_v3_bwd(
         ret &= nhead_stride_v == nhead_stride_dv
         ret &= (batch_stride_dk / batch_stride_k) == (nhead_q / nhead_k)
         ret &= (batch_stride_dv / batch_stride_v) == (nhead_q / nhead_k)
+        ret &= not swa
 
         return ret
 
@@ -267,6 +273,55 @@ def can_impl_fmha_v3_bwd(
     return ret
 
 
+def can_impl_fmha_v3_bwd_gfx950(
+    dout: jnp.ndarray,
+    q: jnp.ndarray,
+    k: jnp.ndarray,
+    v: jnp.ndarray,
+    dropout_p: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[jnp.ndarray],
+    alibi_slopes: Optional[jnp.ndarray],
+    dbias: Optional[jnp.ndarray],
+    deterministic: bool,
+) -> bool:
+    """Check if FMHA v3 backward kernel can be used on gfx950.
+
+    This provides additional optimization path for gfx950 hardware.
+    """
+    _, seqlen_q, nhead_q, hdim_q = q.shape
+    _, seqlen_k, nhead_k, hdim_v = v.shape
+
+    # Normalize window sizes.
+    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
+    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
+    swa = (window_size_left > 0) or (window_size_right > 0)
+
+    # Only 1 block when sk <= 256, thus deterministic
+    is_950_1block = (
+        get_gfx() == "gfx950"
+        and seqlen_k <= 256
+        and hdim_q > 64
+        and hdim_q <= 128
+        and hdim_q % 8 == 0
+        and not swa
+    )
+
+    ret = get_gfx() == "gfx950"
+    ret &= alibi_slopes is None
+    ret &= bias is None
+    ret &= dbias is None
+    ret &= dropout_p == 0.0
+    ret &= not deterministic or is_950_1block
+    ret &= hdim_q == hdim_v
+    ret &= nhead_q % nhead_k == 0
+    ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+
+    return ret
+
+
 def _cached_mha_fwd_call(
     out_shape,
     softmax_lse_shape,
@@ -290,6 +345,8 @@ def _cached_mha_fwd_call(
         q,
         k,
         v,
+        cu_seqlens_q,
+        cu_seqlens_kv,
         out_provided,
         bias,
         alibi_slopes,
@@ -307,6 +364,8 @@ def _cached_mha_fwd_call(
             q,
             k,
             v,
+            cu_seqlens_q,
+            cu_seqlens_kv,
             out_provided,
             bias,
             alibi_slopes,
@@ -359,6 +418,8 @@ def _cached_fmha_v3_fwd_call(
         q,
         k,
         v,
+        cu_seqlens_q,
+        cu_seqlens_kv,
         out_provided,
         bias,
         alibi_slopes,
@@ -376,6 +437,8 @@ def _cached_fmha_v3_fwd_call(
             q,
             k,
             v,
+            cu_seqlens_q,
+            cu_seqlens_kv,
             out_provided,
             bias,
             alibi_slopes,
@@ -581,6 +644,8 @@ def mha_fwd(
     out: Optional[jnp.ndarray] = None,
     bias: Optional[jnp.ndarray] = None,
     alibi_slopes: Optional[jnp.ndarray] = None,
+    cu_seqlens_q: Optional[jnp.ndarray] = None,
+    cu_seqlens_kv: Optional[jnp.ndarray] = None,
     gen: Optional[jnp.ndarray] = None,
 ) -> List[jnp.ndarray]:
     """Standard MHA forward kernel with support for bias and dropout."""
@@ -601,6 +666,10 @@ def mha_fwd(
         bias = _empty_tensor(jnp.float32)
     if alibi_slopes is None:
         alibi_slopes = _empty_tensor(jnp.float32)
+    if cu_seqlens_q is None:
+        cu_seqlens_q = _empty_tensor(jnp.int32)
+    if cu_seqlens_kv is None:
+        cu_seqlens_kv = _empty_tensor(jnp.int32)
     if gen is None:
         gen = _empty_tensor(jnp.int64)
 
@@ -622,6 +691,8 @@ def mha_fwd(
         q,
         k,
         v,
+        cu_seqlens_q,
+        cu_seqlens_kv,
         out,
         bias,
         alibi_slopes,
@@ -653,6 +724,8 @@ def fmha_v3_fwd(
     out: Optional[jnp.ndarray] = None,
     bias: Optional[jnp.ndarray] = None,
     alibi_slopes: Optional[jnp.ndarray] = None,
+    cu_seqlens_q: Optional[jnp.ndarray] = None,
+    cu_seqlens_kv: Optional[jnp.ndarray] = None,
     gen: Optional[jnp.ndarray] = None,
 ) -> List[jnp.ndarray]:
     """FMHA v3 forward kernel optimized for bf16, head_dim=128, no bias/dropout."""
@@ -669,6 +742,10 @@ def fmha_v3_fwd(
         bias = _empty_tensor(jnp.float32)
     if alibi_slopes is None:
         alibi_slopes = _empty_tensor(jnp.float32)
+    if cu_seqlens_q is None:
+        cu_seqlens_q = _empty_tensor(jnp.int32)
+    if cu_seqlens_kv is None:
+        cu_seqlens_kv = _empty_tensor(jnp.int32)
     if gen is None:
         gen = _empty_tensor(jnp.int64)
 
@@ -690,6 +767,8 @@ def fmha_v3_fwd(
         q,
         k,
         v,
+        cu_seqlens_q,
+        cu_seqlens_kv,
         out,
         bias,
         alibi_slopes,
@@ -917,7 +996,8 @@ def _flash_attn_forward(
         return_lse,
     )
 
-    if can_use_v3:
+    # Prefer CK kernel for decode cases (short sequences)
+    if can_use_v3 and seqlen_q > 128:
         result = fmha_v3_fwd(
             q,
             k,
@@ -929,9 +1009,11 @@ def _flash_attn_forward(
             window_size_right,
             return_lse,
             return_softmax,
-            None,
+            None,  # out
             bias,
             alibi_slopes,
+            None,  # cu_seqlens_q
+            None,  # cu_seqlens_kv
             None,  # gen
         )
     else:
@@ -946,9 +1028,11 @@ def _flash_attn_forward(
             window_size_right,
             return_lse,
             return_softmax,
-            None,
+            None,  # out
             bias,
             alibi_slopes,
+            None,  # cu_seqlens_q
+            None,  # cu_seqlens_kv
             None,  # gen
         )
 
@@ -978,97 +1062,97 @@ def _flash_attn_backward(
 
     Returns: (dq, dk, dv, softmax_d, dbias) - dbias is None if no bias provided.
     """
-    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
+    can_impl_fmha_v3_bwd_ = (
+        can_impl_fmha_v3_bwd(
+            dout,
+            q,
+            k,
+            v,
+            jnp.empty_like(k),
+            jnp.empty_like(v),
+            (
+                jnp.empty_like(bias) if bias is not None else None
+            ),
+            dropout_p,
+            causal,
+            window_size_left,
+            window_size_right,
+            bias,
+            alibi_slopes,
+            deterministic,
+            is_v3_atomic_fp32,
+        )
+        & can_use_v3_fwd
+    )
+
+    # Add gfx950 specific path
+    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950(
         dout,
         q,
         k,
         v,
-        jnp.empty_like(k),  # To maintain parity with aiter
-        jnp.empty_like(v),  # To maintain parity with aiter
-        (
-            jnp.empty_like(bias) if bias is not None else None
-        ),  # To maintain parity with aiter
         dropout_p,
         causal,
         window_size_left,
         window_size_right,
         bias,
         alibi_slopes,
+        (jnp.empty_like(bias) if bias is not None else None),
         deterministic,
-        is_v3_atomic_fp32,
-    ) & can_use_v3_fwd
+    )
 
-    try:
-        if can_impl_fmha_v3_bwd_:
-            log.info("Using FMHA v3 backward kernel")
-            results = fmha_v3_bwd(
-                dout,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dropout_p,
-                softmax_scale,
-                causal,
-                window_size_left,
-                window_size_right,
-                deterministic,
-                is_v3_atomic_fp32,
-                how_v3_bf16_cvt,
-                None,  # dq
-                None,  # dk
-                None,  # dv
-                None,  # dbias - v3 doesn't support it
-                bias,
-                alibi_slopes,
-                rng_state,
-                None,  # gen
-            )
-            return results[0], results[1], results[2], results[3], None
-        else:
-            log.info("Using MHA backward kernel")
-            results = mha_bwd(
-                dout,
-                q,
-                k,
-                v,
-                out,
-                softmax_lse,
-                dropout_p,
-                softmax_scale,
-                causal,
-                window_size_left,
-                window_size_right,
-                deterministic,
-                None,  # dq
-                None,  # dk
-                None,  # dv
-                None,  # dbias - ck supports it
-                bias,
-                alibi_slopes,
-                rng_state,
-                None,  # gen
-            )
+    if can_impl_fmha_v3_bwd_:
+        log.info("Using FMHA v3 backward kernel")
+        results = fmha_v3_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            deterministic,
+            is_v3_atomic_fp32,
+            how_v3_bf16_cvt,
+            None,  # dq
+            None,  # dk
+            None,  # dv
+            None,  # dbias - v3 doesn't support it
+            bias,
+            alibi_slopes,
+            rng_state,
+            None,  # gen
+        )
+        return results[0], results[1], results[2], results[3], None
+    else:
+        log.info("Using MHA backward kernel")
+        results = mha_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            deterministic,
+            None,  # dq
+            None,  # dk
+            None,  # dv
+            None,  # dbias - ck supports it
+            bias,
+            alibi_slopes,
+            rng_state,
+            None,  # gen
+        )
         return results
-
-    except (RuntimeError, ValueError) as e:
-        # Re-raise known error types with context
-        kernel_type = "FMHA v3" if can_use_v3_bwd else "MHA"
-        raise RuntimeError(
-            f"Flash attention backward pass failed with {kernel_type} kernel: {e}. "
-            f"Input shapes: q={q.shape}, k={k.shape}, v={v.shape}, "
-            f"dout={dout.shape}, dropout_p={dropout_p}, causal={causal}"
-        ) from e
-
-    except Exception as e:
-        # Log unexpected errors but don't mask them
-        kernel_type = "FMHA v3" if can_use_v3_bwd else "MHA"
-        # Re-raise instead of silently returning zeros
-        raise RuntimeError(
-            f"Unexpected error in flash attention backward pass: {e}. "
-            f"This indicates a bug that should be reported."
-        ) from e
 
 
 # Public API functions with custom VJP for autodiff.

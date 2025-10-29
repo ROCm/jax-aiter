@@ -167,16 +167,15 @@ ffi::Error MhaBwd_Bridge(
     );
   } catch (const c10::Error &e) {
     return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("fmha_v3_fwd PyTorch error: ") +
+                      std::string("mha_bwd PyTorch error: ") +
                           e.what_without_backtrace());
   } catch (const std::exception &e) {
     const char *what_msg = e.what();
-    std::fprintf(stderr,
-                 "[FMHA_FWD] Exception caught - type: %s, message: %s\n",
+    std::fprintf(stderr, "[MHA_BWD] Exception caught - type: %s, message: %s\n",
                  typeid(e).name(), what_msg ? what_msg : "null");
     std::fflush(stderr);
     return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("fmha_v3_fwd: ") +
+                      std::string("mha_bwd: ") +
                           (what_msg ? what_msg : "unknown error"));
   }
 

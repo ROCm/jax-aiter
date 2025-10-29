@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..ja_compat import dtypes
+from ..ja_compat.chip_info import get_gfx
 from ..ffi.registry import register_ffi_target
 
 logging.basicConfig(level=logging.INFO)
@@ -98,6 +99,8 @@ def _cached_mha_varlen_fwd_call(
         bias,
         alibi_slopes,
         gen,
+        cu_seqlens_q_padded,
+        cu_seqlens_k_padded,
         *,
         max_seqlen_q,
         max_seqlen_k,
@@ -123,6 +126,8 @@ def _cached_mha_varlen_fwd_call(
             bias,
             alibi_slopes,
             gen,
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             min_seqlen_q=min_seqlen_q,
@@ -458,6 +463,8 @@ def mha_varlen_fwd(
     bias: Optional[jnp.ndarray] = None,
     alibi_slopes: Optional[jnp.ndarray] = None,
     gen: Optional[jnp.ndarray] = None,
+    cu_seqlens_q_padded: Optional[jnp.ndarray] = None,
+    cu_seqlens_k_padded: Optional[jnp.ndarray] = None,
 ) -> List[jnp.ndarray]:
     """MHA varlen forward kernel."""
     _ensure_ffi_target_registered("MhaVarlenFwdJA")
@@ -478,6 +485,10 @@ def mha_varlen_fwd(
         alibi_slopes = _empty_tensor(jnp.float32)
     if gen is None:
         gen = _empty_tensor(jnp.int64)
+    if cu_seqlens_q_padded is None:
+        cu_seqlens_q_padded = _empty_tensor(jnp.int32)
+    if cu_seqlens_k_padded is None:
+        cu_seqlens_k_padded = _empty_tensor(jnp.int32)
 
     out_shape = (total_q, num_heads_q, head_size_v)
     softmax_lse_shape = (num_heads_q, total_q)
@@ -503,6 +514,8 @@ def mha_varlen_fwd(
         bias,
         alibi_slopes,
         gen,
+        cu_seqlens_q_padded,
+        cu_seqlens_k_padded,
         max_seqlen_q=_static_int(max_seqlen_q),
         max_seqlen_k=_static_int(max_seqlen_k),
         min_seqlen_q=_static_int(min_seqlen_q),
@@ -814,6 +827,8 @@ def _flash_attn_varlen_forward(
     block_table: Optional[jnp.ndarray] = None,
     out: Optional[jnp.ndarray] = None,
     zero_tensors: bool = False,
+    cu_seqlens_q_padded: Optional[jnp.ndarray] = None,
+    cu_seqlens_k_padded: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Forward pass for varlen attention."""
     (_, nhead_q, hdim_q) = q.shape
@@ -831,11 +846,13 @@ def _flash_attn_varlen_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_q == hdim_v)
-        ret = ret and (hdim_q == 128)
+        ret = ret and (hdim_v == 128)
+        ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
+        # V3 kernel doesn't support physical sequence padding
+        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
         return ret
 
     if can_impl_fmha_v3_fwd():
@@ -887,7 +904,9 @@ def _flash_attn_varlen_forward(
             block_table,
             bias,
             alibi_slopes,
-            None,
+            None,  # gen
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
         )
 
     return list(result)
@@ -923,6 +942,7 @@ def _flash_attn_varlen_backward(
 
     mask = causal and window_size_left == -1
     nmask = not causal and window_size_left == -1 and window_size_right == -1
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def can_impl_fmha_v3_bwd():
         ret = alibi_slopes is None
@@ -930,13 +950,28 @@ def _flash_attn_varlen_backward(
         ret = ret and (not deterministic)
         ret = ret and (hdim_q == hdim_v)
         ret = ret and (nhead_q % nhead_k == 0)
-        ret = ret and (hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0)
+        ret = ret and (hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (mask or nmask)
+        ret = ret and (not swa)
+        return ret
+
+    def can_impl_fmha_v3_bwd_gfx950():
+        """Check if FMHA v3 backward kernel can be used on gfx950 for varlen."""
+        ret = get_gfx() == "gfx950"
+        ret &= alibi_slopes is None
+        ret &= dropout_p == 0.0
+        ret &= not deterministic
+        ret &= hdim_q == hdim_v
+        ret &= nhead_q % nhead_k == 0
+        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= not swa
         return ret
 
     # LSE is already in 3D format from forward, no conversion needed
-    if can_impl_fmha_v3_bwd():
+    can_use_v3_bwd = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
+
+    if can_use_v3_bwd:
         results = fmha_v3_varlen_bwd(
             dout,
             q,
@@ -996,7 +1031,9 @@ def _flash_attn_varlen_backward(
 
 
 # Public API functions with custom VJP for autodiff.
-@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17))
+@partial(
+    jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11, 12, 15, 16, 17, 18, 19)
+)
 def flash_attn_varlen(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -1018,6 +1055,8 @@ def flash_attn_varlen(
     return_attn_probs: bool = False,
     block_table: Optional[jnp.ndarray] = None,
     out: Optional[jnp.ndarray] = None,
+    cu_seqlens_q_padded: Optional[jnp.ndarray] = None,
+    cu_seqlens_k_padded: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """
     Flash Attention function for variable-length sequences.
@@ -1068,6 +1107,10 @@ def flash_attn_varlen(
         block_table: Optional block table for paged attention
         out: Optional output tensor. If provided, the output will be written to this tensor.
             Note: This is provided for API compatibility but is not commonly used in JAX
+        cu_seqlens_q_padded: Optional padded cumulative sequence lengths for queries [batch_size + 1].
+            For physical sequence padding support. Currently not supported by v3 kernels.
+        cu_seqlens_k_padded: Optional padded cumulative sequence lengths for keys [batch_size + 1].
+            For physical sequence padding support. Currently not supported by v3 kernels.
 
     Returns:
         out: [total, nheads, headdim_v]
@@ -1124,6 +1167,8 @@ def flash_attn_varlen(
         block_table=block_table,
         out=out,
         zero_tensors=False,  # Keep internal, use default value
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
     )
 
     # Unpad output to original dimensions.
@@ -1156,9 +1201,8 @@ def _flash_attn_varlen_fwd(
     return_attn_probs: bool = False,
     block_table: Optional[jnp.ndarray] = None,
     out: Optional[jnp.ndarray] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
-    zero_tensors: bool = False,
+    cu_seqlens_q_padded: Optional[jnp.ndarray] = None,
+    cu_seqlens_k_padded: Optional[jnp.ndarray] = None,
 ):
     """Forward pass that returns both output and residuals for backward pass."""
     if softmax_scale is None:
@@ -1202,10 +1246,12 @@ def _flash_attn_varlen_fwd(
         alibi_slopes=alibi_slopes,
         return_lse=True,  # Always return for backward
         return_softmax=return_attn_probs and dropout_p > 0,
-        how_v3_bf16_cvt=how_v3_bf16_cvt,
+        how_v3_bf16_cvt=1,  # Default value, matching public API
         block_table=block_table,
         out=out,
-        zero_tensors=zero_tensors,
+        zero_tensors=False,  # Default value, matching public API
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_k_padded=cu_seqlens_k_padded,
     )
 
     out = out_padded[..., :head_size_v_og]
@@ -1229,7 +1275,7 @@ def _flash_attn_varlen_fwd(
         dropout_p,
         softmax_scale,
         logits_soft_cap,
-        zero_tensors,
+        False,  # zero_tensors - hardcoded to match public API
         causal,
         (wl_norm, wr_norm),
         bias,
@@ -1238,8 +1284,8 @@ def _flash_attn_varlen_fwd(
         deterministic,
         head_size_q_og,
         head_size_v_og,
-        is_v3_atomic_fp32,
-        how_v3_bf16_cvt,
+        True,  # is_v3_atomic_fp32 - hardcoded default
+        1,  # how_v3_bf16_cvt - hardcoded to match public API
     )
 
     return result, residuals
@@ -1257,6 +1303,8 @@ def _flash_attn_varlen_bwd(
     deterministic,
     return_lse,
     return_attn_probs,
+    block_table,
+    out,
     residuals,
     grad_outputs,
 ):

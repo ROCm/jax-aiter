@@ -45,6 +45,7 @@ coverage.xml
 *.swp
 *.swo
 *~
+.cursor/
 
 # JAX build artifacts.
 *.xla

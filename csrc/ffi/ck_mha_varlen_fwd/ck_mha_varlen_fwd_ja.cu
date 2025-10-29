@@ -33,7 +33,11 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> block_table_, // [hq] or [b, hq]
                std::optional<const at::Tensor> bias_, // [total_q, max_seqlen_k]
                std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-               std::optional<at::Generator> gen_);
+               std::optional<at::Generator> gen_,
+               std::optional<const at::Tensor>
+                   cu_seqlens_q_padded_, // [b+1] physical starts with PAD
+               std::optional<const at::Tensor> cu_seqlens_k_padded_ // [b+1])
+);
 }
 } // namespace aiter
 
@@ -53,8 +57,12 @@ ffi::Error MhaVarlenFwd_Bridge(
     std::optional<ffi::AnyBuffer> bias, // [total_q, max_seqlen_k] (optional)
     std::optional<ffi::AnyBuffer> alibi_slopes, // [hq] or [b, hq] (optional)
     std::optional<ffi::AnyBuffer> gen,          // generator (optional)
-    ffi::Result<ffi::AnyBuffer> out,            // [total_q, hq, d]
-    ffi::Result<ffi::AnyBuffer> softmax_lse,    // [hq, total_q]
+    std::optional<ffi::AnyBuffer>
+        cu_seqlens_q_padded_, // [b+1] physical starts with PAD
+    std::optional<ffi::AnyBuffer>
+        cu_seqlens_k_padded_,                // [b+1] physical starts with PAD
+    ffi::Result<ffi::AnyBuffer> out,         // [total_q, hq, d]
+    ffi::Result<ffi::AnyBuffer> softmax_lse, // [hq, total_q]
     ffi::Result<ffi::AnyBuffer> p, // [hq, total_q, max_seqlen_k] (dropout mask)
     ffi::Result<ffi::AnyBuffer> rng_state, // [2]
     int max_seqlen_q, int max_seqlen_k, int min_seqlen_q, float p_dropout,
@@ -109,6 +117,20 @@ ffi::Error MhaVarlenFwd_Bridge(
                 ::jax_aiter::wrap_any_buffer(*alibi_slopes, dev_idx))
           : std::nullopt;
 
+  std::optional<const at::Tensor> cu_seqlens_q_padded_opt =
+      (cu_seqlens_q_padded_.has_value() &&
+       cu_seqlens_q_padded_->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*cu_seqlens_q_padded_, dev_idx))
+          : std::nullopt;
+
+  std::optional<const at::Tensor> cu_seqlens_k_padded_opt =
+      (cu_seqlens_k_padded_.has_value() &&
+       cu_seqlens_k_padded_->size_bytes() > 0)
+          ? std::make_optional<const at::Tensor>(
+                ::jax_aiter::wrap_any_buffer(*cu_seqlens_k_padded_, dev_idx))
+          : std::nullopt;
+
   std::optional<at::Generator> gen_opt = std::nullopt;
   // Handle generator parameter - extract from JAX buffer if provided.
   if (gen.has_value() &&
@@ -129,28 +151,30 @@ ffi::Error MhaVarlenFwd_Bridge(
   std::vector<at::Tensor> results;
   try {
     results = aiter::torch_itfs::mha_varlen_fwd(
-        q_tensor,               // q: [total_q, hq, d]
-        k_tensor,               // k: [total_k, hk, d]
-        v_tensor,               // v: [total_k, hk, d]
-        cu_seqlens_q_tensor,    // cu_seqlens_q: [b+1]
-        cu_seqlens_k_opt,       // cu_seqlens_k: [b+1] (optional)
-        max_seqlen_q,           // max_seqlen_q
-        max_seqlen_k,           // max_seqlen_k
-        min_seqlen_q,           // min_seqlen_q
-        p_dropout,              // p_dropout
-        softmax_scale,          // softmax_scale
-        logits_soft_cap,        // logits_soft_cap
-        zero_tensors,           // zero_tensors
-        is_causal,              // is_causal
-        window_size_left,       // window_size_left
-        window_size_right,      // window_size_right
-        return_softmax_lse,     // return_softmax_lse
-        return_dropout_randval, // return_dropout_randval
-        out_provided_opt,       // out_ (optional pre-allocated output)
-        block_table_opt,        // block_table_ (optional for paged attention)
-        bias_opt,               // bias_ (optional)
-        alibi_slopes_opt,       // alibi_slopes_ (optional)
-        gen_opt                 // gen_ (optional generator)
+        q_tensor,                // q: [total_q, hq, d]
+        k_tensor,                // k: [total_k, hk, d]
+        v_tensor,                // v: [total_k, hk, d]
+        cu_seqlens_q_tensor,     // cu_seqlens_q: [b+1]
+        cu_seqlens_k_opt,        // cu_seqlens_k: [b+1] (optional)
+        max_seqlen_q,            // max_seqlen_q
+        max_seqlen_k,            // max_seqlen_k
+        min_seqlen_q,            // min_seqlen_q
+        p_dropout,               // p_dropout
+        softmax_scale,           // softmax_scale
+        logits_soft_cap,         // logits_soft_cap
+        zero_tensors,            // zero_tensors
+        is_causal,               // is_causal
+        window_size_left,        // window_size_left
+        window_size_right,       // window_size_right
+        return_softmax_lse,      // return_softmax_lse
+        return_dropout_randval,  // return_dropout_randval
+        out_provided_opt,        // out_ (optional pre-allocated output)
+        block_table_opt,         // block_table_ (optional for paged attention)
+        bias_opt,                // bias_ (optional)
+        alibi_slopes_opt,        // alibi_slopes_ (optional)
+        gen_opt,                 // gen_ (optional generator)
+        cu_seqlens_q_padded_opt, // cu_seqlens_q_padded_ (optional)
+        cu_seqlens_k_padded_opt  // cu_seqlens_k_padded_ (optional)
     );
   } catch (const c10::Error &e) {
     return ffi::Error(ffi::ErrorCode::kInternal,
@@ -229,6 +253,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // bias: [total_q, max_seqlen_k] (optional)
         .Arg<ffi::AnyBuffer>() // alibi_slopes: [hq] or [b, hq] (optional)
         .Arg<ffi::AnyBuffer>() // gen: generator (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_q_padded: [b+1] physical starts
+                               // with PAD (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_k_padded: [b+1] physical starts
+                               // with PAD (optional)
         .Ret<ffi::AnyBuffer>() // out: [total_q, hq, d]
         .Ret<ffi::AnyBuffer>() // softmax_lse: [hq, total_q]
         .Ret<ffi::AnyBuffer>() // p: [hq, total_q, max_seqlen_k] (dropout mask)

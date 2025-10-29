@@ -80,62 +80,11 @@ def patch_aiter_core(core_module, jax_aiter_root):
     # Ensure bd_dir is correct after patching get_user_jit_dir.
     core_module.bd_dir = Path(get_user_jit_dir_ja()) / "build"
     core_module.bd_dir.mkdir(parents=True, exist_ok=True)
-    core_module.CK_DIR = f"{core_module.bd_dir}/ck"
-    Path(core_module.CK_DIR).mkdir(parents=True, exist_ok=True)
+    # core_module.CK_DIR = f"{core_module.bd_dir}/ck"
+    # Path(core_module.CK_DIR).mkdir(parents=True, exist_ok=True)
     # recopy_ck caches by function; after changing CK_DIR, clear cache:
     if hasattr(core_module, "recopy_ck"):
         core_module.recopy_ck.cache_clear()
-
-    # Patch AITER's rename_cpp_to_cu to only copy changed files.
-    # This preserves file timestamps and enables ninja incremental compilation.
-    def rename_cpp_to_cu_incremental(els, dst, recurisve=False):
-        """Copy files only if source is newer than destination, preserving ninja incremental compilation."""
-
-        def should_copy_file(src_path, dst_path):
-            """Check if we should copy the file based on modification time."""
-            if not os.path.exists(dst_path):
-                return True
-
-            src_mtime = os.path.getmtime(src_path)
-            dst_mtime = os.path.getmtime(dst_path)
-            return src_mtime > dst_mtime
-
-        def do_rename_and_mv(name, src, dst, ret):
-            """
-            Rename .cpp files to .cu and copy only if the source is newer than the destination.
-            """
-            newName = name
-            if name.endswith(".cpp") or name.endswith(".cu"):
-                newName = name.replace(".cpp", ".cu")
-                ret.append(f"{dst}/{newName}")
-
-            src_path = f"{src}/{name}"
-            dst_path = f"{dst}/{newName}"
-
-            # Only copy if source is newer. This is the key fix.
-            if should_copy_file(src_path, dst_path):
-                shutil.copy2(src_path, dst_path)
-
-        ret = []
-        for el in els:
-            if not os.path.exists(el):
-                logger.warning(f"---> {el} not exists!!!!!!")
-                continue
-            if os.path.isdir(el):
-                for entry in os.listdir(el):
-                    if os.path.isdir(f"{el}/{entry}"):
-                        if recurisve:
-                            ret += rename_cpp_to_cu_incremental(
-                                [f"{el}/{entry}"], dst, recurisve
-                            )
-                        continue
-                    do_rename_and_mv(entry, el, dst, ret)
-            else:
-                do_rename_and_mv(os.path.basename(el), os.path.dirname(el), dst, ret)
-        return ret
-
-    # Replace AITER's function with our incremental version.
-    core_module.rename_cpp_to_cu = rename_cpp_to_cu_incremental
 
     # Override the get_args_of_build function to use JA config.
     original_get_args_of_build = core_module.get_args_of_build
@@ -270,7 +219,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
         import cpp_extension
 
         def _prepare_ldflags_ja(
-            extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude
+            extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude, prebuild=0
         ):
             extra_ldflags.append("-mcmodel=large")
             extra_ldflags.append("-ffunction-sections")
@@ -282,21 +231,24 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
                 TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib")
                 extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
-                extra_ldflags.append("-lc10")
-                if with_cuda:
-                    extra_ldflags.append(
-                        "-lc10_hip" if cpp_extension.IS_HIP_EXTENSION else "-lc10_cuda"
-                    )
-                extra_ldflags.append("-ltorch_cpu")
-                if with_cuda:
-                    extra_ldflags.append(
-                        "-ltorch_hip"
-                        if cpp_extension.IS_HIP_EXTENSION
-                        else "-ltorch_cuda"
-                    )
-                extra_ldflags.append("-ltorch")
-                if not is_standalone:
-                    extra_ldflags.append("-ltorch_python")
+                if prebuild != 1:
+                    extra_ldflags.append("-lc10")
+                    if with_cuda:
+                        extra_ldflags.append(
+                            "-lc10_hip"
+                            if cpp_extension.IS_HIP_EXTENSION
+                            else "-lc10_cuda"
+                        )
+                    extra_ldflags.append("-ltorch_cpu")
+                    if with_cuda:
+                        extra_ldflags.append(
+                            "-ltorch_hip"
+                            if cpp_extension.IS_HIP_EXTENSION
+                            else "-ltorch_cuda"
+                        )
+                    extra_ldflags.append("-ltorch")
+                    if not is_standalone:
+                        extra_ldflags.append("-ltorch_python")
 
                 if is_standalone:
                     extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
@@ -306,7 +258,8 @@ def patch_aiter_core(core_module, jax_aiter_root):
                     print("Detected CUDA files, patching ldflags", file=sys.stderr)
 
                 extra_ldflags.append(f'-L{cpp_extension._join_rocm_home("lib")}')
-                extra_ldflags.append("-lamdhip64")
+                if prebuild != 1:
+                    extra_ldflags.append("-lamdhip64")
 
             return sorted(extra_ldflags)
 
@@ -325,6 +278,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module: bool,
             is_standalone: bool = False,
             torch_exclude: bool = False,
+            prebuild: int = 0,
         ) -> None:
             cpp_extension.verify_ninja_availability()
 
@@ -333,9 +287,14 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 compiler, torch_exclude
             )
             if with_cuda is None:
-                with_cuda = any(map(_is_cuda_file, sources))
+                with_cuda = any(map(cpp_extension._is_cuda_file, sources))
             extra_ldflags = cpp_extension._prepare_ldflags(
-                extra_ldflags or [], with_cuda, verbose, is_standalone, torch_exclude
+                extra_ldflags or [],
+                with_cuda,
+                verbose,
+                is_standalone,
+                torch_exclude,
+                prebuild,
             )
             build_file_path = os.path.join(build_directory, "build.ninja")
             if verbose:
@@ -356,6 +315,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                prebuild=prebuild,
             )
 
             if verbose:

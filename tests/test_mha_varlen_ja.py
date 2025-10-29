@@ -71,7 +71,7 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _ = attention_ref(
+    out, _, _ = attention_ref(
         q,
         k,
         v,
