@@ -418,8 +418,6 @@ def _cached_fmha_v3_fwd_call(
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_kv,
         out_provided,
         bias,
         alibi_slopes,
@@ -437,8 +435,6 @@ def _cached_fmha_v3_fwd_call(
             q,
             k,
             v,
-            cu_seqlens_q,
-            cu_seqlens_kv,
             out_provided,
             bias,
             alibi_slopes,
@@ -724,8 +720,6 @@ def fmha_v3_fwd(
     out: Optional[jnp.ndarray] = None,
     bias: Optional[jnp.ndarray] = None,
     alibi_slopes: Optional[jnp.ndarray] = None,
-    cu_seqlens_q: Optional[jnp.ndarray] = None,
-    cu_seqlens_kv: Optional[jnp.ndarray] = None,
     gen: Optional[jnp.ndarray] = None,
 ) -> List[jnp.ndarray]:
     """FMHA v3 forward kernel optimized for bf16, head_dim=128, no bias/dropout."""
@@ -742,10 +736,6 @@ def fmha_v3_fwd(
         bias = _empty_tensor(jnp.float32)
     if alibi_slopes is None:
         alibi_slopes = _empty_tensor(jnp.float32)
-    if cu_seqlens_q is None:
-        cu_seqlens_q = _empty_tensor(jnp.int32)
-    if cu_seqlens_kv is None:
-        cu_seqlens_kv = _empty_tensor(jnp.int32)
     if gen is None:
         gen = _empty_tensor(jnp.int64)
 
@@ -767,8 +757,6 @@ def fmha_v3_fwd(
         q,
         k,
         v,
-        cu_seqlens_q,
-        cu_seqlens_kv,
         out,
         bias,
         alibi_slopes,
@@ -967,6 +955,8 @@ def _flash_attn_forward(
     alibi_slopes: Optional[jnp.ndarray],
     return_lse: bool,
     return_softmax: bool,
+    cu_seqlens_q: Optional[jnp.ndarray] = None,
+    cu_seqlens_kv: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Forward pass with automatic kernel selection and window size normalization."""
     _, seqlen_q, nhead_q, hdim_q = q.shape
@@ -977,27 +967,35 @@ def _flash_attn_forward(
         window_size_left, window_size_right, seqlen_k
     )
 
+    # If cu_seqlens are provided, we must use MHA kernel (not v3).
+    has_padding = cu_seqlens_q is not None and cu_seqlens_kv is not None
+
     # Select optimal kernel based on input constraints.
-    can_use_v3 = _can_impl_fmha_v3_fwd(
-        q,
-        k,
-        v,
-        dropout_p,
-        seqlen_q,
-        seqlen_k,
-        hdim_q,
-        hdim_v,
-        nhead_q,
-        nhead_k,
-        alibi_slopes,
-        bias,
-        window_size_left,
-        window_size_right,
-        return_lse,
+    can_use_v3 = (
+        False
+        if has_padding
+        else _can_impl_fmha_v3_fwd(
+            q,
+            k,
+            v,
+            dropout_p,
+            seqlen_q,
+            seqlen_k,
+            hdim_q,
+            hdim_v,
+            nhead_q,
+            nhead_k,
+            alibi_slopes,
+            bias,
+            window_size_left,
+            window_size_right,
+            return_lse,
+        )
     )
 
-    # Prefer CK kernel for decode cases (short sequences)
-    if can_use_v3 and seqlen_q > 128:
+    # Prefer CK kernel for decode cases (short sequences).
+    # Never use v3 when padding is involved.
+    if can_use_v3 and seqlen_q > 128 and not has_padding:
         result = fmha_v3_fwd(
             q,
             k,
@@ -1012,8 +1010,6 @@ def _flash_attn_forward(
             None,  # out
             bias,
             alibi_slopes,
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_kv
             None,  # gen
         )
     else:
@@ -1031,8 +1027,8 @@ def _flash_attn_forward(
             None,  # out
             bias,
             alibi_slopes,
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_kv
+            cu_seqlens_q,
+            cu_seqlens_kv,
             None,  # gen
         )
 
@@ -1062,30 +1058,25 @@ def _flash_attn_backward(
 
     Returns: (dq, dk, dv, softmax_d, dbias) - dbias is None if no bias provided.
     """
-    can_impl_fmha_v3_bwd_ = (
-        can_impl_fmha_v3_bwd(
-            dout,
-            q,
-            k,
-            v,
-            jnp.empty_like(k),
-            jnp.empty_like(v),
-            (
-                jnp.empty_like(bias) if bias is not None else None
-            ),
-            dropout_p,
-            causal,
-            window_size_left,
-            window_size_right,
-            bias,
-            alibi_slopes,
-            deterministic,
-            is_v3_atomic_fp32,
-        )
-        & can_use_v3_fwd
+    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
+        dout,
+        q,
+        k,
+        v,
+        jnp.empty_like(k),
+        jnp.empty_like(v),
+        (jnp.empty_like(bias) if bias is not None else None),
+        dropout_p,
+        causal,
+        window_size_left,
+        window_size_right,
+        bias,
+        alibi_slopes,
+        deterministic,
+        is_v3_atomic_fp32,
     )
 
-    # Add gfx950 specific path
+    # Add gfx950 specific path.
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950(
         dout,
         q,
@@ -1101,7 +1092,9 @@ def _flash_attn_backward(
         deterministic,
     )
 
-    if can_impl_fmha_v3_bwd_:
+    # Prefer FMHA v3 bwd when eligible and seqlen_q > 16 (AITer behavior).
+    seqlen_q = int(q.shape[1])
+    if can_impl_fmha_v3_bwd_ and seqlen_q > 16:
         log.info("Using FMHA v3 backward kernel")
         results = fmha_v3_bwd(
             dout,
@@ -1156,7 +1149,7 @@ def _flash_attn_backward(
 
 
 # Public API functions with custom VJP for autodiff.
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 9, 10, 11))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 9, 10, 11, 12, 13))
 def flash_attn_func(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -1170,6 +1163,8 @@ def flash_attn_func(
     deterministic: bool = True,
     return_lse: bool = False,
     return_attn_probs: bool = False,
+    cu_seqlens_q: Optional[jnp.ndarray] = None,
+    cu_seqlens_kv: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1226,7 +1221,7 @@ def flash_attn_func(
     head_size_q_og = q.shape[3]
     head_size_v_og = v.shape[3]
 
-    # Pad head dimensions to multiples of 8
+    # Pad head dimensions to multiples of 8.
     q_padded, k_padded, v_padded = q, k, v
     if head_size_q_og % 8 != 0:
         pad_q = 8 - head_size_q_og % 8
@@ -1241,7 +1236,7 @@ def flash_attn_func(
     seqlen_k = k_padded.shape[1]
     wl_norm, wr_norm = _normalize_window_size(window_size[0], window_size[1], seqlen_k)
 
-    # Call forward kernel with normalized window sizes for consistent behavior
+    # Call forward kernel with normalized window sizes and cu_seqlens for consistent behavior.
     out_padded, softmax_lse, S_dmask, _ = _flash_attn_forward(
         q_padded,
         k_padded,
@@ -1249,12 +1244,14 @@ def flash_attn_func(
         dropout_p,
         softmax_scale,
         causal=causal,
-        window_size_left=wl_norm,  # Use normalized values
-        window_size_right=wr_norm,  # Use normalized values
+        window_size_left=wl_norm,
+        window_size_right=wr_norm,
         bias=bias,
         alibi_slopes=alibi_slopes,
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
     )
 
     # Unpad output to original dimensions.
@@ -1282,6 +1279,8 @@ def _flash_attn_func_fwd(
     deterministic: bool = True,
     return_lse: bool = False,
     return_attn_probs: bool = False,
+    cu_seqlens_q: Optional[jnp.ndarray] = None,
+    cu_seqlens_kv: Optional[jnp.ndarray] = None,
 ):
     """Forward pass that returns both output and residuals for backward pass."""
     if softmax_scale is None:
@@ -1290,7 +1289,7 @@ def _flash_attn_func_fwd(
     head_size_q_og = q.shape[3]
     head_size_v_og = v.shape[3]
 
-    # Pad head dimensions to multiples of 8
+    # Pad head dimensions to multiples of 8.
     q_padded, k_padded, v_padded = q, k, v
     if head_size_q_og % 8 != 0:
         pad_q = 8 - head_size_q_og % 8
@@ -1303,7 +1302,7 @@ def _flash_attn_func_fwd(
     seqlen_k = k_padded.shape[1]
     wl_norm, wr_norm = _normalize_window_size(window_size[0], window_size[1], seqlen_k)
 
-    # Pass normalized concrete values to forward - ensures consistent behavior
+    # Pass normalized concrete values and cu_seqlens to forward.
     out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
         q_padded,
         k_padded,
@@ -1311,12 +1310,14 @@ def _flash_attn_func_fwd(
         dropout_p,
         softmax_scale,
         causal=causal,
-        window_size_left=wl_norm,  # Use normalized values
-        window_size_right=wr_norm,  # Use normalized values
+        window_size_left=wl_norm,
+        window_size_right=wr_norm,
         bias=bias,
         alibi_slopes=alibi_slopes,
-        return_lse=True,  # Always return for backward
+        return_lse=True,
         return_softmax=return_attn_probs and dropout_p > 0,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
     )
 
     out = out_padded[..., :head_size_v_og]
@@ -1344,8 +1345,8 @@ def _flash_attn_func_fwd(
         bias,
         alibi_slopes,
         deterministic,
-        head_size_q_og,  # Store original Q head dimension
-        head_size_v_og,  # Store original V head dimension
+        head_size_q_og,
+        head_size_v_og,
     )
 
     return result, residuals
@@ -1359,6 +1360,8 @@ def _flash_attn_func_bwd(
     deterministic,
     return_lse,
     return_attn_probs,
+    cu_seqlens_q,
+    cu_seqlens_kv,
     residuals,
     grad_outputs,
 ):
@@ -1384,9 +1387,9 @@ def _flash_attn_func_bwd(
         head_size_v_og,
     ) = residuals
 
-    # Handle different output formats - extract gradient w.r.t. main output
+    # Handle different output formats - extract gradient w.r.t. main output.
     if isinstance(grad_outputs, tuple):
-        dout = grad_outputs[0]  # Gradient w.r.t. main output tensor
+        dout = grad_outputs[0]
     else:
         dout = grad_outputs
 
@@ -1412,20 +1415,20 @@ def _flash_attn_func_bwd(
         res_window_size[1],
         res_bias,
         res_alibi_slopes,
-        res_deterministic,  # Use same deterministic setting as forward pass
+        res_deterministic,
         rng_state,
         True,  # is_v3_atomic_fp32
         1,  # how_v3_bf16_cvt
     )
 
-    # Unpad gradients to match original input dimensions
-    # Both Q and K have the same head dimension (head_size_q_og)
-    # V has its own dimension (head_size_v_og)
+    # Unpad gradients to match original input dimensions.
+    # Both Q and K have the same head dimension (head_size_q_og).
+    # V has its own dimension (head_size_v_og).
     dq = dq_padded[..., :head_size_q_og]
     dk = dk_padded[..., :head_size_q_og]
     dv = dv_padded[..., :head_size_v_og]
 
-    # Return gradients for differentiable inputs only: q, k, v, softmax_scale, bias, alibi_slopes
+    # Return gradients for differentiable inputs only: q, k, v, softmax_scale, bias, alibi_slopes.
     return (
         dq,  # q (index 0)
         dk,  # k (index 1)
@@ -1435,5 +1438,4 @@ def _flash_attn_func_bwd(
     )
 
 
-# Register the custom VJP
 flash_attn_func.defvjp(_flash_attn_func_fwd, _flash_attn_func_bwd)

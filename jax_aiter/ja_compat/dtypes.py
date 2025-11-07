@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 import jax.numpy as jnp
 from .chip_info import get_gfx
 
@@ -59,3 +61,49 @@ def str2tuple(v):
         return tuple(int(p.strip()) for p in parts if p.strip() != "")
     except Exception as e:
         raise ValueError(f"invalid format of input: {v}") from e
+
+
+def to_jax_dtype(dtype_spec):
+    """Convert a dtype specification to a JAX dtype.
+
+    Args:
+        dtype_spec: Can be:
+            - A string key from d_dtypes (e.g., "fp16", "bf16", "fp32")
+            - Common synonym strings (e.g., "float16", "bfloat16", "float32")
+            - A dtype-like object (JAX/numpy dtype or Python type)
+
+    Returns:
+        A JAX dtype object
+
+    Raises:
+        ValueError: If the dtype_spec is not recognized
+    """
+    if isinstance(dtype_spec, str):
+        dtype_str = dtype_spec.lower().strip()
+
+        # Check if it's already in d_dtypes
+        if dtype_str in d_dtypes:
+            return d_dtypes[dtype_str]
+
+        # Map common synonyms
+        synonyms = {
+            "half": "fp16",
+            "float16": "fp16",
+            "bfloat16": "bf16",
+            "float32": "fp32",
+            "float": "fp32",
+            "int32": "i32",
+            "uint32": "u32",
+            "int16": "i16",
+            "int8": "i8",
+        }
+
+        if dtype_str in synonyms:
+            return d_dtypes[synonyms[dtype_str]]
+
+        raise ValueError(f"Unknown dtype string: {dtype_spec}")
+
+    try:
+        return jnp.dtype(dtype_spec)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Cannot convert {dtype_spec} to JAX dtype") from e

@@ -9,6 +9,7 @@ from aiter.test_mha_common import (
     attn_bias_from_alibi_slopes,
     ck_randval_to_dropout_mask,
     convert_flash_attn_S_to_softmax,
+    generate_qkv,
 )
 import pytest
 import argparse
@@ -16,6 +17,7 @@ import argparse
 # JAX imports.
 import jax
 import jax.numpy as jnp
+import jax.nn as jnn
 from jax import dlpack as jax_dlpack
 from torch.utils import dlpack as torch_dlpack
 
@@ -48,6 +50,8 @@ def run_torch(
     window_size=(-1, -1),
     upcast=True,
     reorder_ops=False,
+    query_padding_mask=None,
+    key_padding_mask=None,
 ):
     (_, seqlen_q, _, _) = q.shape
     (_, seqlen_k, _, _) = k.shape
@@ -61,12 +65,12 @@ def run_torch(
     else:
         attn_bias = None
 
-    out, _, _ = attention_ref(
+    out, _, softmax_lse = attention_ref(
         q,
         k,
         v,
-        None,
-        None,
+        query_padding_mask,
+        key_padding_mask,
         attn_bias,
         dropout_p,
         dropout_mask,
@@ -76,20 +80,20 @@ def run_torch(
         reorder_ops=reorder_ops,
     )
 
-    if dout == None:
-        return out
+    if dout is None:
+        return out, softmax_lse
     elif bias is not None:
         dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
         # If seqlen_q > seqlen_k with mask, pytorch will output NaN.
         # Align with ck behavior here.
         dbias = torch.nan_to_num(dbias, nan=0.0)
-        return out, dq, dk, dv, dbias
+        return out, softmax_lse, dq, dk, dv, dbias
     else:
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-        return out, dq, dk, dv, None
+        return out, softmax_lse, dq, dk, dv, None
 
 
-def run_jax(
+def run_jax_aiter(
     q,
     k,
     v,
@@ -103,8 +107,9 @@ def run_jax(
     return_lse=True,
     return_attn_probs=True,
 ):
-    """Simplified JAX implementation with single VJP call."""
-    # Convert PyTorch -> JAX (zero-copy via DLPack)
+    """Run JAX flash attention and return outputs + grads for parity checks."""
+
+    # Convert PyTorch tensors to JAX arrays (zero-copy via DLPack).
     qj = _to_jax(q)
     kj = _to_jax(k)
     vj = _to_jax(v)
@@ -113,8 +118,8 @@ def run_jax(
 
     window_size = tuple(int(x) for x in window_size)
 
-    (outj, lse_j, S_dmask_j), pullback = jax.vjp(
-        lambda Q, K, V, B, ALJ: jax_flash_attn_func(
+    def _jax_flash(Q, K, V, B, ALJ):
+        return jax_flash_attn_func(
             Q,
             K,
             V,
@@ -126,23 +131,30 @@ def run_jax(
             deterministic=deterministic,
             return_lse=return_lse,
             return_attn_probs=return_attn_probs,
-        ),
-        qj,
-        kj,
-        vj,
-        bj,
-        alj,
-    )
+        )
 
-    # Reconstruct dropout mask.
+    primal_out, pullback = jax.vjp(_jax_flash, qj, kj, vj, bj, alj)
+
+    # Normalize outputs depending on requested return values.
+    softmax_lse_j = None
+    s_dmask_j = None
+    if return_lse and return_attn_probs:
+        outj, softmax_lse_j, s_dmask_j = primal_out
+    elif return_lse:
+        outj, softmax_lse_j = primal_out
+    elif return_attn_probs:
+        outj, s_dmask_j = primal_out
+    else:
+        outj = primal_out
+
+    # Reconstruct dropout mask only when stochastic dropout is active.
     dropout_mask = None
-    if dropout_p > 0.0:
+    if dropout_p > 0.0 and s_dmask_j is not None:
         (_, seqlen_q, _, d_q) = q.shape
-        (_, seqlen_k, _, d_k) = k.shape
-        (_, seqlen_k, _, d_v) = v.shape
-        S_dmask_converted = ck_randval_to_dropout_mask(_to_torch(S_dmask_j), dropout_p)
-        S_dmask_converted = convert_flash_attn_S_to_softmax(
-            S_dmask_converted,
+        (_, seqlen_k, _, _) = k.shape
+        s_dmask_t = ck_randval_to_dropout_mask(_to_torch(s_dmask_j), dropout_p)
+        s_dmask_t = convert_flash_attn_S_to_softmax(
+            s_dmask_t,
             seqlen_q,
             seqlen_k,
             None,
@@ -152,32 +164,29 @@ def run_jax(
             causal=causal,
             window_size=window_size,
         )
-        dropout_mask = S_dmask_converted >= 0
+        dropout_mask = s_dmask_t >= 0
 
     out_t = _to_torch(outj)
+    softmax_lse_t = _to_torch(softmax_lse_j) if softmax_lse_j is not None else None
 
     if dout is None:
-        return out_t, dropout_mask, _, _, _, _
+        return out_t, softmax_lse_t, dropout_mask, None, None, None, None
 
-    cot = (
-        _to_jax(dout),
-        jnp.zeros_like(lse_j),
-        jnp.zeros_like(S_dmask_j),
-    )
+    cot_components = [_to_jax(dout)]
+    if softmax_lse_j is not None:
+        cot_components.append(jnp.zeros_like(softmax_lse_j))
+    if s_dmask_j is not None:
+        cot_components.append(jnp.zeros_like(s_dmask_j))
+    cot = tuple(cot_components)
 
-    if bj is None:
-        dqj, dkj, dvj, _, _ = pullback(cot)
-        dbj = None
-    else:
-        dqj, dkj, dvj, dbj, _ = pullback(cot)
+    dqj, dkj, dvj, dbj, _ = pullback(cot)
 
-    # Convert JAX -> PyTorch (zero-copy via DLPack)
     dq_t = _to_torch(dqj)
     dk_t = _to_torch(dkj)
     dv_t = _to_torch(dvj)
-    dbias_t = _to_torch(dbj) if dbj is not None else None
+    dbias_t = _to_torch(dbj) if (bias is not None and dbj is not None) else None
 
-    return out_t, dropout_mask, dq_t, dk_t, dv_t, dbias_t
+    return out_t, softmax_lse_t, dropout_mask, dq_t, dk_t, dv_t, dbias_t
 
 
 @pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
@@ -220,6 +229,7 @@ def run_jax(
         (2048, 2048),
     ],
 )
+@pytest.mark.parametrize("input_layout", ["BSHD", "BHSD", "SBHD", "KVPACKED"])
 def test_flash_attn_output(
     batch_size,
     nheads,
@@ -234,6 +244,7 @@ def test_flash_attn_output(
     deterministic,
     mha_type,
     dtype,
+    input_layout,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
@@ -267,6 +278,17 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
+    (_, _, _, _, _, _, _, q, k, v, _, _, _,) = generate_qkv(
+        q,
+        k,
+        v,
+        None,
+        None,
+        kvpacked=(input_layout == "KVPACKED"),
+        qkvpacked=(input_layout == "QKVPACKED"),
+        input_layout=input_layout,
+    )
+
     attn_bias = None
     alibi_slopes = None
     if bias_type == "bias":
@@ -286,7 +308,15 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    out_jax, dropout_mask_jax, dq_jax, dk_jax, dv_jax, dbias_jax = run_jax(
+    (
+        out_jax,
+        softmax_lse_jax,
+        dropout_mask_jax,
+        dq_jax,
+        dk_jax,
+        dv_jax,
+        dbias_jax,
+    ) = run_jax_aiter(
         q,
         k,
         v,
@@ -301,7 +331,7 @@ def test_flash_attn_output(
         return_attn_probs,
     )
 
-    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
+    out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
         k,
         v,
@@ -314,7 +344,7 @@ def test_flash_attn_output(
         window_size,
     )
 
-    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
+    out_pt, softmax_lse_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q,
         k,
         v,
@@ -330,13 +360,25 @@ def test_flash_attn_output(
     )
 
     # Compare outputs
-    print(f"JAX vs REF Output max diff: {(out_jax - out_ref).abs().max().item()}")
-    print(f"PT vs REF Output max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Output max diff: {(out_jax - out_ref).abs().max().item()}")
+    print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
 
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
-    assert (
-        out_jax - out_ref
-    ).abs().max().item() <= out_tol, "JAX output doesn't match REF"
+    assert (out_jax - out_ref).abs().max().item() <= out_tol
+
+    if softmax_lse_jax is not None and softmax_lse_ref is not None:
+        print(
+            f"softmax_lse max diff: {(softmax_lse_jax - softmax_lse_ref).abs().max().item()}"
+        )
+        print(
+            f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
+        )
+        softmax_lse_tol = max(
+            2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
+        )
+        # assert (
+        #     softmax_lse_jax - softmax_lse_ref
+        # ).abs().max().item() <= softmax_lse_tol
 
     # Compare gradients
     if dq_jax is not None:
@@ -475,6 +517,15 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
+parser.add_argument(
+    "-i",
+    "--input_layout",
+    type=str,
+    choices=["BSHD", "BHSD", "SBHD", "QKVPACKED", "KVPACKED"],
+    default="BSHD",
+    help="""input_layout.
+    e.g.: -i BSHD""",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()
@@ -493,4 +544,5 @@ if __name__ == "__main__":
         args.deterministic,
         args.mha_type,
         dtype,
+        args.input_layout,
     )
