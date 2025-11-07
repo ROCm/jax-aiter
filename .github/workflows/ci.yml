@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: [linux-mi355-4]
+    runs-on: [self-hosted, Linux, X64]
 
     env:
       IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.12-ubu24
