@@ -247,7 +247,7 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_varlen_ja.py
-            python multi_gpu_runner.py --save-failed failed_tests.txt
+            python tests/multi_gpu_runner.py --save-failed failed_tests.txt
             if [ -f failed_tests.txt ]; then
               echo "Failed tests count: $(sort failed_tests.txt | uniq | wc -l)"
               echo "Failed tests:"
