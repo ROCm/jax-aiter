@@ -208,6 +208,18 @@ jobs:
             ls -lh build/aiter_build/*.so
           '
 
+      - name: Save AITER JIT modules cache
+        if: steps.jit_decision.outputs.do_build == 'true' && steps.aiter_cache.outputs.cache-hit != 'true' && hashFiles('build/aiter_build/*.so') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/aiter_build/*.so
+          key: >
+            aiter-so-${{ runner.os }}
+            -aiter-${{ steps.aiter_sha.outputs.sha }}
+            -jit-${{ hashFiles('jax_aiter/jit/**') }}
+            -cfg-${{ hashFiles('scripts/**','**/optCompilerConfig.json') }}
+
       - name: Build JA frontend modules
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
