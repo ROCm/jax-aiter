@@ -7,9 +7,11 @@ JAX-AITER integrates AMD's AITER operator library into JAX, bringing AITER's hig
 
 Status: experimental.
 
+Note: Python 3.12 is now required; Python 3.10 support has been dropped.
+
 ## AITER integration for JAX
 
-**AITER** is AMD’s centralized library of AI operators optimized for ROCm GPUs.
+**AITER** is AMD's centralized library of AI operators optimized for ROCm GPUs.
 It unifies multiple backends (C++, Python, CK, assembly, etc.) and exposes a consistent operator interface.
 
 **JAX-AITER** builds on that foundation by providing:
@@ -39,8 +41,9 @@ Environment setup (run from the top of the jax-aiter project tree):
 ```bash
 export JA_ROOT_DIR="$PWD"                    # Set to the top of jax-aiter project tree
 export AITER_SYMBOL_VISIBLE=1
-export GPU_ARCHS=gfx950                      # Example for MI350; use your GPU arch (e.g., gfx942 for MI300)
-export AITER_ASM_DIR=/aiter-hsa-path/gfx950/ # Example for MI350
+export GPU_ARCHS=gfx950                        # Example for MI350; use your GPU arch (e.g., gfx942 for MI300)
+# You may specify multiple archs as a semicolon-separated list, e.g.: GPU_ARCHS="gfx942;gfx950"
+export AITER_ASM_DIR="$JA_ROOT_DIR/third_party/aiter/hsa/gfx950"  # Example path matching our CI layout
 ```
 
 You can build natively or inside a ROCm container. You can pull docker images from the latest release of ROCm jax.
@@ -50,7 +53,7 @@ https://hub.docker.com/r/rocm/jax/tags
 We suggest to use latest jax docker images:
 
 ```bash
-docker pull rocm/jax:rocm7.0.2-jax0.6.0-py3.10-ubu22
+docker pull rocm/jax:rocm7.0.2-jax0.6.0-py3.12-ubu24
 ```
 
 Inside the container (or on your host with ROCm installed), proceed:
@@ -65,19 +68,21 @@ Submodules:
 - third_party/aiter
 - third_party/pytorch
 
-### 2) Build static PyTorch for ROCm
+### 2) Apply patches and build static PyTorch for ROCm
 
 Statically build minimal PyTorch libraries (c10, torch_cpu, torch_hip, caffe2_nvrtc) and headers for linking.
 
-Apply the caffe2_nvrtc static/PIC patch:
+Apply patches:
 
 ```bash
+# PyTorch patch for caffe2_nvrtc static/PIC
 cd third_party/pytorch
 git apply ../../scripts/torch_caffe.patch
 cd -
 
+# AITER integration patch
 cd third_party/aiter
-git apply ../../scripts/aiter_torch_remove.patch
+git apply ../../scripts/aiter.patch
 cd -
 ```
 
@@ -102,10 +107,9 @@ make
 ```
 
 Key paths (from Makefile):
-- Output: build/aiter_build/libjax_aiter.so
+- Output: build/jax_aiter_build/libjax_aiter.so
 - Static libs: third_party/pytorch/build_static/lib
 - Include dirs: JAX FFI, PyTorch, and csrc/common are used
-
 
 ### 4) Build AITER JIT modules
 
@@ -124,11 +128,10 @@ python3 jax_aiter/jit/build_jit.py
 Outputs (.so) are placed under build/aiter_build/.
 
 Notes:
-- build_jit.py doesn't use any "jit" atm, but in future we may change that to do so.
 - build_jit.py patches AITER's core to redirect user JIT dir to build/aiter_build and inject PyTorch/JAX-FFI include paths.
 - Ensure static PyTorch build completed first; headers and libs expected under third_party/pytorch/build_static and build_static/install/include.
 
-### 5) Build JAX-AITER modules
+### 5) Build JAX-AITER frontend modules
 
 Build JAX-AITER frontend modules that bridge JAX FFI to AITER:
 
@@ -142,28 +145,68 @@ Notes:
 - JA modules are thin host-only frontends that call into AITER implementations
 - They must be built after the umbrella and AITER modules
 
-### 6) Test / Verify
+### 6) Install runtime dependencies and test
+
+Install ROCm PyTorch wheel (ROCm 7.0.2):
+
+```bash
+python3 -m pip install --break-system-packages \
+  --default-timeout=300 \
+  --retries 5 \
+  --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/ \
+  'torch==2.8.0+rocm7.0.2.lw.git245bf6ed'
+```
+
+Install AITER and JAX-AITER:
+
+```bash
+pip install --break-system-packages third_party/aiter
+pip install --break-system-packages .
+```
 
 Smoke test:
 
 ```bash
-python -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print('jax-aiter import OK')"
+python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print('jax-aiter import OK')"
 ```
 
-Run tests (requires JAX ROCm, Pytorch and GPU):
-
-Pytorch is a test time dependency and requires to test with the baseline.
-
-```Bash
-pip install --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0/torch==2.8.0+rocm7.0.0.git64359f59
-python3 setup.py # both aiter and jax aiter.
-pip install pytest-xdist
-```
+Run tests (requires JAX ROCm, PyTorch and GPU):
 
 ```bash
-pytest -q tests/test_mha_varlen_ja.py
-pytest -q tests/test_mha_ck_ja.py
+pip install pytest pytest-xdist
+pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_varlen_ja.py
+pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_ja.py
 ```
+
+## Run benchmarks
+
+The primary benchmark compares Multi-Head Attention between:
+- Pure JAX baseline (`jax_aiter.baseline.mha_attn.attention_ref`)
+- JAX-AITER implementation (`jax_aiter.mha.flash_attn_func`)
+
+Default configuration:
+- Layout: BSHD (batch, seq_len, num_heads, head_dim)
+- Default dtype: bfloat16
+- Multiple configurations (seq_len up to 8192; head_dim 64–256; causal/non-causal)
+- 10 runs per configuration (median reported)
+
+Usage:
+```bash
+cd jax-aiter
+python benchmarks/benchmark_mha.py
+```
+
+Notes:
+- Requires a GPU-enabled JAX environment
+- Ensure AITER/JAX-AITER modules are built and importable (see steps above)
+- To change the number of runs, you can modify the call in `benchmark_mha.py` (e.g., `main(num_runs=20)`), or run:
+  ```bash
+  python -c "import importlib; m=importlib.import_module('benchmarks.benchmark_mha'); m.main(num_runs=20)"
+  ```
+- Optional CSV export: add at the end of `main()`:
+  ```python
+  export_results_csv(results, filename='benchmark_results.csv')
+  ```
 
 ## Troubleshooting
 
@@ -175,7 +218,7 @@ pytest -q tests/test_mha_ck_ja.py
   make
   ```
 
-  - **caffe2_nvrtc not found or not PIC:**
+- **caffe2_nvrtc not found or not PIC:**
   Ensure the patch (scripts/torch_caffe.patch) was applied, then rerun build_static_pytorch.sh
 
 - **JIT cannot find PyTorch headers:**
@@ -185,7 +228,7 @@ pytest -q tests/test_mha_ck_ja.py
   ```
 
 - **Symbol not found errors while loading .sos for MHA kernels**
-  Confitm that libmha_fwd and libmha_bwd are built and loaded before loading the respective modules.
+  Confirm that libmha_fwd and libmha_bwd are built and loaded before loading the respective modules.
 
 ## Developer notes
 
