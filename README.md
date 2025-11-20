@@ -46,7 +46,7 @@ export JA_ROOT_DIR="$PWD"                    # Set to the top of jax-aiter proje
 export AITER_SYMBOL_VISIBLE=1
 export GPU_ARCHS=gfx950                        # Example for MI350; use your GPU arch (e.g., gfx942 for MI300)
 # You may specify multiple archs as a semicolon-separated list, e.g.: GPU_ARCHS="gfx942;gfx950"
-export AITER_ASM_DIR="$JA_ROOT_DIR/third_party/aiter/hsa/gfx950"  # Example path matching our CI layout
+export AITER_ASM_DIR="$JA_ROOT_DIR/third_party/aiter/hsa/gfx950/"  # Example path matching our CI layout
 ```
 
 You can build natively or inside a ROCm container. You can pull docker images from the latest release of ROCm jax.

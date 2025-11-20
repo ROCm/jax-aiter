@@ -1,28 +1,76 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
 import threading
 
-NGPUS = 8
-TESTFILE = "tests/test_mha_ja.py"
-RERUNS = "3"
+# Default configuration
+DEFAULT_NGPUS = 8
+DEFAULT_TESTPATH = "tests"  # Changed from single file to entire tests directory
+DEFAULT_RERUNS = "3"
 
 
-def collect_all_tests():
+def detect_gpu_count():
+    """Try to detect the number of available AMD GPUs."""
+    # Try amd-smi first (newer tool)
+    try:
+        result = subprocess.run(
+            ["amd-smi", "list", "--json"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            # Count occurrences of "gpu" in the JSON output
+            gpu_count = result.stdout.count('"gpu"')
+            if gpu_count > 0:
+                print(f"Detected {gpu_count} GPUs using amd-smi")
+                return gpu_count
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Fall back to rocm-smi
+    try:
+        result = subprocess.run(["rocm-smi"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            # Count lines that start with a digit (GPU IDs)
+            gpu_count = len(
+                [
+                    line
+                    for line in result.stdout.splitlines()
+                    if line and line[0].isdigit()
+                ]
+            )
+            if gpu_count > 0:
+                print(f"Detected {gpu_count} GPUs using rocm-smi")
+                return gpu_count
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Check environment variables
+    if "HIP_VISIBLE_DEVICES" in os.environ:
+        devices = os.environ["HIP_VISIBLE_DEVICES"].split(",")
+        print(f"Using HIP_VISIBLE_DEVICES: {len(devices)} GPUs")
+        return len(devices)
+
+    # Default fallback
+    print(f"Could not detect GPUs, defaulting to {DEFAULT_NGPUS}")
+    return DEFAULT_NGPUS
+
+
+def collect_all_tests(testpath):
     """Return list of nodeids collected by pytest."""
     out = subprocess.check_output(
-        ["pytest", "--collect-only", "-q", TESTFILE],
+        ["pytest", "--collect-only", "-q", testpath],
         text=True,
     )
     # pytest --collect-only -q prints one nodeid per line.
-    return [
-        line.strip()
-        for line in out.splitlines()
-        if line.strip() and not line.startswith("<")
-    ]
+    nodeids = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line and not line.startswith("<") and "::" in line:
+            nodeids.append(line)
+    return nodeids
 
 
 def make_shards(nodeids, n):
@@ -86,7 +134,7 @@ def stream_output(gpu_idx, proc, shard_total):
             if stripped:
                 pytest_chars = 0
                 for char in stripped:
-                    if char in ".Fsx":
+                    if char in ".FsxR":  # Added R for reruns
                         pytest_chars += 1
                     else:
                         break
@@ -95,10 +143,13 @@ def stream_output(gpu_idx, proc, shard_total):
                     dots = status_prefix.count(".")
                     fails = status_prefix.count("F")
                     skips = status_prefix.count("s")
+                    rerun_markers = status_prefix.count("R")
+                    # R doesn't increment 'done' as it's a retry, not a new test
                     done += dots + fails + skips
                     passed += dots
                     failed += fails
                     skipped += skips
+                    reruns += rerun_markers
 
         prefix = f"[GPU {gpu_idx} {done}/{shard_total}]"
         if stripped:
@@ -193,50 +244,101 @@ def print_final_report(exitcodes, total_expected):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run tests in parallel across multiple GPUs"
+        description="Run tests in parallel across multiple AMD GPUs"
+    )
+    parser.add_argument(
+        "testpath",
+        nargs="?",
+        default=DEFAULT_TESTPATH,
+        help=f"Path to test file or directory (default: {DEFAULT_TESTPATH})",
+    )
+    parser.add_argument(
+        "--ngpus",
+        type=int,
+        default=None,
+        help=f"Number of GPUs to use (default: auto-detect or {DEFAULT_NGPUS})",
+    )
+    parser.add_argument(
+        "--reruns",
+        type=int,
+        default=DEFAULT_RERUNS,
+        help=f"Number of reruns for failed tests (default: {DEFAULT_RERUNS})",
     )
     parser.add_argument(
         "--save-failed",
         metavar="FILE",
         help="Save failed test nodeids to the specified file",
     )
+    parser.add_argument("--filter", help="Filter tests using pytest -k expression")
+    parser.add_argument(
+        "--maxfail", type=int, help="Exit after first N failures per GPU"
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Verbose pytest output"
+    )
     args = parser.parse_args()
 
-    print("Collecting tests...")
-    all_nodeids = collect_all_tests()
-    shards = make_shards(all_nodeids, NGPUS)
+    # Determine number of GPUs
+    if args.ngpus is not None:
+        ngpus = args.ngpus
+        print(f"Using specified {ngpus} GPUs")
+    else:
+        ngpus = detect_gpu_count()
+
+    # Collect tests
+    print(f"Collecting tests from {args.testpath}...")
+    all_nodeids = collect_all_tests(args.testpath)
+
+    if not all_nodeids:
+        print("No tests found!")
+        sys.exit(1)
+
+    shards = make_shards(all_nodeids, ngpus)
 
     total_tests = len(all_nodeids)
     print(f"\n{'='*80}")
     print(f"Total tests collected: {total_tests}")
-    print(f"Distributing across {NGPUS} GPUs (~{total_tests//NGPUS} tests per GPU)")
+    print(f"Distributing across {ngpus} GPUs (~{total_tests//ngpus} tests per GPU)")
+    print(f"Test path: {args.testpath}")
+    if args.filter:
+        print(f"Filter: {args.filter}")
     print(f"{'='*80}\n")
 
     procs = []
     threads = []
 
-    for gpu in range(NGPUS):
+    for gpu in range(ngpus):
         shard_tests = shards[gpu]
         shard_total = len(shard_tests)
 
         env = os.environ.copy()
         env["HIP_VISIBLE_DEVICES"] = str(gpu)
-        env["PYTEST_SHARD_TOTAL"] = str(NGPUS)
+        env["PYTEST_SHARD_TOTAL"] = str(ngpus)
         env["PYTEST_SHARD_INDEX"] = str(gpu)
 
         cmd = [
             "pytest",
-            "-v",
-            # "--maxfail=5",
             "--no-header",
             "--no-summary",
             "--disable-warnings",
-            f"--reruns={RERUNS}",
-            TESTFILE,
+            "--color=no",
+            "-q",
+            f"--reruns={args.reruns}",
+            args.testpath,
         ]
 
+        # Note: -q and -v are mutually exclusive, so we skip -v when using -q
+        # if args.verbose:
+        #     cmd.append("-v")
+
+        if args.maxfail:
+            cmd.append(f"--maxfail={args.maxfail}")
+
+        if args.filter:
+            cmd.extend(["-k", args.filter])
+
         print(
-            f"[launcher] Starting shard {gpu}/{NGPUS-1} on GPU {gpu} with {shard_total} tests"
+            f"[launcher] Starting shard {gpu}/{ngpus-1} on GPU {gpu} with {shard_total} tests"
         )
         proc = subprocess.Popen(
             cmd,

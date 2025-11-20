@@ -475,3 +475,72 @@ def attention_ref(
         attention.astype(dtype_og),
         lse.astype(dtype_og),
     )
+
+
+def pad_rearrange_dropout_mask_hts_to_bhss(
+    S_dmask_hts: jnp.ndarray,
+    cu_seqlens_q: jnp.ndarray,
+    seqlen_q_rounded: int,
+    seqlen_k_rounded: int,
+) -> jnp.ndarray:
+    """
+    Convert varlen S_dmask from HTS layout to BHSS:
+      Input:  (H, total_q, max_seqlen_k)
+      Output: (B, H, seqlen_q_rounded, seqlen_k_rounded)
+
+    We use cu_seqlens_q to split per batch and pad each chunk to (seqlen_q_rounded, seqlen_k_rounded).
+    """
+    nheads, total_q, max_seqlen_k = S_dmask_hts.shape
+    batch_size = int(cu_seqlens_q.shape[0] - 1)
+
+    out = jnp.zeros(
+        (batch_size, nheads, seqlen_q_rounded, seqlen_k_rounded),
+        dtype=S_dmask_hts.dtype,
+    )
+
+    # Python loop is fine here (test utility), not performance critical
+    for b in range(batch_size):
+        start = int(cu_seqlens_q[b])
+        end = int(cu_seqlens_q[b + 1])
+        q_len = end - start
+
+        # Slice (H, q_len, max_seqlen_k)
+        sl = S_dmask_hts[:, start:end, :]
+
+        pad_q = seqlen_q_rounded - q_len
+        pad_k = seqlen_k_rounded - sl.shape[2]
+        # Pad with zeros; convert_flash_attn_S_to_softmax will mask via padding masks
+        sl_padded = jnp.pad(sl, ((0, 0), (0, pad_q), (0, pad_k)), mode="constant")
+
+        out = out.at[b].set(sl_padded)
+
+    return out
+
+
+def generate_random_padding_mask(
+    max_seqlen: int,
+    batch_size: int,
+    key: jax.Array,
+    mode: str = "random",
+) -> jnp.ndarray:
+    assert mode in ["full", "random", "third"]
+
+    if mode == "full":
+        lengths = jnp.full((batch_size,), max_seqlen, dtype=dtypes.i32)
+    elif mode == "random":
+        lo = max(1, max_seqlen - 20)
+        hi = max_seqlen + 1
+        lengths = jax.random.randint(key, (batch_size,), lo, hi, dtype=dtypes.i32)
+    else:  # "third"
+        lo = max_seqlen // 3
+        hi = max_seqlen + 1
+        lengths = jax.random.randint(key, (batch_size,), lo, hi, dtype=dtypes.i32)
+
+    # (batch_size,) -> (batch_size, 1) for broadcasting
+    lengths = lengths[:, None]
+
+    ar = jnp.arange(max_seqlen, dtype=dtypes.i32)
+    positions = repeat(ar, "s -> b s", b=batch_size)  # (batch_size, max_seqlen)
+
+    padding_mask = positions < lengths  # (batch_size, max_seqlen), bool
+    return padding_mask
