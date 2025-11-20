@@ -25,6 +25,18 @@ jobs:
       ROCM_VERSION: 7.0.2
 
     steps:
+      - name: Clean workspace permissions
+        run: |
+          set -x
+          echo "Fixing workspace permissions from previous runs..."
+          # Clean build artifacts that may have wrong permissions
+          sudo rm -rf build/aiter_build build/jax_aiter_build || true
+          # Clean pytest cache and test artifacts (common permission issue!)
+          sudo rm -rf .pytest_cache __pycache__ **/__pycache__ .coverage htmlcov || true
+          # Fix any remaining permission issues in workspace
+          sudo chown -R $(id -u):$(id -g) . || true
+          echo "Workspace cleaned and permissions fixed"
+
       - name: Checkout repository with submodules
         uses: actions/checkout@v4
         with:
