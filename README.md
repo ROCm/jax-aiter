@@ -61,12 +61,43 @@ Inside the container (or on your host with ROCm installed), proceed:
 ### 1) Clone the repository and init submodules
 
 ```bash
-git clone --recursive git@github.com:ROCm/jax-aiter.git
+git clone https://github.com/ROCm/jax-aiter.git
+cd jax-aiter
 ```
 
-Submodules:
-- third_party/aiter
-- third_party/pytorch
+**Initialize JAX-AITER submodules:**
+```bash
+git submodule update --init third_party/pytorch third_party/aiter
+```
+
+**Initialize PyTorch's necessary nested submodules:**
+```bash
+cd third_party/pytorch
+git submodule update --init \
+    third_party/cpuinfo \
+    third_party/sleef \
+    third_party/protobuf \
+    third_party/onnx \
+    third_party/fmt \
+    third_party/FP16 \
+    third_party/FXdiv \
+    third_party/psimd \
+    third_party/pthreadpool \
+    third_party/pybind11 \
+    third_party/pocketfft \
+    third_party/composable_kernel \
+    third_party/nlohmann \
+    third_party/kineto \
+    third_party/flatbuffers
+cd ../..
+```
+
+**Initialize AITER submodules:**
+```bash
+cd third_party/aiter
+git submodule update --init 3rdparty/composable_kernel
+cd ../..
+```
 
 ### 2) Apply patches and build static PyTorch for ROCm
 
