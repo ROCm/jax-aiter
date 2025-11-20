@@ -49,6 +49,11 @@ jobs:
           echo "Initializing Submodules (Selective)"
           echo "========================================="
           
+          # Clean stale submodule cache (fixes "Unable to find current revision" errors)
+          echo "0. Cleaning stale submodule cache..."
+          rm -rf .git/modules/third_party/aiter .git/modules/third_party/pytorch || true
+          git submodule deinit -f third_party/aiter third_party/pytorch || true
+          
           # Initialize JAX-AITER top-level submodules
           echo "1. Initializing jax-aiter submodules..."
           git submodule update --init third_party/pytorch third_party/aiter
@@ -79,8 +84,6 @@ jobs:
           cd third_party/aiter
           git submodule update --init 3rdparty/composable_kernel
           cd ../..
-          
-          echo "✅ All required submodules initialized"
           echo "========================================="
 
       - name: Get third_party/aiter submodule SHA
