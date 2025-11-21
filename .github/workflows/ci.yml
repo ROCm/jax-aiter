@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: [linux-mi355-8]
 
     env:
       IMAGE: rocm/jax:rocm7.0.2-jax0.6.0-py3.12-ubu24
@@ -102,7 +102,7 @@ jobs:
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               git ca-certificates curl build-essential pkg-config
-            python3 -m pip install --break-system-packages cmake ninja pyyaml pytest pytest-xdist
+            python3 -m pip install --break-system-packages cmake ninja pyyaml pytest pytest-xdist pytest-rerunfailures
             git --version
           '
 
@@ -276,15 +276,41 @@ jobs:
       - name: Run tests
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_varlen_ja.py
-            python tests/multi_gpu_runner.py --save-failed failed_tests.txt
-            if [ -f failed_tests.txt ]; then
-              echo "Failed tests count: $(sort failed_tests.txt | uniq | wc -l)"
-              echo "Failed tests:"
-              sort failed_tests.txt | uniq
+            set -euxo pipefail
+
+            # Run MHA tests in parallel across GPUs and save failures
+            python tests/multi_gpu_runner.py tests/test_mha_ja.py --save-failed failed_mha.txt || true
+            if [ -s failed_mha.txt ]; then
+              echo "Failed MHA tests count: $(sort -u failed_mha.txt | wc -l)"
+              echo "Failed MHA tests:"
+              sort -u failed_mha.txt
+            else
+              echo "No MHA test failures"
             fi
+
+            # Run Varlen tests in parallel across GPUs and save failures
+            python tests/multi_gpu_runner.py tests/test_mha_varlen_ja.py --save-failed failed_varlen.txt || true
+            if [ -s failed_varlen.txt ]; then
+              echo "Failed Varlen tests count: $(sort -u failed_varlen.txt | wc -l)"
+              echo "Failed Varlen tests:"
+              sort -u failed_varlen.txt
+            else
+              echo "No Varlen test failures"
+            fi
+
+            # Combined failures for convenience
+            cat failed_mha.txt failed_varlen.txt 2>/dev/null | sort -u > failed_tests.txt || true
+            if [ -s failed_tests.txt ]; then
+              echo "Total failed tests: $(wc -l < failed_tests.txt)"
+              echo "All failed tests:"
+              cat failed_tests.txt
+            else
+              echo "No test failures across MHA and Varlen suites"
+            fi
+
+            # Optional benchmark
             python benchmarks/benchmark_mha.py
-          ' || echo "::warning::Pytest reported failures; continuing without failing the step"
+          ' || echo "::warning::Tests reported failures; continuing without failing the step"
 
       - name: Build summary
         if: always()
