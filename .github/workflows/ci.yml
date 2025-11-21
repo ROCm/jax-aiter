@@ -25,39 +25,17 @@ jobs:
       ROCM_VERSION: 7.0.2
 
     steps:
-      - name: Clean workspace permissions
-        run: |
-          set -x
-          echo "Fixing workspace permissions from previous runs..."
-          # Clean build artifacts that may have wrong permissions
-          sudo rm -rf build/aiter_build build/jax_aiter_build || true
-          sudo rm -rf .pytest_cache __pycache__ **/__pycache__ .coverage htmlcov || true
-          sudo chown -R $(id -u):$(id -g) . || true
-          echo "Workspace cleaned and permissions fixed"
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Initialize required submodules only
-        run: |
-          set -euxo pipefail
-          echo "========================================="
-          echo "Initializing Submodules (Selective)"
-          echo "========================================="
-          
-          # Clean stale submodule cache (fixes "Unable to find current revision" errors)
-          echo "0. Cleaning stale submodule cache..."
-          rm -rf .git/modules/third_party/aiter .git/modules/third_party/pytorch || true
-          git submodule deinit -f third_party/aiter third_party/pytorch || true
-          
+        run: |          
           # Initialize JAX-AITER top-level submodules
-          echo "1. Initializing jax-aiter submodules..."
           git submodule update --init third_party/pytorch third_party/aiter
           
           # Initialize PyTorch's necessary nested submodules
-          echo "2. Initializing PyTorch nested submodules..."
           cd third_party/pytorch
           git submodule update --init \
               third_party/cpuinfo \
@@ -78,11 +56,9 @@ jobs:
           cd ../..
           
           # Initialize AITER submodules
-          echo "3. Initializing AITER submodules..."
           cd third_party/aiter
           git submodule update --init 3rdparty/composable_kernel
           cd ../..
-          echo "========================================="
 
       - name: Get third_party/aiter submodule SHA
         id: aiter_sha
