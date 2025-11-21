@@ -24,11 +24,41 @@ jobs:
       ROCM_VERSION: 7.0.2
 
     steps:
-      - name: Checkout repository with submodules
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
+          
+      - name: Initialize required submodules only
+        run: |
+          set -euxo pipefail
+          # Initialize JAX-AITER top-level submodules
+          git submodule update --init third_party/pytorch third_party/aiter
+          
+          # Initialize PyTorch's necessary nested submodules
+          cd third_party/pytorch
+          git submodule update --init \
+              third_party/cpuinfo \
+              third_party/sleef \
+              third_party/protobuf \
+              third_party/onnx \
+              third_party/fmt \
+              third_party/FP16 \
+              third_party/FXdiv \
+              third_party/psimd \
+              third_party/pthreadpool \
+              third_party/pybind11 \
+              third_party/pocketfft \
+              third_party/composable_kernel \
+              third_party/nlohmann \
+              third_party/kineto \
+              third_party/flatbuffers
+          cd ../..
+          
+          # Initialize AITER submodules
+          cd third_party/aiter
+          git submodule update --init 3rdparty/composable_kernel
+          cd ../..
 
       - name: Print host info
         run: |
