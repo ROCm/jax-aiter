@@ -1,215 +1,312 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
 #include <hip/hip_runtime.h>
+#include <vector>
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/HIPGeneratorImpl.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <torch/all.h>
-
 #include "hip_utils.h"
-#include "logging.h"
-#include "torch_utils.h"
-
-// Forward declaration for aiter torch interface.
-// Returns { dq, dk, dv, softmax_d }.
-namespace aiter {
-namespace torch_itfs {
-std::vector<at::Tensor>
-fmha_v3_bwd(const at::Tensor &dout,        // [b, sq, hq, d_v]
-            const at::Tensor &q,           // [b, sq, hq, d]
-            const at::Tensor &k,           // [b, sk, hk, d]
-            const at::Tensor &v,           // [b, sk, hk, d_v]
-            const at::Tensor &out,         // [b, sq, hq, d_v]
-            const at::Tensor &softmax_lse, // [b, hq, sq]
-            float p_dropout, float softmax_scale, bool is_causal,
-            int window_size_left, int window_size_right, bool deterministic,
-            bool is_v3_atomic_fp32, int how_v3_bf16_cvt,
-            std::optional<at::Tensor> dq_, std::optional<at::Tensor> dk_,
-            std::optional<at::Tensor> dv_,
-            std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-            std::optional<const at::Tensor> rng_state_,
-            std::optional<at::Generator> gen_);
-}
-} // namespace aiter
+#include "mha_bwd.h"
+#include "mha_common_utils.cu"
+#include "mha_common_utils.h"
 
 namespace ffi = xla::ffi;
 
 namespace jax_aiter {
 
+static size_t compute_dq_acc_size(int64_t batch_size, int64_t seqlen_q,
+                                  int64_t seqlen_k, int64_t num_heads,
+                                  int64_t head_size, bool deterministic,
+                                  bool is_v3_atomic_fp32,
+                                  xla::ffi::DataType q_dtype,
+                                  std::vector<int64_t> &out_shape) {
+
+  size_t element_size = 4;
+
+  if (!deterministic) {
+    if (is_v3_atomic_fp32) {
+      out_shape = {1, batch_size, num_heads, seqlen_q, head_size};
+      element_size = 4;
+    } else {
+      int64_t seqlen_q_padded = ((seqlen_q + 15) / 16) * 16;
+      out_shape = {1, batch_size, num_heads, seqlen_q_padded, 128};
+      element_size = (q_dtype == xla::ffi::DataType::F16 ||
+                      q_dtype == xla::ffi::DataType::BF16)
+                         ? 2
+                         : 4;
+    }
+  } else {
+    const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
+    const ck_tile::index_t nsplits =
+        ck_tile::integer_divide_ceil(seqlen_k, kN0);
+    out_shape = {nsplits, batch_size, num_heads, seqlen_q, head_size};
+    element_size = 4;
+  }
+
+  size_t total_elements = 1;
+  for (auto dim : out_shape) {
+    total_elements *= dim;
+  }
+
+  return total_elements * element_size;
+}
+
 ffi::Error FmhaV3Bwd_Bridge(
-    hipStream_t stream,
-    ffi::AnyBuffer dout, // [batch, seqlen_q, nhead, hdim_v]
-    ffi::AnyBuffer q,    // [batch, seqlen_q, nhead, hdim_q]
-    ffi::AnyBuffer k,    // [batch, seqlen_kv, nhead, hdim_q]
-    ffi::AnyBuffer v,    // [batch, seqlen_kv, nhead, hdim_v]
-    ffi::AnyBuffer out,  // [batch, seqlen_q, nhead, hdim_v] (from forward pass)
-    ffi::AnyBuffer softmax_lse, // [batch, nhead, seqlen_q]
+    hipStream_t stream, ffi::AnyBuffer dout, ffi::AnyBuffer q, ffi::AnyBuffer k,
+    ffi::AnyBuffer v, ffi::AnyBuffer out, ffi::AnyBuffer softmax_lse,
     std::optional<ffi::AnyBuffer> dq_, std::optional<ffi::AnyBuffer> dk_,
     std::optional<ffi::AnyBuffer> dv_,
     std::optional<ffi::AnyBuffer> alibi_slopes_,
     std::optional<ffi::AnyBuffer> rng_state_,
-    std::optional<ffi::AnyBuffer> gen_,
-    ffi::Result<ffi::AnyBuffer> dq,        // [batch, seqlen_q, nhead, hdim_q]
-    ffi::Result<ffi::AnyBuffer> dk,        // [batch, seqlen_kv, nhead, hdim_q]
-    ffi::Result<ffi::AnyBuffer> dv,        // [batch, seqlen_kv, nhead, hdim_v]
-    ffi::Result<ffi::AnyBuffer> softmax_d, // [batch, nhead, seqlen_q]
-    float dropout_p, float softmax_scale, bool is_causal, int window_size_left,
-    int window_size_right, bool deterministic, bool is_v3_atomic_fp32,
-    int how_v3_bf16_cvt) {
-  if (!q.untyped_data() || !k.untyped_data() || !v.untyped_data()) {
+    std::optional<ffi::AnyBuffer> gen_, ffi::Result<ffi::AnyBuffer> dq,
+    ffi::Result<ffi::AnyBuffer> dk, ffi::Result<ffi::AnyBuffer> dv,
+    ffi::Result<ffi::AnyBuffer> softmax_d, float dropout_p, float softmax_scale,
+    bool is_causal, int window_size_left, int window_size_right,
+    bool deterministic, bool is_v3_atomic_fp32, int how_v3_bf16_cvt) {
+
+  if (!q.untyped_data() || !k.untyped_data() || !v.untyped_data() ||
+      !out.untyped_data() || !softmax_lse.untyped_data() ||
+      !dout.untyped_data()) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                      "Required input buffer (q/k/v) is null");
+                      "Required input buffer (q/k/v/out/lse/dout) is null");
   }
 
   const int dev_idx = ::jax_aiter::device_from_ptr(q.untyped_data());
-  if (dev_idx < 0)
+  if (dev_idx < 0) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument, "bad device from q");
-
-  // Wrap input tensors.
-  auto dout_tensor = ::jax_aiter::wrap_any_buffer(dout, dev_idx);
-  auto q_tensor = ::jax_aiter::wrap_any_buffer(q, dev_idx);
-  auto k_tensor = ::jax_aiter::wrap_any_buffer(k, dev_idx);
-  auto v_tensor = ::jax_aiter::wrap_any_buffer(v, dev_idx);
-  auto out_tensor = ::jax_aiter::wrap_any_buffer(out, dev_idx);
-  auto softmax_lse_tensor = ::jax_aiter::wrap_any_buffer(softmax_lse, dev_idx);
-
-  const c10::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(
-      device_of(q_tensor));
-
-  const c10::hip::HIPStreamMasqueradingAsCUDA ext_stream =
-      c10::hip::getStreamFromExternalMasqueradingAsCUDA(stream, dev_idx);
-  const c10::hip::HIPStreamGuardMasqueradingAsCUDA stream_guard{ext_stream};
-
-  // Handle optional parameters by checking buffer size.
-  std::optional<at::Tensor> dq_provided_opt = std::nullopt;
-  if (dq_.has_value() && dq_->size_bytes() > 0) {
-    dq_provided_opt =
-        std::make_optional(::jax_aiter::wrap_any_buffer(*dq_, dev_idx));
   }
 
-  std::optional<at::Tensor> dk_provided_opt = std::nullopt;
-  if (dk_.has_value() && dk_->size_bytes() > 0) {
-    dk_provided_opt =
-        std::make_optional(::jax_aiter::wrap_any_buffer(*dk_, dev_idx));
+  auto q_dims = q.dimensions();
+  auto k_dims = k.dimensions();
+  auto v_dims = v.dimensions();
+  auto dout_dims = dout.dimensions();
+  auto out_dims = out.dimensions();
+  auto lse_dims = softmax_lse.dimensions();
+
+  int64_t batch_size = q_dims[0];
+  int64_t seqlen_q = q_dims[1];
+  int64_t num_heads_q = q_dims[2];
+  int64_t head_size_q = q_dims[3];
+
+  int64_t seqlen_k = k_dims[1];
+  int64_t num_heads_k = k_dims[2];
+  int64_t head_size_v = v_dims[3];
+
+  if (seqlen_q == 0) {
+    if (dq->size_bytes() > 0) {
+      HIP_CHECK(
+          hipMemsetAsync(dq->untyped_data(), 0, dq->size_bytes(), stream));
+    }
+    if (dk->size_bytes() > 0) {
+      HIP_CHECK(
+          hipMemsetAsync(dk->untyped_data(), 0, dk->size_bytes(), stream));
+    }
+    if (dv->size_bytes() > 0) {
+      HIP_CHECK(
+          hipMemsetAsync(dv->untyped_data(), 0, dv->size_bytes(), stream));
+    }
+    if (softmax_d->size_bytes() > 0) {
+      HIP_CHECK(hipMemsetAsync(softmax_d->untyped_data(), 0,
+                               softmax_d->size_bytes(), stream));
+    }
+    return ffi::Error::Success();
   }
 
-  std::optional<at::Tensor> dv_provided_opt = std::nullopt;
-  if (dv_.has_value() && dv_->size_bytes() > 0) {
-    dv_provided_opt =
-        std::make_optional(::jax_aiter::wrap_any_buffer(*dv_, dev_idx));
-  }
-
-  std::optional<const at::Tensor> alibi_slopes_opt =
-      (alibi_slopes_.has_value() && alibi_slopes_->size_bytes() > 0)
-          ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(*alibi_slopes_, dev_idx))
-          : std::nullopt;
-
-  std::optional<const at::Tensor> rng_state_opt =
-      (rng_state_.has_value() && rng_state_->size_bytes() > 0)
-          ? std::make_optional<const at::Tensor>(
-                ::jax_aiter::wrap_any_buffer(*rng_state_, dev_idx))
-          : std::nullopt;
-
-  std::optional<at::Generator> gen_opt = std::nullopt;
-  // Handle generator parameter - extract from JAX buffer if provided.
-  if (gen_.has_value() &&
-      gen_->size_bytes() >= static_cast<size_t>(2 * sizeof(int64_t))) {
-    // Extract seed and offset from JAX buffer.
-    const auto *gen_data = static_cast<const int64_t *>(gen_->untyped_data());
-    const uint64_t seed = static_cast<uint64_t>(gen_data[0]);
-    const uint64_t offset = static_cast<uint64_t>(gen_data[1]);
-
-    // Create PyTorch generator with the provided seed.
-    auto gen_torch = at::make_generator<at::CUDAGeneratorImpl>(dev_idx);
-    auto *impl = gen_torch.get<at::CUDAGeneratorImpl>();
-    impl->set_current_seed(seed);
-    impl->set_offset(offset);
-    gen_opt = gen_torch;
-    JA_LOG("Using generator with seed: %llu, offset: %llu", seed, offset);
-  }
-
-  std::vector<at::Tensor> results;
   try {
-    results = aiter::torch_itfs::fmha_v3_bwd(
-        dout_tensor,        // dout: [b, sq, hq, d_v]
-        q_tensor,           // q: [b, sq, hq, d]
-        k_tensor,           // k: [b, sk, hk, d]
-        v_tensor,           // v: [b, sk, hk, d_v]
-        out_tensor,         // out: [b, sq, hq, d_v]
-        softmax_lse_tensor, // softmax_lse: [b, hq, sq]
-        dropout_p,          // p_dropout
-        softmax_scale,      // softmax_scale
-        is_causal,          // is_causal
-        window_size_left,   // window_size_left
-        window_size_right,  // window_size_right
-        deterministic,      // deterministic
-        is_v3_atomic_fp32,  // is_v3_atomic_fp32
-        how_v3_bf16_cvt,    // how_v3_bf16_cvt
-        dq_provided_opt,    // dq_ (optional pre-allocated)
-        dk_provided_opt,    // dk_ (optional pre-allocated)
-        dv_provided_opt,    // dv_ (optional pre-allocated)
-        alibi_slopes_opt,   // alibi_slopes_ (optional)
-        rng_state_opt,      // rng_state_ (optional)
-        gen_opt             // gen_ (optional generator)
-    );
-  } catch (const c10::Error &e) {
-    return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("fmha_v3_fwd PyTorch error: ") +
-                          e.what_without_backtrace());
+    mha_utils::validate_mha_bwd_inputs(dout, q, k, v, out, softmax_lse,
+                                       head_size_q, head_size_v, num_heads_q,
+                                       num_heads_k);
   } catch (const std::exception &e) {
-    const char *what_msg = e.what();
-    std::fprintf(stderr,
-                 "[FMHA_FWD] Exception caught - type: %s, message: %s\n",
-                 typeid(e).name(), what_msg ? what_msg : "null");
-    std::fflush(stderr);
-    return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("fmha_v3_fwd: ") +
-                          (what_msg ? what_msg : "unknown error"));
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, e.what());
   }
 
-  if (results.size() < 4) {
-    return ffi::Error(ffi::ErrorCode::kInternal,
-                      "Kernel returned insufficient results");
+  if (num_heads_q != num_heads_k) {
+    return ffi::Error(ffi::ErrorCode::kUnimplemented,
+                      "MQA/GQA not yet supported in v3 backward path");
   }
 
-  // Copy results back to JAX output buffers.
-  // Results: {dq, dk, dv, softmax_d}.
+  std::string dtype_str = mha_utils::dtype_to_string(q.element_type());
+
+  auto mask = mha_utils::create_mask_info(
+      is_causal, window_size_left, window_size_right, seqlen_q, seqlen_k);
+
+  const void *alibi_ptr = nullptr;
+  ck_tile::index_t stride_alibi = 0;
+
+  if (alibi_slopes_.has_value() && mha_utils::is_valid_buffer(*alibi_slopes_)) {
+    alibi_ptr = alibi_slopes_->untyped_data();
+    auto alibi_dims = alibi_slopes_->dimensions();
+    stride_alibi =
+        alibi_dims.size() >= 2 ? mha_utils::calculate_stride(alibi_dims, 0) : 0;
+  }
+
+  bias_enum bias_type =
+      (alibi_ptr != nullptr) ? bias_enum::alibi : bias_enum::no_bias;
+
+  uint64_t *seed_ptr = nullptr;
+  uint64_t *offset_ptr = nullptr;
+
   try {
-    // Wrap JAX output buffers as PyTorch tensors.
-    auto dq_tensor = ::jax_aiter::wrap_any_buffer(*dq, dev_idx);
-
-    dq_tensor.copy_(results[0], /*non_blocking=*/true);
-
-    // Copy gradient tensors to output buffers.
-    if (results[1].numel() > 0) {
-      auto dk_tensor = ::jax_aiter::wrap_any_buffer(*dk, dev_idx);
-      dk_tensor.copy_(results[1], /*non_blocking=*/true);
-    }
-
-    if (results[2].numel() > 0) {
-      auto dv_tensor = ::jax_aiter::wrap_any_buffer(*dv, dev_idx);
-      dv_tensor.copy_(results[2], /*non_blocking=*/true);
-    }
-
-    if (results[3].numel() > 0) {
-      auto softmax_d_tensor = ::jax_aiter::wrap_any_buffer(*softmax_d, dev_idx);
-      softmax_d_tensor.copy_(results[3], /*non_blocking=*/true);
-    }
-  } catch (const c10::Error &e) {
-    return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("Output copy PyTorch error: ") +
-                          e.what_without_backtrace());
+    auto [seed, offset] =
+        mha_utils::get_rng_seed_offset_ptrs(rng_state_, dropout_p);
+    seed_ptr = seed;
+    offset_ptr = offset;
   } catch (const std::exception &e) {
-    const char *what_msg = e.what();
-    return ffi::Error(ffi::ErrorCode::kInternal,
-                      std::string("Output copy failed: ") +
-                          (what_msg ? what_msg : "unknown error"));
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, e.what());
   }
+
+  std::vector<int64_t> dq_acc_shape;
+  size_t dq_acc_bytes = compute_dq_acc_size(
+      batch_size, seqlen_q, seqlen_k, num_heads_q, head_size_v, deterministic,
+      is_v3_atomic_fp32, q.element_type(), dq_acc_shape);
+
+  void *dq_acc_ptr = nullptr;
+  HIP_CHECK(hipMalloc(&dq_acc_ptr, dq_acc_bytes));
+  HIP_CHECK(hipMemsetAsync(dq_acc_ptr, 0, dq_acc_bytes, stream));
+
+  ck_tile::index_t split_stride_dq_acc = 1;
+  ck_tile::index_t batch_stride_dq_acc = 1;
+  ck_tile::index_t nhead_stride_dq_acc = 1;
+  ck_tile::index_t stride_dq_acc = 1;
+
+  if (dq_acc_shape.size() == 5) {
+    std::vector<ck_tile::index_t> strides(5);
+    strides[4] = 1;
+    for (int i = 3; i >= 0; i--) {
+      strides[i] = strides[i + 1] * dq_acc_shape[i + 1];
+    }
+
+    split_stride_dq_acc = strides[0];
+    batch_stride_dq_acc = strides[1];
+    nhead_stride_dq_acc = strides[2];
+    stride_dq_acc = strides[3];
+  }
+
+  ck_tile::index_t stride_q = mha_utils::calculate_stride(q_dims, 1);
+  ck_tile::index_t stride_k = mha_utils::calculate_stride(k_dims, 1);
+  ck_tile::index_t stride_v = mha_utils::calculate_stride(v_dims, 1);
+  ck_tile::index_t stride_o = mha_utils::calculate_stride(out_dims, 1);
+  ck_tile::index_t stride_do = mha_utils::calculate_stride(dout_dims, 1);
+
+  auto dq_dims = dq->dimensions();
+  auto dk_dims = dk->dimensions();
+  auto dv_dims = dv->dimensions();
+
+  ck_tile::index_t stride_dq = mha_utils::calculate_stride(dq_dims, 1);
+  ck_tile::index_t stride_dk = mha_utils::calculate_stride(dk_dims, 1);
+  ck_tile::index_t stride_dv = mha_utils::calculate_stride(dv_dims, 1);
+
+  ck_tile::index_t nhead_stride_q = mha_utils::calculate_stride(q_dims, 2);
+  ck_tile::index_t nhead_stride_k = mha_utils::calculate_stride(k_dims, 2);
+  ck_tile::index_t nhead_stride_v = mha_utils::calculate_stride(v_dims, 2);
+  ck_tile::index_t nhead_stride_o = mha_utils::calculate_stride(out_dims, 2);
+  ck_tile::index_t nhead_stride_do = mha_utils::calculate_stride(dout_dims, 2);
+  ck_tile::index_t nhead_stride_lse = mha_utils::calculate_stride(lse_dims, 1);
+  ck_tile::index_t nhead_stride_dq = mha_utils::calculate_stride(dq_dims, 2);
+  ck_tile::index_t nhead_stride_dk = mha_utils::calculate_stride(dk_dims, 2);
+  ck_tile::index_t nhead_stride_dv = mha_utils::calculate_stride(dv_dims, 2);
+
+  ck_tile::index_t batch_stride_q = mha_utils::calculate_stride(q_dims, 0);
+  ck_tile::index_t batch_stride_k = mha_utils::calculate_stride(k_dims, 0);
+  ck_tile::index_t batch_stride_v = mha_utils::calculate_stride(v_dims, 0);
+  ck_tile::index_t batch_stride_o = mha_utils::calculate_stride(out_dims, 0);
+  ck_tile::index_t batch_stride_do = mha_utils::calculate_stride(dout_dims, 0);
+  ck_tile::index_t batch_stride_lse = mha_utils::calculate_stride(lse_dims, 0);
+  ck_tile::index_t batch_stride_dq = mha_utils::calculate_stride(dq_dims, 0);
+  ck_tile::index_t batch_stride_dk = mha_utils::calculate_stride(dk_dims, 0);
+  ck_tile::index_t batch_stride_dv = mha_utils::calculate_stride(dv_dims, 0);
+
+  float p_undrop = mha_utils::calculate_p_undrop(dropout_p);
+
+  auto args = fmha_bwd_args{q.untyped_data(),
+                            k.untyped_data(),
+                            v.untyped_data(),
+                            alibi_ptr,
+                            out.untyped_data(),
+                            softmax_lse.untyped_data(),
+                            dout.untyped_data(),
+                            softmax_d->untyped_data(),
+                            nullptr,
+                            dq->untyped_data(),
+                            dk->untyped_data(),
+                            dv->untyped_data(),
+                            nullptr,
+                            dq_acc_ptr,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            static_cast<ck_tile::index_t>(seqlen_q),
+                            static_cast<ck_tile::index_t>(seqlen_k),
+                            static_cast<ck_tile::index_t>(batch_size),
+                            static_cast<ck_tile::index_t>(seqlen_q),
+                            static_cast<ck_tile::index_t>(seqlen_k),
+                            static_cast<ck_tile::index_t>(head_size_q),
+                            static_cast<ck_tile::index_t>(head_size_v),
+                            static_cast<ck_tile::index_t>(num_heads_q),
+                            static_cast<ck_tile::index_t>(num_heads_k),
+                            softmax_scale,
+                            stride_q,
+                            stride_k,
+                            stride_v,
+                            stride_alibi,
+                            stride_o,
+                            0,
+                            stride_do,
+                            stride_dq_acc,
+                            stride_dq,
+                            stride_dk,
+                            stride_dv,
+                            0,
+                            nhead_stride_q,
+                            nhead_stride_k,
+                            nhead_stride_v,
+                            0,
+                            nhead_stride_o,
+                            0,
+                            nhead_stride_do,
+                            nhead_stride_lse,
+                            nhead_stride_dq_acc,
+                            nhead_stride_dq,
+                            nhead_stride_dk,
+                            nhead_stride_dv,
+                            0,
+                            batch_stride_q,
+                            batch_stride_k,
+                            batch_stride_v,
+                            0,
+                            batch_stride_o,
+                            0,
+                            batch_stride_do,
+                            batch_stride_lse,
+                            batch_stride_dq_acc,
+                            batch_stride_dq,
+                            batch_stride_dk,
+                            batch_stride_dv,
+                            0,
+                            split_stride_dq_acc,
+                            mask.left,
+                            mask.right,
+                            static_cast<ck_tile::index_t>(mask.type),
+                            dropout_p,
+                            p_undrop,
+                            std::make_pair(seed_ptr, offset_ptr)};
+
+  auto stream_config = mha_utils::create_stream_config(stream);
+
+  float runtime = aiter::mha_bwd(
+      args, stream_config, dtype_str, false, mask.type, bias_type, false, false,
+      deterministic, true, is_v3_atomic_fp32, how_v3_bf16_cvt);
+
+  hipFree(dq_acc_ptr);
+
+  if (runtime < 0) {
+    return ffi::Error(ffi::ErrorCode::kInternal,
+                      "aiter::mha_bwd failed - invalid arguments or "
+                      "unsupported configuration");
+  }
+
   return ffi::Error::Success();
 }
 
@@ -217,34 +314,33 @@ ffi::Error FmhaV3Bwd_Bridge(
 
 #pragma GCC visibility push(default)
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    FmhaV3BwdJA, jax_aiter::FmhaV3Bwd_Bridge,
-    ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<hipStream_t>>()
-        .Arg<ffi::AnyBuffer>() // dout: [batch, seqlen_q, nhead, hdim_v]
-        .Arg<ffi::AnyBuffer>() // q: [batch, seqlen_q, nhead, hdim_q]
-        .Arg<ffi::AnyBuffer>() // k: [batch, seqlen_kv, nhead, hdim_q]
-        .Arg<ffi::AnyBuffer>() // v: [batch, seqlen_kv, nhead, hdim_v]
-        .Arg<ffi::AnyBuffer>() // o: [batch, seqlen_q, nhead, hdim_v]
-        .Arg<ffi::AnyBuffer>() // lse: [batch, nhead, seqlen_q]
-        .Arg<ffi::AnyBuffer>() // dq_provided (optional)
-        .Arg<ffi::AnyBuffer>() // dk_provided (optional)
-        .Arg<ffi::AnyBuffer>() // dv_provided (optional)
-        .Arg<ffi::AnyBuffer>() // alibi_slopes (optional)
-        .Arg<ffi::AnyBuffer>() // rng_state_provided (optional)
-        .Arg<ffi::AnyBuffer>() // gen (optional)
-        .Ret<ffi::AnyBuffer>() // dq: [batch, seqlen_q, nhead, hdim_q]
-        .Ret<ffi::AnyBuffer>() // dk: [batch, seqlen_kv, nhead, hdim_q]
-        .Ret<ffi::AnyBuffer>() // dv: [batch, seqlen_kv, nhead, hdim_v]
-        .Ret<ffi::AnyBuffer>() // softmax_d: [batch, nhead, seqlen_q]
-        .Attr<float>("dropout_p")
-        .Attr<float>("softmax_scale")
-        .Attr<bool>("is_causal")
-        .Attr<int>("window_size_left")
-        .Attr<int>("window_size_right")
-        .Attr<bool>("deterministic")
-        .Attr<bool>("is_v3_atomic_fp32")
-        .Attr<int>("how_v3_bf16_cvt"),
-    {xla::ffi::Traits::kCmdBufferCompatible});
+XLA_FFI_DEFINE_HANDLER_SYMBOL(FmhaV3BwdJA, jax_aiter::FmhaV3Bwd_Bridge,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<hipStream_t>>()
+                                  .Arg<ffi::AnyBuffer>() // dout
+                                  .Arg<ffi::AnyBuffer>() // q
+                                  .Arg<ffi::AnyBuffer>() // k
+                                  .Arg<ffi::AnyBuffer>() // v
+                                  .Arg<ffi::AnyBuffer>() // o
+                                  .Arg<ffi::AnyBuffer>() // lse
+                                  .Arg<ffi::AnyBuffer>() // dq_provided
+                                  .Arg<ffi::AnyBuffer>() // dk_provided
+                                  .Arg<ffi::AnyBuffer>() // dv_provided
+                                  .Arg<ffi::AnyBuffer>() // alibi_slopes
+                                  .Arg<ffi::AnyBuffer>() // rng_state_provided
+                                  .Arg<ffi::AnyBuffer>() // gen
+                                  .Ret<ffi::AnyBuffer>() // dq
+                                  .Ret<ffi::AnyBuffer>() // dk
+                                  .Ret<ffi::AnyBuffer>() // dv
+                                  .Ret<ffi::AnyBuffer>() // softmax_d
+                                  .Attr<float>("dropout_p")
+                                  .Attr<float>("softmax_scale")
+                                  .Attr<bool>("is_causal")
+                                  .Attr<int>("window_size_left")
+                                  .Attr<int>("window_size_right")
+                                  .Attr<bool>("deterministic")
+                                  .Attr<bool>("is_v3_atomic_fp32")
+                                  .Attr<int>("how_v3_bf16_cvt"),
+                              {xla::ffi::Traits::kCmdBufferCompatible});
 
 #pragma GCC visibility pop
