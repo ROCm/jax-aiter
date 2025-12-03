@@ -81,7 +81,7 @@ def load_umbrella_library():
 
 
 def load_thin_modules():
-    """Load thin modules in main namespace from AITER and JA build directories."""
+    """Load thin modules from aiter_build and jax_aiter_build directories."""
     global _module_handles
 
     if not _umbrella_handle:
@@ -91,23 +91,32 @@ def load_thin_modules():
     aiter_dir = build_root / "aiter_build"
     ja_dir = build_root / "jax_aiter_build"
 
-    def _load_dir(dir_path, tag):
-        """Load all .so files from a directory."""
+    def _load_modules(dir_path):
+        loaded = []
         if not dir_path.exists():
-            logger.info(f"{tag} directory not found: {dir_path}")
-            return
+            return loaded
+
         for module_so in sorted(dir_path.glob("*.so")):
+            if module_so.name == "libjax_aiter.so":
+                continue
             try:
-                if module_so.name == "libjax_aiter.so":
-                    continue
                 module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
                 _module_handles[module_so.name] = module_handle
+                loaded.append(module_so.name)
+                logger.debug(f"Loaded {module_so.name}")
             except Exception as e:
-                logger.warning(f"Could not load {module_so}: {e}")
+                logger.error(f"Failed to load {module_so.name}: {e}")
+        return loaded
 
-    # Load AITER modules first, then JA modules
-    _load_dir(aiter_dir, "aiter")
-    _load_dir(ja_dir, "ja")
+    # Load aiter_build modules first (libmha_bwd.so, etc)
+    aiter_loaded = _load_modules(aiter_dir)
+    if aiter_loaded:
+        logger.info(f"Loaded aiter_build modules: {aiter_loaded}")
+
+    # Then load jax_aiter_build modules
+    ja_loaded = _load_modules(ja_dir)
+    if ja_loaded:
+        logger.info(f"Loaded jax_aiter_build modules: {ja_loaded}")
 
 
 def resolve_symbol(target_name: str) -> int:

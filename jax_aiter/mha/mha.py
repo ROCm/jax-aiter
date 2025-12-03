@@ -64,7 +64,7 @@ def _static_int(x) -> np.int32:
 def _normalize_window_size(
     window_size_left: int, window_size_right: int, seqlen_k: int
 ):
-    """Normalize window sizes: set to -1 if >= sequence length."""
+    """Normalize window sizes to -1 if >= sequence length."""
     wl = -1 if window_size_left >= seqlen_k else window_size_left
     wr = -1 if window_size_right >= seqlen_k else window_size_right
     return wl, wr
@@ -91,7 +91,7 @@ def _can_impl_fmha_v3_fwd(
     return_lse,
 ):
     """Check if FMHA v3 forward kernel can be used."""
-    # Check for sliding window attention.
+    # Check sliding window attention support.
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     ret = alibi_slopes is None
@@ -129,23 +129,23 @@ def can_impl_fmha_v3_bwd(
     This function determines kernel compatibility based on tensor shapes, strides,
     and hardware constraints. It mirrors the logic from the PyTorch/Aiter implementation.
     """
-    # Extract shapes.
+    # Extract tensor shapes.
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
 
-    # Create placeholder tensors for stride checking if not provided.
+    # Create placeholder tensors for stride checking.
     if dk is None:
         dk = jnp.empty_like(k)
     if dv is None:
         dv = jnp.empty_like(v)
 
-    # Calculate strides (JAX arrays have byte strides, convert to element strides)
+    # Calculate strides converting from bytes to elements (JAX arrays have byte strides).
     # For JAX arrays: element_stride = byte_stride / itemsize.
     def _get_strides(arr):
         """Get element strides from JAX array."""
         byte_strides = arr.strides if hasattr(arr, "strides") else None
         if byte_strides is None:
-            # Compute strides for a C-contiguous array.
+            # Compute strides for C-contiguous layout.
             itemsize = arr.dtype.itemsize
             shape = arr.shape
             strides = []
@@ -193,7 +193,7 @@ def can_impl_fmha_v3_bwd(
     swa = (window_size_left > 0) or (window_size_right > 0)  # sliding window attention
 
     def np():
-        """Check non-padded cases with specific stride requirements."""
+        """Check non-padded stride requirements."""
         npssk = seqlen_q == seqlen_k
         npssk &= seqlen_k % 64 == 0
         npssk &= stride_q == stride_do
@@ -215,21 +215,19 @@ def can_impl_fmha_v3_bwd(
         return ret
 
     def pssk():
-        """Check for specific head dimensions with atomic fp32 operations."""
+        """Check head dimensions for atomic fp32."""
         gfx = get_gfx()
-        # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed.
+        # Ensure nhead_stride_dq_acc >= stride_dq_acc.
         ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (
             hdim_q == 128 and gfx == "gfx950"
         )
-        ret &= nmask or (
-            mask and seqlen_q == seqlen_k
-        )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= nmask or (mask and seqlen_q == seqlen_k)
         ret &= not swa
 
         return ret
 
     def pddv():
-        """Check for padded dimensions between 64 and 128."""
+        """Check padded dimensions in range [64, 128)."""
         ret = is_v3_atomic_fp32 == False
         ret &= hdim_q > 64 and hdim_q < 128
         ret &= seqlen_q == seqlen_k
@@ -249,18 +247,18 @@ def can_impl_fmha_v3_bwd(
         return ret
 
     def psskddv():
-        """Check for padded cases with sliding window attention support."""
+        """Check padded cases with SWA support."""
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q > 64 and hdim_q <= 192
         ret &= (
             nmask
             or (mask and seqlen_q == seqlen_k)
             or (swa and hdim_q > 64 and hdim_q <= 128)
-        )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        )
 
         return ret
 
-    # Basic constraints
+    # Basic kernel constraints.
     ret = alibi_slopes is None
     ret &= bias is None
     ret &= dropout_p == 0.0
@@ -287,10 +285,7 @@ def can_impl_fmha_v3_bwd_gfx950(
     dbias: Optional[jnp.ndarray],
     deterministic: bool,
 ) -> bool:
-    """Check if FMHA v3 backward kernel can be used on gfx950.
-
-    This provides additional optimization path for gfx950 hardware.
-    """
+    """Check if FMHA v3 backward kernel can be used on gfx950."""
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
 
@@ -299,7 +294,7 @@ def can_impl_fmha_v3_bwd_gfx950(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     swa = (window_size_left > 0) or (window_size_right > 0)
 
-    # Only 1 block when sk <= 256, thus deterministic
+    # Single block for sk <= 256 is deterministic.
     is_950_1block = (
         get_gfx() == "gfx950"
         and seqlen_k <= 256
@@ -702,7 +697,7 @@ def mha_fwd(
         return_dropout_randval=return_dropout_randval,
     )
 
-    # Convert tuple to list for consistency.
+    # Convert to list for consistency.
     return list(results)
 
 
@@ -729,7 +724,7 @@ def fmha_v3_fwd(
     _, seqlen_k, num_heads_v, head_size_v = v.shape
     _, seqlen_k, num_heads_k, _ = k.shape
 
-    # Handle optional tensors
+    # Handle optional tensors.
     if out is None:
         out = _empty_tensor(q.dtype)
     if bias is None:
@@ -739,7 +734,7 @@ def fmha_v3_fwd(
     if gen is None:
         gen = _empty_tensor(jnp.int64)
 
-    # Output shapes - always allocate full tensors to avoid null buffer issues.
+    # Output shapes.
     out_shape = (batch_size, seqlen_q, num_heads_q, head_size_v)
     softmax_lse_shape = (batch_size, num_heads_q, seqlen_q)
     p_shape = (batch_size, num_heads_q, seqlen_q, seqlen_k)
@@ -818,19 +813,23 @@ def mha_bwd(
     if gen is None:
         gen = _empty_tensor(jnp.int64)
 
-    # Output shapes.
+    has_bias = bias is not None and bias.size > 0
+
+    # C++ returns dbias_expanded [b,sq,h,sk] which we reduce to [sq,sk] below.
     dq_shape = (batch_size, seqlen_q, num_heads, head_size_q)
     dk_shape = (batch_size, seqlen_k, num_heads_k, head_size_q)
     dv_shape = (batch_size, seqlen_k, num_heads_k, head_size_v)
     softmax_d_shape = (batch_size, num_heads, seqlen_q)
-    dbias_shape = bias.shape if bias is not None else (0,)
+    dbias_expanded_shape = (
+        (batch_size, seqlen_q, num_heads, seqlen_k) if has_bias else (0,)
+    )
 
     fn = _cached_mha_bwd_call(
         dq_shape,
         dk_shape,
         dv_shape,
         softmax_d_shape,
-        dbias_shape,
+        dbias_expanded_shape,
         q.dtype,
     )
 
@@ -856,7 +855,15 @@ def mha_bwd(
         deterministic=deterministic,
     )
 
-    return results
+    dq_out, dk_out, dv_out, softmax_d_out, dbias_expanded = results
+
+    # Reduce dbias_expanded: sum over batch and heads to get final [sq,sk] shape.
+    if has_bias and dbias_expanded.size > 0:
+        dbias_out = jnp.sum(dbias_expanded, axis=(0, 2))
+    else:
+        dbias_out = dbias_expanded
+
+    return [dq_out, dk_out, dv_out, softmax_d_out, dbias_out]
 
 
 def fmha_v3_bwd(
@@ -967,10 +974,10 @@ def _flash_attn_forward(
         window_size_left, window_size_right, seqlen_k
     )
 
-    # If cu_seqlens are provided, we must use MHA kernel (not v3).
+    # Use MHA kernel when cu_seqlens provided.
     has_padding = cu_seqlens_q is not None and cu_seqlens_kv is not None
 
-    # Select optimal kernel based on input constraints.
+    # Select optimal kernel.
     can_use_v3 = (
         False
         if has_padding
@@ -993,8 +1000,7 @@ def _flash_attn_forward(
         )
     )
 
-    # Prefer CK kernel for decode cases (short sequences).
-    # Never use v3 when padding is involved.
+    # Prefer CK kernel for decode cases.
     if can_use_v3 and seqlen_q > 128 and not has_padding:
         result = fmha_v3_fwd(
             q,
@@ -1076,7 +1082,7 @@ def _flash_attn_backward(
         is_v3_atomic_fp32,
     )
 
-    # Add gfx950 specific path.
+    # Check gfx950 path.
     can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950(
         dout,
         q,
@@ -1092,7 +1098,7 @@ def _flash_attn_backward(
         deterministic,
     )
 
-    # Prefer FMHA v3 bwd when eligible and seqlen_q > 16 (AITer behavior).
+    # Use v3 backward for seqlen_q > 16.
     seqlen_q = int(q.shape[1])
     if can_impl_fmha_v3_bwd_ and seqlen_q > 16:
         log.info("Using FMHA v3 backward kernel")
@@ -1114,7 +1120,7 @@ def _flash_attn_backward(
             None,  # dq
             None,  # dk
             None,  # dv
-            None,  # dbias - v3 doesn't support it
+            None,  # dbias - v3 doesn't support
             bias,
             alibi_slopes,
             rng_state,
@@ -1139,7 +1145,7 @@ def _flash_attn_backward(
             None,  # dq
             None,  # dk
             None,  # dv
-            None,  # dbias - ck supports it
+            None,  # dbias
             bias,
             alibi_slopes,
             rng_state,
@@ -1231,12 +1237,11 @@ def flash_attn_func(
         pad_v = 8 - head_size_v_og % 8
         v_padded = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad_v)))
 
-    # Normalize window sizes once here using concrete values.
-    # This ensures consistent behavior between forward and backward passes.
+    # Normalize window sizes for consistency.
     seqlen_k = k_padded.shape[1]
     wl_norm, wr_norm = _normalize_window_size(window_size[0], window_size[1], seqlen_k)
 
-    # Call forward kernel with normalized window sizes and cu_seqlens for consistent behavior.
+    # Call forward kernel.
     out_padded, softmax_lse, S_dmask, _ = _flash_attn_forward(
         q_padded,
         k_padded,
@@ -1254,7 +1259,7 @@ def flash_attn_func(
         cu_seqlens_kv=cu_seqlens_kv,
     )
 
-    # Unpad output to original dimensions.
+    # Unpad output.
     out = out_padded[..., :head_size_v_og]
 
     result = [out]
@@ -1330,7 +1335,7 @@ def _flash_attn_func_fwd(
 
     result = tuple(result)
 
-    # Residuals needed for backward pass.
+    # Store residuals for backward pass.
     residuals = (
         q_padded,
         k_padded,
@@ -1387,20 +1392,20 @@ def _flash_attn_func_bwd(
         head_size_v_og,
     ) = residuals
 
-    # Handle different output formats - extract gradient w.r.t. main output.
+    # Extract gradient for main output.
     if isinstance(grad_outputs, tuple):
         dout = grad_outputs[0]
     else:
         dout = grad_outputs
 
-    # Pad gradient to match padded dimensions.
+    # Pad gradient to match dimensions.
     if dout.shape[-1] != out_padded.shape[-1]:
         pad_v = out_padded.shape[-1] - dout.shape[-1]
         dout_padded = jnp.pad(dout, ((0, 0), (0, 0), (0, 0), (0, pad_v)))
     else:
         dout_padded = dout
 
-    # Call unified backward function that handles kernel dispatch.
+    # Call backward with kernel dispatch.
     dq_padded, dk_padded, dv_padded, softmax_d, dbias_grad = _flash_attn_backward(
         dout_padded,
         q_padded,
@@ -1421,14 +1426,12 @@ def _flash_attn_func_bwd(
         1,  # how_v3_bf16_cvt
     )
 
-    # Unpad gradients to match original input dimensions.
-    # Both Q and K have the same head dimension (head_size_q_og).
-    # V has its own dimension (head_size_v_og).
+    # Unpad gradients to original dimensions.
     dq = dq_padded[..., :head_size_q_og]
     dk = dk_padded[..., :head_size_q_og]
     dv = dv_padded[..., :head_size_v_og]
 
-    # Return gradients for differentiable inputs only: q, k, v, softmax_scale, bias, alibi_slopes.
+    # Return gradients for differentiable inputs.
     return (
         dq,  # q (index 0)
         dk,  # k (index 1)

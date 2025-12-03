@@ -63,7 +63,7 @@ def _static_int(x) -> int:
 def _normalize_window_size(
     window_size_left: int, window_size_right: int, max_seqlen_k: int
 ):
-    """Normalize window sizes: set to -1 if >= max sequence length."""
+    """Normalize window sizes to -1 if >= max sequence length."""
     wl = -1 if window_size_left >= max_seqlen_k else window_size_left
     wr = -1 if window_size_right >= max_seqlen_k else window_size_right
     return wl, wr
@@ -500,7 +500,7 @@ def mha_varlen_fwd(
         softmax_lse_shape,
         p_shape,
         rng_state_shape,
-        v.dtype,  # Use v.dtype for output
+        v.dtype,  # Use v.dtype for output.
     )
 
     results = fn(
@@ -588,7 +588,7 @@ def fmha_v3_varlen_fwd(
         softmax_lse_shape,
         p_shape,
         rng_state_shape,
-        v.dtype,  # Use v.dtype for output
+        v.dtype,  # Use v.dtype for output.
     )
 
     results = fn(
@@ -653,7 +653,7 @@ def mha_varlen_bwd(
     head_size_v = v.shape[-1]
     batch_size = cu_seqlens_q.shape[0] - 1
 
-    # Handle optional tensors
+    # Handle optional tensors.
     if dq is None:
         dq = _empty_tensor(q.dtype)
     if dk is None:
@@ -667,7 +667,7 @@ def mha_varlen_bwd(
     if gen is None:
         gen = _empty_tensor(jnp.int64)
 
-    # Output shapes
+    # Output shapes.
     dq_shape = (total_q, num_heads, head_size_q)
     dk_shape = (total_k, num_heads_k, head_size_q)
     dv_shape = (total_k, num_heads_k, head_size_v)
@@ -836,10 +836,10 @@ def _flash_attn_varlen_forward(
     nhead_k = v.shape[-2]
     hdim_v = v.shape[-1]
 
-    mask = causal == True and window_size_left == -1  # causal mask
+    mask = causal == True and window_size_left == -1  # causal mask.
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
-    )  # no mask
+    )  # no mask.
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def can_impl_fmha_v3_fwd():
@@ -851,7 +851,7 @@ def _flash_attn_varlen_forward(
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
-        # V3 kernel doesn't support physical sequence padding
+        # V3 doesn't support padded sequences.
         ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
         return ret
 
@@ -918,7 +918,7 @@ def _flash_attn_varlen_backward(
     k: jnp.ndarray,
     v: jnp.ndarray,
     out: jnp.ndarray,
-    softmax_lse_3d: jnp.ndarray,  # [batch, nheads, max_seqlen_q] from forward (3D format)
+    softmax_lse_3d: jnp.ndarray,  # [batch, nheads, max_seqlen_q] from forward
     cu_seqlens_q: jnp.ndarray,
     cu_seqlens_k: jnp.ndarray,
     max_seqlen_q: int,
@@ -968,7 +968,7 @@ def _flash_attn_varlen_backward(
         ret &= not swa
         return ret
 
-    # LSE is already in 3D format from forward, no conversion needed
+    # LSE is in 3D format from forward.
     can_use_v3_bwd = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
 
     if can_use_v3_bwd:
@@ -1163,10 +1163,10 @@ def flash_attn_varlen(
         alibi_slopes=alibi_slopes,
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
-        how_v3_bf16_cvt=1,  # Default value, matching AITER
+        how_v3_bf16_cvt=1,  # Default value.
         block_table=block_table,
         out=out,
-        zero_tensors=False,  # Keep internal, use default value
+        zero_tensors=False,  # Default value.
         cu_seqlens_q_padded=cu_seqlens_q_padded,
         cu_seqlens_k_padded=cu_seqlens_k_padded,
     )
@@ -1174,7 +1174,7 @@ def flash_attn_varlen(
     # Unpad output to original dimensions.
     out = out_padded[..., :head_size_v_og]
 
-    # Always return a fixed triple; let caller ignore Nones.
+    # Return fixed triple.
     lse_ret = softmax_lse_3d if return_lse else None
     s_ret = S_dmask if (return_attn_probs and dropout_p > 0) else None
     return (out, lse_ret, s_ret)
@@ -1211,7 +1211,7 @@ def _flash_attn_varlen_fwd(
     head_size_q_og = q.shape[2]
     head_size_v_og = v.shape[2]
 
-    # Pad head dimensions to multiples of 8
+    # Pad head dimensions to multiples of 8.
     q_padded, k_padded, v_padded = q, k, v
     if head_size_q_og % 8 != 0:
         pad_q = 8 - head_size_q_og % 8
@@ -1221,12 +1221,10 @@ def _flash_attn_varlen_fwd(
         pad_v = 8 - head_size_v_og % 8
         v_padded = jnp.pad(v, ((0, 0), (0, 0), (0, pad_v)))
 
-    # Parent-level normalization consistent with mha.py
     wl_norm, wr_norm = _normalize_window_size(
         window_size[0], window_size[1], max_seqlen_k
     )
 
-    # Pass normalized concrete values to forward
     out_padded, softmax_lse_3d, S_dmask, rng_state = _flash_attn_varlen_forward(
         q_padded,
         k_padded,
@@ -1246,10 +1244,10 @@ def _flash_attn_varlen_fwd(
         alibi_slopes=alibi_slopes,
         return_lse=True,  # Always return for backward
         return_softmax=return_attn_probs and dropout_p > 0,
-        how_v3_bf16_cvt=1,  # Default value, matching public API
+        how_v3_bf16_cvt=1,  # Default value
         block_table=block_table,
         out=out,
-        zero_tensors=False,  # Default value, matching public API
+        zero_tensors=False,  # Default value
         cu_seqlens_q_padded=cu_seqlens_q_padded,
         cu_seqlens_k_padded=cu_seqlens_k_padded,
     )
@@ -1260,7 +1258,7 @@ def _flash_attn_varlen_fwd(
     s_ret = S_dmask if (return_attn_probs and dropout_p > 0) else None
     result = (out, lse_ret, s_ret)
 
-    # Residuals needed for backward pass
+    # Residuals for backward pass.
     residuals = (
         q_padded,
         k_padded,
@@ -1275,7 +1273,7 @@ def _flash_attn_varlen_fwd(
         dropout_p,
         softmax_scale,
         logits_soft_cap,
-        False,  # zero_tensors - hardcoded to match public API
+        False,  # zero_tensors
         causal,
         (wl_norm, wr_norm),
         bias,
@@ -1284,8 +1282,8 @@ def _flash_attn_varlen_fwd(
         deterministic,
         head_size_q_og,
         head_size_v_og,
-        True,  # is_v3_atomic_fp32 - hardcoded default
-        1,  # how_v3_bf16_cvt - hardcoded to match public API
+        True,  # is_v3_atomic_fp32
+        1,  # how_v3_bf16_cvt
     )
 
     return result, residuals
@@ -1309,13 +1307,12 @@ def _flash_attn_varlen_bwd(
     grad_outputs,
 ):
     """Backward pass using residuals and output gradients."""
-    # Unpack grad_outputs (cotangent of the output)
+    # Unpack gradients.
     if isinstance(grad_outputs, (tuple, list)):
         dout = grad_outputs[0]
     else:
         dout = grad_outputs
 
-    # Unpack residuals
     (
         q_padded,
         k_padded,
@@ -1348,7 +1345,6 @@ def _flash_attn_varlen_bwd(
         pad_v = 8 - head_size_v_og % 8
         dout_padded = jnp.pad(dout, ((0, 0), (0, 0), (0, pad_v)))
 
-    # Call backward function
     dq_padded, dk_padded, dv_padded, softmax_d = _flash_attn_varlen_backward(
         dout=dout_padded,
         q=q_padded,
@@ -1373,12 +1369,12 @@ def _flash_attn_varlen_bwd(
         zero_tensors=res_zero_tensors,
     )
 
-    # Unpad gradients to match original input dimensions
+    # Unpad gradients to match original input dimensions.
     dq = dq_padded[..., :head_size_q_og]
     dk = dk_padded[..., :head_size_q_og]
     dv = dv_padded[..., :head_size_v_og]
 
-    # Return gradients for all inputs (None for non-differentiable params)
+    # Return gradients for all inputs (None for non-differentiable params).
     return (
         dq,  # q
         dk,  # k
