@@ -51,12 +51,15 @@ def get_umbrella_lib() -> Path:
 
 def set_aiter_asm_dir():
     """
-    Set AITER_ASM_DIR environment variable based on GPU architecture.
+    Set AITER_ASM_DIR environment variable to the base HSA directory.
 
-    This determines the path to architecture-specific HSA kernel files (.co).
+    NEW CONVENTION (AITER 3baf198+):
+    AITER_ASM_DIR should point to the base hsa/ directory (no arch suffix).
+    AITER's get_asm_dir() function will append the architecture dynamically.
+
     The path is set to:
-    - For development mode: <repo_root>/third_party/aiter/hsa/<gfx_arch>/
-    - For installed packages: <package_location>/jax_aiter/_hsa/<gfx_arch>/
+    - For development mode: <repo_root>/third_party/aiter/hsa/
+    - For installed packages: <package_location>/jax_aiter/_hsa/
 
     This should be called early during package initialization.
     """
@@ -68,30 +71,36 @@ def set_aiter_asm_dir():
     try:
         from .chip_info import get_gfx
 
-        # Get GPU architecture (e.g., "gfx942", "gfx950").
+        # Get GPU architecture for verification (e.g., "gfx942", "gfx950").
         gfx_arch = get_gfx()
 
         # Check if we're in development mode (JA_ROOT_DIR set).
         ja_root = os.environ.get("JA_ROOT_DIR")
 
         if ja_root:
-            # Development mode - use third_party/aiter/hsa.
+            # Development mode - use third_party/aiter/hsa (base directory).
             hsa_base = Path(ja_root) / "third_party" / "aiter" / "hsa"
         else:
-            # Installed package mode - use jax_aiter/_hsa.
+            # Installed package mode - use jax_aiter/_hsa (base directory).
             pkg_root = get_package_install_dir()
             hsa_base = pkg_root / "_hsa"
 
-        # Set architecture-specific path.
-        asm_dir = hsa_base / gfx_arch
-
-        if asm_dir.exists():
-            os.environ["AITER_ASM_DIR"] = str(asm_dir) + "/"
+        # NEW CONVENTION: Set to base hsa/ directory (AITER appends arch internally).
+        if hsa_base.exists():
+            # Verify arch-specific subdirectory exists as a sanity check.
+            arch_dir = hsa_base / gfx_arch
+            if not arch_dir.exists():
+                logger.warning(
+                    f"HSA arch directory not found: {arch_dir}. "
+                    f"Assembly kernels may not be available for {gfx_arch}."
+                )
+            
+            os.environ["AITER_ASM_DIR"] = str(hsa_base) + "/"
             logger.info(f"Set AITER_ASM_DIR to: {os.environ['AITER_ASM_DIR']}")
         else:
             logger.warning(
-                f"HSA kernel directory not found: {asm_dir}. "
-                f"Assembly kernels may not be available for {gfx_arch}."
+                f"HSA base directory not found: {hsa_base}. "
+                f"Assembly kernels will not be available."
             )
     except Exception as e:
         logger.warning(f"Failed to set AITER_ASM_DIR: {e}")

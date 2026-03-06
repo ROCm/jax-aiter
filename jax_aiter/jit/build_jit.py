@@ -46,21 +46,22 @@ def patch_aiter_core(core_module, jax_aiter_root):
     # Add JA_ROOT_DIR to the core module's globals.
     core_module.JA_ROOT_DIR = jax_aiter_root
 
-    # Override get_asm_dir to point to parent hsa directory.
-    # This allows us to reference arch-specific paths explicitly in optCompilerConfig.json.
+    # NEW AITER (3baf198+): AITER_ASM_DIR already points to base hsa/ directory.
+    # Verify it's set correctly (defensive check for compatibility).
     orig_asm_dir = core_module.AITER_ASM_DIR
-    gfx_dir = orig_asm_dir.rstrip(os.sep)
-    hsa_dir = os.path.dirname(gfx_dir)  # .../hsa
-    core_module.AITER_ASM_DIR = hsa_dir
-    os.environ["AITER_ASM_DIR"] = hsa_dir
-
-    # Override the cached get_asm_dir function.
-    @functools.lru_cache(maxsize=1)
-    def get_asm_dir_ja():
-        return hsa_dir
-
-    core_module.get_asm_dir = get_asm_dir_ja
-    logger.info(f"Overridden AITER_ASM_DIR to: {hsa_dir}")
+    
+    # Check if AITER_ASM_DIR ends with an architecture (old convention).
+    # If so, strip it to get the base hsa/ directory (backward compatibility).
+    if orig_asm_dir.rstrip(os.sep).endswith(('gfx942', 'gfx950', 'gfx1100', 'gfx1150', 'gfx1200')):
+        # Old convention detected - fix it
+        gfx_dir = orig_asm_dir.rstrip(os.sep)
+        hsa_dir = os.path.dirname(gfx_dir) + "/"  # .../hsa/
+        core_module.AITER_ASM_DIR = hsa_dir
+        os.environ["AITER_ASM_DIR"] = hsa_dir
+        logger.info(f"Detected old AITER_ASM_DIR convention, updated to: {hsa_dir}")
+    else:
+        # New convention - already correct
+        logger.info(f"AITER_ASM_DIR already using new convention: {orig_asm_dir}")
 
     # Override get_user_jit_dir to use JAX-AITER build directory.
     @functools.lru_cache(maxsize=1)
