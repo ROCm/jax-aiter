@@ -949,7 +949,7 @@ def _flash_attn_varlen_backward(
         ret = ret and (dropout_p == 0.0)
         ret = ret and (not deterministic)
         ret = ret and (hdim_q == hdim_v)
-        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (nhead_q == nhead_k)
         ret = ret and (hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (mask or nmask)
@@ -963,7 +963,7 @@ def _flash_attn_varlen_backward(
         ret &= dropout_p == 0.0
         ret &= not deterministic
         ret &= hdim_q == hdim_v
-        ret &= nhead_q % nhead_k == 0
+        ret &= nhead_q == nhead_k
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
         ret &= not swa
         return ret

@@ -40,13 +40,15 @@ AMDGPU_TARGET_FLAGS := $(foreach arch,$(GPU_ARCHS_LIST),--offload-arch=$(arch))
 JA_CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
                -fvisibility-inlines-hidden -fvisibility=hidden
 
-JA_INCLUDES := -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC) \
+JA_INCLUDES := -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
+               -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/library/include \
+               -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/example/ck_tile/01_fmha \
+               -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC) \
                -I$(TORCH_SITE) -I$(TORCH_INC) -I$(TORCH_API_INC) \
                -I$(TORCH_API_INC)/install/include -I$(TORCH_SITE)/torch/csrc \
                -I$(TORCH_SITE)/aten -I$(TORCH_SITE)/aten/src -I$(TORCH_SITE)/aten/src/ATen \
                -I$(TORCH_API_INC)/aten/src -I$(TORCH_API_INC)/aten/src/ATen \
-               -I$(AITER_INC) -I$(AITER_SRC_DIR)/csrc/include \
-               -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/example/ck_tile/01_fmha
+               -I$(AITER_INC) -I$(AITER_SRC_DIR)/csrc/include
 
 # JA module targets.
 JA_MODULES := $(JA_BUILD_DIR)/custom_ja.so \
@@ -71,6 +73,7 @@ ja_mods: $(JA_MODULES)
 
 $(OUT_SO): build/jax_aiter_build/ csrc/common/mha_common_utils.cu
 	$(HIPCC) -shared $(UMBRELLA_CXXFLAGS) \
+		-I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
 		-I$(AITER_SRC_DIR)/3rdparty/composable_kernel/example/ck_tile/01_fmha \
 		csrc/common/mha_common_utils.cu \
 		$(UMBRELLA_LDFLAGS) -o $@

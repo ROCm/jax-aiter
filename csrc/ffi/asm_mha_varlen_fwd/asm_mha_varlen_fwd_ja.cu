@@ -241,73 +241,94 @@ ffi::Error FmhaV3VarlenFwd_Bridge(
       }
     }
 
-    // Construct fmha_fwd_args for varlen v3; is_group_mode=true,
-    // use_ext_asm=true.
-    auto args = fmha_fwd_args{
-        q.untyped_data(),
-        k.untyped_data(),
-        v.untyped_data(),
-        final_bias_ptr,
-        return_dropout_randval ? p->untyped_data() : nullptr,
-        return_softmax_lse ? softmax_lse->untyped_data() : nullptr,
-        out->untyped_data(),
-        nullptr,          // cu_seqlen_q_ptr (batch mode)
-        nullptr,          // cu_seqlen_kv_ptr (batch mode)
-        cu_seqlens_q_ptr, // seqstart_q (group mode)
-        cu_seqlens_k_ptr, // seqstart_k (group mode)
-        nullptr,          // seqlen_k_ptr
-        nullptr,          // seqstart_padded_q_ptr
-        nullptr,          // seqstart_padded_k_ptr
-        static_cast<ck_tile::index_t>(total_q),
-        static_cast<ck_tile::index_t>(total_k),
-        static_cast<ck_tile::index_t>(batch_size),
-        static_cast<ck_tile::index_t>(max_seqlen_q),
-        static_cast<ck_tile::index_t>(head_size_q),
-        static_cast<ck_tile::index_t>(head_size_v),
-        static_cast<ck_tile::index_t>(num_heads),
-        static_cast<ck_tile::index_t>(num_heads_k),
-        softmax_scale,
-        1.0f, // scale_p
-        1.0f, // scale_o
-        logits_soft_cap,
-        stride_q,
-        stride_k,
-        stride_v,
-        stride_bias,
-        stride_randval,
-        stride_o,
-        nhead_stride_q,
-        nhead_stride_k,
-        nhead_stride_v,
-        nhead_stride_bias,
-        nhead_stride_randval,
-        nhead_stride_lse,
-        nhead_stride_o,
-        0, // batch_stride_q (varlen uses 0).
-        0, // batch_stride_k
-        0, // batch_stride_v
-        0, // batch_stride_bias
-        0, // batch_stride_randval
-        0, // batch_stride_lse
-        0, // batch_stride_o
-        mask.left,
-        mask.right,
-        static_cast<ck_tile::index_t>(mask.type),
-        min_seqlen_q,
-        p_dropout,
-        return_dropout_randval,
-        std::make_pair(rng_ptrs.seed, rng_ptrs.offset)};
+    auto args = aiter::mha_fwd_args{
+        .use_asm_v3 = true,
+        .v3_api_check = true,
+        .how_v3_bf16_cvt = how_v3_bf16_cvt,
+        .data_type = dtype_str,
+        .is_group_mode = true,
+        .bias_type = static_cast<int>(bias_type),
+        .has_lse = return_softmax_lse,
+        .qscale_type = 0,
+        .has_sink = false,
+
+        .q_ptr = q.untyped_data(),
+        .k_ptr = k.untyped_data(),
+        .v_ptr = v.untyped_data(),
+        .bias_ptr = final_bias_ptr,
+        .q_descale_ptr = nullptr,
+        .k_descale_ptr = nullptr,
+        .v_descale_ptr = nullptr,
+        .rand_val_ptr = return_dropout_randval ? p->untyped_data() : nullptr,
+        .lse_ptr = return_softmax_lse ? softmax_lse->untyped_data() : nullptr,
+        .o_ptr = out->untyped_data(),
+
+        .seqstart_q_ptr = cu_seqlens_q_ptr,
+        .seqstart_k_ptr = cu_seqlens_k_ptr,
+        .seqlen_q_ptr = nullptr,
+        .seqlen_k_ptr = nullptr,
+        .cu_seqlen_q_ptr = nullptr,
+        .cu_seqlen_k_ptr = nullptr,
+        .block_scale_seqstart_q_ptr = nullptr,
+        .block_scale_seqstart_k_ptr = nullptr,
+        .sink_ptr = nullptr,
+
+        .seqlen_q = static_cast<ck_tile::index_t>(total_q),
+        .seqlen_k = static_cast<ck_tile::index_t>(total_k),
+        .batch = static_cast<ck_tile::index_t>(batch_size),
+        .max_seqlen_q = static_cast<ck_tile::index_t>(max_seqlen_q),
+        .hdim_q = static_cast<ck_tile::index_t>(head_size_q),
+        .hdim_v = static_cast<ck_tile::index_t>(head_size_v),
+        .nhead_q = static_cast<ck_tile::index_t>(num_heads),
+        .nhead_k = static_cast<ck_tile::index_t>(num_heads_k),
+
+        .scale_s = softmax_scale,
+        .logits_soft_cap = logits_soft_cap,
+
+        .stride_q = stride_q,
+        .stride_k = stride_k,
+        .stride_v = stride_v,
+        .stride_bias = stride_bias,
+        .stride_randval = stride_randval,
+        .stride_o = stride_o,
+        .nhead_stride_q = nhead_stride_q,
+        .nhead_stride_k = nhead_stride_k,
+        .nhead_stride_v = nhead_stride_v,
+        .nhead_stride_bias = nhead_stride_bias,
+        .nhead_stride_randval = nhead_stride_randval,
+        .nhead_stride_lse = nhead_stride_lse,
+        .nhead_stride_o = nhead_stride_o,
+        .nhead_stride_q_descale = 0,
+        .nhead_stride_k_descale = 0,
+        .nhead_stride_v_descale = 0,
+        .batch_stride_q = 0,
+        .batch_stride_k = 0,
+        .batch_stride_v = 0,
+        .batch_stride_bias = 0,
+        .batch_stride_randval = 0,
+        .batch_stride_lse = 0,
+        .batch_stride_o = 0,
+        .batch_stride_q_descale = 0,
+        .batch_stride_k_descale = 0,
+        .batch_stride_v_descale = 0,
+
+        .window_size_left = mask.left,
+        .window_size_right = mask.right,
+        .sink_size = 0,
+        .mask_type = static_cast<ck_tile::index_t>(mask.type),
+        .min_seqlen_q = min_seqlen_q,
+
+        .p_drop = p_dropout,
+        .s_randval = return_dropout_randval,
+        .drop_seed_offset = std::make_pair(rng_ptrs.seed, rng_ptrs.offset),
+
+        .block_scale_size_q = 0,
+        .block_scale_size_kv = 0
+    };
 
     auto stream_config = mha_utils::create_stream_config(stream);
 
-    // Call aiter::mha_fwd with ASM v3 flags.
-    float runtime =
-        aiter::mha_fwd(args, stream_config, dtype_str,
-                       true, // is_group_mode (varlen)
-                       mask.type, bias_type, return_softmax_lse,
-                       true,           // use_ext_asm (ASM v3 kernels)
-                       how_v3_bf16_cvt // v3-specific bfloat16 conversion mode
-        );
+    float runtime = aiter::mha_fwd(args, stream_config);
 
     if (runtime < 0) {
       return ffi::Error(ffi::ErrorCode::kInternal,

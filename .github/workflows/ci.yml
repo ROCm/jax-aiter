@@ -146,14 +146,6 @@ jobs:
             git apply ../../scripts/torch_caffe.patch
           '
 
-      - name: Apply AITER patch
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            cd third_party/aiter
-            git apply ../../scripts/aiter.patch
-          '
-
       - name: Build static PyTorch (full)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '

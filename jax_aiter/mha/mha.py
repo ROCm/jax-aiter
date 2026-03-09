@@ -264,7 +264,7 @@ def can_impl_fmha_v3_bwd(
     ret &= dropout_p == 0.0
     ret &= not deterministic
     ret &= hdim_q == hdim_v
-    ret &= nhead_q % nhead_k == 0
+    ret &= nhead_q == nhead_k
     ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
     ret &= np() or pssk() or pddv() or psskddv()
 
@@ -311,7 +311,7 @@ def can_impl_fmha_v3_bwd_gfx950(
     ret &= dropout_p == 0.0
     ret &= not deterministic or is_950_1block
     ret &= hdim_q == hdim_v
-    ret &= nhead_q % nhead_k == 0
+    ret &= nhead_q == nhead_k
     ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
 
     return ret
