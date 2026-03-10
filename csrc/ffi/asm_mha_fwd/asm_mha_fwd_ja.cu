@@ -223,7 +223,7 @@ FmhaV3Fwd_Bridge(hipStream_t stream,
       // AITER-specific fields (must come first in struct)
       .use_asm_v3 = true,
       .v3_api_check = false,
-      .how_v3_bf16_cvt = 2,
+      .how_v3_bf16_cvt = 1,
       
       // CK fmha_fwd_traits fields
       .data_type = dtype_str,

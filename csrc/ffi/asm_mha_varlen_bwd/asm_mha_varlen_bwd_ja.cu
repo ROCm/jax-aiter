@@ -370,7 +370,7 @@ ffi::Error FmhaV3VarlenBwd_Bridge(
         .use_asm_v3 = true,
         .v3_atomic_fp32 = is_v3_atomic_fp32,
         .v3_bf16_cvt = how_v3_bf16_cvt,
-        .v3_api_check = true,
+        .v3_api_check = false,
         .hdim_q = static_cast<int>(head_size_q),
         .hdim_v = static_cast<int>(head_size_v),
         .data_type = dtype_str,

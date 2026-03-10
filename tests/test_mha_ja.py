@@ -150,28 +150,32 @@ def run_jax_aiter(
     """
     window_size = tuple(int(x) for x in window_size)
 
-    def _jax_flash(Q, K, V, B, ALJ, CU_Q, CU_KV):
-        return jax_flash_attn_func(
-            Q,
-            K,
-            V,
-            dropout_p=dropout_p,
-            causal=causal,
-            window_size=window_size,
-            bias=B,
-            alibi_slopes=ALJ,
-            deterministic=deterministic,
-            return_lse=return_lse,
-            return_attn_probs=return_attn_probs,
-            cu_seqlens_q=CU_Q,
-            cu_seqlens_kv=CU_KV,
-        )
+    # Only q, k, v (and optionally bias) go through vjp.
+    # Other args (alibi_slopes, cu_seqlens, scalars) are closed over.
+    has_bias = bias is not None and bias.size > 0
 
-    primal_out, pullback = jax.vjp(
-        _jax_flash, q, k, v, bias, alibi_slopes, cu_seqlens_q, cu_seqlens_kv
-    )
+    if has_bias:
+        def _jax_flash(Q, K, V, B):
+            return jax_flash_attn_func(
+                Q, K, V,
+                dropout_p=dropout_p, causal=causal, window_size=window_size,
+                bias=B, alibi_slopes=alibi_slopes, deterministic=deterministic,
+                return_lse=return_lse, return_attn_probs=return_attn_probs,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+            )
+        primal_out, pullback = jax.vjp(_jax_flash, q, k, v, bias)
+    else:
+        def _jax_flash(Q, K, V):
+            return jax_flash_attn_func(
+                Q, K, V,
+                dropout_p=dropout_p, causal=causal, window_size=window_size,
+                bias=bias, alibi_slopes=alibi_slopes, deterministic=deterministic,
+                return_lse=return_lse, return_attn_probs=return_attn_probs,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+            )
+        primal_out, pullback = jax.vjp(_jax_flash, q, k, v)
 
-    # Parse outputs
+    # Parse outputs.
     softmax_lse = None
     s_dmask = None
     if return_lse and return_attn_probs:
@@ -183,13 +187,12 @@ def run_jax_aiter(
     else:
         out = primal_out
 
-    # Reconstruct dropout mask for baseline comparison
+    # Reconstruct dropout mask for baseline comparison.
     dropout_mask = None
     if dropout_p > 0.0 and s_dmask is not None:
         B, seqlen_q, N, d_q = q.shape
         _, seqlen_k, _, _ = k.shape
 
-        # Convert S_dmask to dropout mask
         s_dmask_thresh = ck_randval_to_dropout_mask(s_dmask, dropout_p)
         s_dmask_converted = convert_flash_attn_S_to_softmax(
             s_dmask_thresh,
@@ -207,7 +210,7 @@ def run_jax_aiter(
     if dout is None:
         return out, softmax_lse, dropout_mask, None, None, None, None
 
-    # Compute gradients
+    # Compute gradients.
     cot_components = [dout]
     if softmax_lse is not None:
         cot_components.append(jnp.zeros_like(softmax_lse))
@@ -216,10 +219,11 @@ def run_jax_aiter(
     cot = tuple(cot_components) if len(cot_components) > 1 else cot_components[0]
 
     grad_values = pullback(cot)
-    # Unpack gradients (q, k, v, bias, alibi_slopes, cu_seqlens_q, cu_seqlens_kv)
-    # cu_seqlens are non-diff so they don't get gradients
-    dq, dk, dv, dbias, dalibi = grad_values[:5]
-    # Remaining are None for cu_seqlens
+    if has_bias:
+        dq, dk, dv, dbias = grad_values[:4]
+    else:
+        dq, dk, dv = grad_values[:3]
+        dbias = None
 
     return out, softmax_lse, dropout_mask, dq, dk, dv, dbias
 

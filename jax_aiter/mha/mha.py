@@ -1064,6 +1064,10 @@ def _flash_attn_backward(
 
     Returns: (dq, dk, dv, softmax_d, dbias) - dbias is None if no bias provided.
     """
+    # gfx950: rtna/rtz bf16 conversion modes deprecated.
+    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
+        how_v3_bf16_cvt = 0
+
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
         dout,
         q,
@@ -1405,7 +1409,19 @@ def _flash_attn_func_bwd(
     else:
         dout_padded = dout
 
-    # Call backward with kernel dispatch.
+    # gfx950 1-block: sk<=256 with hd in (64,128] is inherently deterministic.
+    seqlen_k_bwd = k_padded.shape[1]
+    hdim_q_bwd = q_padded.shape[3]
+    is_950_1block = (
+        get_gfx() == "gfx950"
+        and seqlen_k_bwd <= 256
+        and hdim_q_bwd > 64
+        and hdim_q_bwd <= 128
+        and hdim_q_bwd % 8 == 0
+    )
+    bwd_deterministic = False if is_950_1block else res_deterministic
+    bwd_atomic_fp32 = False if is_950_1block else True
+
     dq_padded, dk_padded, dv_padded, softmax_d, dbias_grad = _flash_attn_backward(
         dout_padded,
         q_padded,
@@ -1420,10 +1436,10 @@ def _flash_attn_func_bwd(
         res_window_size[1],
         res_bias,
         res_alibi_slopes,
-        res_deterministic,
+        bwd_deterministic,
         rng_state,
-        True,  # is_v3_atomic_fp32
-        1,  # how_v3_bf16_cvt
+        bwd_atomic_fp32,
+        1,  # how_v3_bf16_cvt (overridden to 0 for gfx950 inside _flash_attn_backward)
     )
 
     # Unpad gradients to original dimensions.

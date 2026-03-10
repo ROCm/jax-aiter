@@ -243,7 +243,7 @@ ffi::Error FmhaV3VarlenFwd_Bridge(
 
     auto args = aiter::mha_fwd_args{
         .use_asm_v3 = true,
-        .v3_api_check = true,
+        .v3_api_check = false,
         .how_v3_bf16_cvt = how_v3_bf16_cvt,
         .data_type = dtype_str,
         .is_group_mode = true,

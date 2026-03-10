@@ -842,6 +842,12 @@ def _flash_attn_varlen_forward(
     )  # no mask.
     swa = (window_size_left > 0) or (window_size_right > 0)
 
+    # alibi + SWA triggers a GPU memory fault in the CK kernel.
+    if alibi_slopes is not None and swa:
+        raise NotImplementedError(
+            "alibi + sliding window attention is not supported"
+        )
+
     def can_impl_fmha_v3_fwd():
         ret = alibi_slopes is None
         ret = ret and (bias is None)
