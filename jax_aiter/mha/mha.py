@@ -311,6 +311,8 @@ def can_impl_fmha_v3_bwd_gfx950(
     ret &= nhead_q == nhead_k
     ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
     ret &= not swa
+    if causal:
+        ret &= seqlen_q <= seqlen_k
 
     return ret
 

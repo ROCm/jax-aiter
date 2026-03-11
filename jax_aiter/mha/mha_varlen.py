@@ -954,6 +954,8 @@ def _flash_attn_varlen_backward(
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (mask or nmask)
         ret = ret and (not swa)
+        if causal and get_gfx() == "gfx950":
+            ret = ret and (max_seqlen_k <= 256)
         return ret
 
     def can_impl_fmha_v3_bwd_gfx950():
@@ -966,6 +968,8 @@ def _flash_attn_varlen_backward(
         ret &= nhead_q == nhead_k
         ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
         ret &= not swa
+        if causal:
+            ret &= max_seqlen_k <= 256
         return ret
 
     # LSE is in 3D format from forward.
