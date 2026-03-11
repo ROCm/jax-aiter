@@ -189,7 +189,7 @@ ffi::Error MhaVarlenBwd_Bridge(
     std::vector<int64_t> dq_acc_shape;
     size_t dq_acc_bytes =
         compute_dq_acc_size_varlen(total_q, max_seqlen_k, num_heads,
-                                   head_size_v, deterministic, dq_acc_shape);
+                                   head_size_q, deterministic, dq_acc_shape);
 
     void *dq_acc_ptr = nullptr;
     HIP_CHECK(hipMalloc(&dq_acc_ptr, dq_acc_bytes));

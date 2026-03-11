@@ -31,7 +31,8 @@ static size_t compute_dq_acc_size(int64_t batch_size, int64_t seqlen_q,
       element_size = 4;
     } else {
       int64_t seqlen_q_padded = ((seqlen_q + 15) / 16) * 16;
-      out_shape = {1, batch_size, num_heads, seqlen_q_padded, 128};
+      int64_t padded_d = (head_size == 192) ? 192 : 128;
+      out_shape = {1, batch_size, num_heads, seqlen_q_padded, padded_d};
       element_size = (q_dtype == xla::ffi::DataType::F16 ||
                       q_dtype == xla::ffi::DataType::BF16)
                          ? 2
@@ -129,6 +130,9 @@ ffi::Error FmhaV3Bwd_Bridge(
 
   std::string dtype_str = mha_utils::dtype_to_string(q.element_type());
 
+  if (window_size_left >= seqlen_k) window_size_left = -1;
+  if (window_size_right >= seqlen_k) window_size_right = -1;
+
   auto mask = mha_utils::create_mask_info(
       is_causal, window_size_left, window_size_right, seqlen_q, seqlen_k);
 
@@ -159,7 +163,7 @@ ffi::Error FmhaV3Bwd_Bridge(
 
   std::vector<int64_t> dq_acc_shape;
   size_t dq_acc_bytes = compute_dq_acc_size(
-      batch_size, seqlen_q, seqlen_k, num_heads_q, head_size_v, deterministic,
+      batch_size, seqlen_q, seqlen_k, num_heads_q, head_size_q, deterministic,
       is_v3_atomic_fp32, q.element_type(), dq_acc_shape);
 
   void *dq_acc_ptr = nullptr;

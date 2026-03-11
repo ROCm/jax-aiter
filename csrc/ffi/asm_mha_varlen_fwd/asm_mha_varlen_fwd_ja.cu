@@ -162,10 +162,13 @@ ffi::Error FmhaV3VarlenFwd_Bridge(
       HIP_CHECK(
           hipMemsetAsync(out->untyped_data(), 0, out->size_bytes(), stream));
       if (return_softmax_lse && softmax_lse->size_bytes() > 0) {
-        // Initialize softmax_lse buffer.
-        float neg_inf = -std::numeric_limits<float>::infinity();
-        HIP_CHECK(hipMemsetAsync(softmax_lse->untyped_data(), 0,
-                                 softmax_lse->size_bytes(), stream));
+        size_t num_elements = softmax_lse->element_count();
+        std::vector<float> neg_inf_buf(num_elements,
+                                       -std::numeric_limits<float>::infinity());
+        HIP_CHECK(hipMemcpyAsync(softmax_lse->untyped_data(),
+                                 neg_inf_buf.data(),
+                                 num_elements * sizeof(float),
+                                 hipMemcpyHostToDevice, stream));
       }
       if (return_dropout_randval && p->size_bytes() > 0) {
         HIP_CHECK(
@@ -189,9 +192,13 @@ ffi::Error FmhaV3VarlenFwd_Bridge(
       HIP_CHECK(
           hipMemsetAsync(out->untyped_data(), 0, out->size_bytes(), stream));
       if (return_softmax_lse && softmax_lse->size_bytes() > 0) {
-        float inf_val = std::numeric_limits<float>::infinity();
-        HIP_CHECK(hipMemsetAsync(softmax_lse->untyped_data(), 0,
-                                 softmax_lse->size_bytes(), stream));
+        size_t num_elements = softmax_lse->element_count();
+        std::vector<float> inf_buf(num_elements,
+                                   std::numeric_limits<float>::infinity());
+        HIP_CHECK(hipMemcpyAsync(softmax_lse->untyped_data(),
+                                 inf_buf.data(),
+                                 num_elements * sizeof(float),
+                                 hipMemcpyHostToDevice, stream));
       }
       return ffi::Error::Success();
     }

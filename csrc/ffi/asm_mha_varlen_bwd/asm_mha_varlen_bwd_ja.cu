@@ -212,7 +212,7 @@ ffi::Error FmhaV3VarlenBwd_Bridge(
     // Allocate dq_acc buffer with v3-specific layout.
     std::vector<int64_t> dq_acc_shape;
     size_t dq_acc_bytes = compute_dq_acc_size_v3_varlen(
-        batch_size, total_q, max_seqlen_q, max_seqlen_k, num_heads, head_size_v,
+        batch_size, total_q, max_seqlen_q, max_seqlen_k, num_heads, head_size_q,
         deterministic, is_v3_atomic_fp32, q.element_type(), dq_acc_shape);
 
     void *dq_acc_ptr = nullptr;

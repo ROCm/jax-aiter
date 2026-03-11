@@ -225,6 +225,11 @@ MhaFwd_Bridge(hipStream_t stream,
   ck_tile::index_t batch_stride_randval =
       return_dropout_randval ? mha_utils::calculate_stride(p_dims, 0) : 0;
 
+  if (return_dropout_randval && p->size_bytes() > 0) {
+    HIP_CHECK(
+        hipMemsetAsync(p->untyped_data(), 0, p->size_bytes(), stream));
+  }
+
   auto args = aiter::mha_fwd_args{
       .use_asm_v3 = false,
       .v3_api_check = false,

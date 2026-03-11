@@ -131,6 +131,9 @@ ffi::Error MhaBwd_Bridge(
 
   std::string dtype_str = mha_utils::dtype_to_string(q.element_type());
 
+  if (window_size_left >= seqlen_k) window_size_left = -1;
+  if (window_size_right >= seqlen_k) window_size_right = -1;
+
   auto mask = mha_utils::create_mask_info(
       is_causal, window_size_left, window_size_right, seqlen_q, seqlen_k);
 
@@ -208,7 +211,7 @@ ffi::Error MhaBwd_Bridge(
 
   std::vector<int64_t> dq_acc_shape;
   size_t dq_acc_bytes = compute_dq_acc_size_ck(
-      batch_size, seqlen_q, seqlen_k, num_heads, head_size_v, deterministic,
+      batch_size, seqlen_q, seqlen_k, num_heads, head_size_q, deterministic,
       mask.type, dq_acc_shape);
 
   void *dq_acc_ptr = nullptr;
@@ -399,6 +402,8 @@ ffi::Error MhaBwd_Bridge(
       hipFree(dk_expanded_ptr);
     if (dv_expanded_ptr)
       hipFree(dv_expanded_ptr);
+    if (dbias_expanded_ptr)
+      hipFree(dbias_expanded_ptr);
     if (dummy_rng)
       hipFree(dummy_rng);
     return ffi::Error(ffi::ErrorCode::kInternal,

@@ -247,14 +247,11 @@ def can_impl_fmha_v3_bwd(
         return ret
 
     def psskddv():
-        """Check padded cases with SWA support."""
+        """Check padded cases. SWA excluded — produces wrong gradients on gfx950."""
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q > 64 and hdim_q <= 192
-        ret &= (
-            nmask
-            or (mask and seqlen_q == seqlen_k)
-            or (swa and hdim_q > 64 and hdim_q <= 128)
-        )
+        ret &= nmask or (mask and seqlen_q == seqlen_k)
+        ret &= not swa
 
         return ret
 
@@ -313,6 +310,7 @@ def can_impl_fmha_v3_bwd_gfx950(
     ret &= hdim_q == hdim_v
     ret &= nhead_q == nhead_k
     ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+    ret &= not swa
 
     return ret
 
