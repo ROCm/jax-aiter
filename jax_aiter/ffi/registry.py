@@ -24,23 +24,8 @@ _jax_initialized = False
 
 # Symbol to module mapping.
 SYMBOL_TO_MODULE_MAP = {
-    # JA custom symbols -> custom_ja.so
-    "LLMM1JA": "custom_ja.so",
-    "LLZZJA": "custom_ja.so",
-    "MMCustomGPUJA": "custom_ja.so",
-    "WvSplitKJA": "custom_ja.so",
-    "WvSplitKQJA": "custom_ja.so",
-    "WvSplitKSmallJA": "custom_ja.so",
-    # JA MHA symbols -> *_ja.so
-    "FmhaV3BwdJA": "asm_mha_bwd_ja.so",
-    "FmhaV3FwdJA": "asm_mha_fwd_ja.so",
-    "FmhaV3VarlenBwdJA": "asm_mha_varlen_bwd_ja.so",
-    "FmhaV3VarlenFwdJA": "asm_mha_varlen_fwd_ja.so",
-    "MhaBatchPrefillJA": "ck_mha_batch_prefill_ja.so",
-    "MhaBwdJA": "ck_fused_attn_bwd_ja.so",
-    "MhaFwdJA": "ck_fused_attn_fwd_ja.so",
-    "MhaVarlenFwdJA": "ck_mha_varlen_fwd_ja.so",
-    "MhaVarlenBwdJA": "ck_mha_varlen_bwd_ja.so",
+    "MhaFwdUnifiedJA": "mha_fwd_ja.so",
+    "MhaBwdUnifiedJA": "mha_bwd_ja.so",
 }
 
 

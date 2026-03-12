@@ -1,1164 +1,307 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
-"""Multi-Head Attention with automatic kernel dispatch for optimal performance."""
+"""Simplified MHA using unified AITER entry point.
+
+Calls aiter::mha_fwd / aiter::mha_bwd through a single FFI handler per
+direction. CK vs ASM v3 dispatch is handled internally by AITER based on
+the use_asm_v3 flag. No Python-side dispatch logic.
+"""
 
 from __future__ import annotations
 import logging
-from typing import Tuple, Optional, List
-import os
+from typing import Tuple, Optional
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import core
 
 from ..ja_compat import dtypes
 from ..ja_compat.chip_info import get_gfx
 from ..ffi.registry import register_ffi_target
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("jax-aiter.mha")
-
-# Debug mode controlled by environment variable.
-DEBUG_MHA = os.getenv("DEBUG_MHA", "0") == "1"
+log = logging.getLogger("jax-aiter.mha_v2")
 
 
-def debug_kernel_params(kernel_name: str, tensors: dict, scalars: dict):
-    """Print kernel parameters for debugging."""
-    if DEBUG_MHA:
-        print(f"\n[MHA-PARAMS] {kernel_name} - Parameter Debug:")
-        print("=== TENSOR PARAMETERS ===")
-        for name, tensor in tensors.items():
-            if tensor is not None and hasattr(tensor, "shape"):
-                print(f"  {name}: shape={tensor.shape}, dtype={tensor.dtype}")
-            else:
-                print(f"  {name}: {tensor} (type: {type(tensor)})")
-
-        print("=== SCALAR PARAMETERS ===")
-        for name, value in scalars.items():
-            print(f"  {name}: {value} (type: {type(value)})")
-        print("=" * 50)
+def _ensure_registered(target: str):
+    register_ffi_target(target, "ROCM")
 
 
-def _ensure_ffi_target_registered(target_name: str):
-    """Register FFI target for ROCM backend."""
-    register_ffi_target(target_name, "ROCM")
-
-
-def _empty_tensor(dtype):
-    """Create empty tensor with valid data pointer."""
+def _empty(dtype):
     return jnp.zeros((0,), dtype=dtype)
 
 
-def _static_float(x) -> np.float32:
-    """Convert to float for static arguments."""
+def _sf(x) -> np.float32:
     return np.float32(x)
 
 
-def _static_int(x) -> np.int32:
-    """Convert to int32 for static arguments."""
+def _si(x) -> np.int32:
     return np.int32(x)
 
 
-def _normalize_window_size(
-    window_size_left: int, window_size_right: int, seqlen_k: int
-):
-    """Normalize window sizes to -1 if >= sequence length."""
-    wl = -1 if window_size_left >= seqlen_k else window_size_left
-    wr = -1 if window_size_right >= seqlen_k else window_size_right
-    return wl, wr
+# ---------------------------------------------------------------------------
+# Unified forward FFI wrapper
+# ---------------------------------------------------------------------------
 
-
-can_use_v3_fwd = False
-
-
-def _can_impl_fmha_v3_fwd(
-    q,
-    k,
-    v,
-    dropout_p,
-    seqlen_q,
-    seqlen_k,
-    hdim_q,
-    hdim_v,
-    nhead_q,
-    nhead_k,
-    alibi_slopes,
-    bias,
-    window_size_left,
-    window_size_right,
-    return_lse,
-):
-    """Check if FMHA v3 forward kernel can be used."""
-    # Check sliding window attention support.
-    swa = (window_size_left > 0) or (window_size_right > 0)
-
-    ret = alibi_slopes is None
-    ret = ret and (bias is None)
-    ret = ret and (dropout_p == 0.0)
-    ret = ret and (hdim_v == 128)
-    ret = ret and (hdim_q == 128 or (get_gfx() == "gfx950" and hdim_q == 192))
-    ret = ret and (nhead_q % nhead_k == 0)
-    ret = ret and (not swa)
-    ret = ret and (q.dtype == dtypes.bf16)
-    global can_use_v3_fwd
-    can_use_v3_fwd = ret
-    return ret
-
-
-def can_impl_fmha_v3_bwd(
-    dout: jnp.ndarray,
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    dk: Optional[jnp.ndarray],
-    dv: Optional[jnp.ndarray],
-    dbias: Optional[jnp.ndarray],
-    dropout_p: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[jnp.ndarray],
-    alibi_slopes: Optional[jnp.ndarray],
-    deterministic: bool,
-    is_v3_atomic_fp32: bool = True,
-) -> bool:
-    """Check if FMHA v3 backward kernel can be used.
-
-    This function determines kernel compatibility based on tensor shapes, strides,
-    and hardware constraints. It mirrors the logic from the PyTorch/Aiter implementation.
-    """
-    # Extract tensor shapes.
-    _, seqlen_q, nhead_q, hdim_q = q.shape
-    _, seqlen_k, nhead_k, hdim_v = v.shape
-
-    # Create placeholder tensors for stride checking.
-    if dk is None:
-        dk = jnp.empty_like(k)
-    if dv is None:
-        dv = jnp.empty_like(v)
-
-    # Calculate strides converting from bytes to elements (JAX arrays have byte strides).
-    # For JAX arrays: element_stride = byte_stride / itemsize.
-    def _get_strides(arr):
-        """Get element strides from JAX array."""
-        byte_strides = arr.strides if hasattr(arr, "strides") else None
-        if byte_strides is None:
-            # Compute strides for C-contiguous layout.
-            itemsize = arr.dtype.itemsize
-            shape = arr.shape
-            strides = []
-            stride = 1
-            for dim in reversed(shape):
-                strides.insert(0, stride)
-                stride *= dim
-            return tuple(strides)
-        return tuple(s // arr.dtype.itemsize for s in byte_strides)
-
-    q_strides = _get_strides(q)
-    k_strides = _get_strides(k)
-    v_strides = _get_strides(v)
-    dout_strides = _get_strides(dout)
-    dk_strides = _get_strides(dk)
-    dv_strides = _get_strides(dv)
-
-    batch_stride_q = q_strides[0]
-    stride_q = q_strides[1]
-    nhead_stride_q = q_strides[2]
-
-    batch_stride_k = k_strides[0]
-    stride_k = k_strides[1]
-    nhead_stride_k = k_strides[2]
-
-    batch_stride_v = v_strides[0]
-    stride_v = v_strides[1]
-    nhead_stride_v = v_strides[2]
-
-    batch_stride_do = dout_strides[0]
-    stride_do = dout_strides[1]
-    nhead_stride_do = dout_strides[2]
-
-    batch_stride_dk = dk_strides[0]
-    nhead_stride_dk = dk_strides[2]
-
-    batch_stride_dv = dv_strides[0]
-    nhead_stride_dv = dv_strides[2]
-
-    # Normalize window sizes.
-    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
-    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal and window_size_left == -1  # causal mask
-    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = (window_size_left > 0) or (window_size_right > 0)  # sliding window attention
-
-    def np():
-        """Check non-padded stride requirements."""
-        npssk = seqlen_q == seqlen_k
-        npssk &= seqlen_k % 64 == 0
-        npssk &= stride_q == stride_do
-        npssk &= nhead_stride_q == nhead_stride_do
-        npssk &= batch_stride_q == batch_stride_do
-        npssk &= stride_k == stride_v
-        npssk &= nhead_stride_k == nhead_stride_v
-        npssk &= batch_stride_k == batch_stride_v
-        npssk &= nhead_stride_k == nhead_stride_dk
-        npssk &= nhead_stride_v == nhead_stride_dv
-        npssk &= (batch_stride_dk / batch_stride_k) == (nhead_q / nhead_k)
-        npssk &= (batch_stride_dv / batch_stride_v) == (nhead_q / nhead_k)
-
-        hd128_case = (hdim_q == 128) and npssk
-        hd64_case = (hdim_q == 64 and is_v3_atomic_fp32 == False) and npssk
-
-        ret = hd128_case or hd64_case
-        ret &= not swa
-        return ret
-
-    def pssk():
-        """Check head dimensions for atomic fp32."""
-        gfx = get_gfx()
-        # Ensure nhead_stride_dq_acc >= stride_dq_acc.
-        ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (
-            hdim_q == 128 and gfx == "gfx950"
-        )
-        ret &= nmask or (mask and seqlen_q == seqlen_k)
-        ret &= not swa
-
-        return ret
-
-    def pddv():
-        """Check padded dimensions in range [64, 128)."""
-        ret = is_v3_atomic_fp32 == False
-        ret &= hdim_q > 64 and hdim_q < 128
-        ret &= seqlen_q == seqlen_k
-        ret &= seqlen_k % 64 == 0
-        ret &= stride_q == stride_do
-        ret &= nhead_stride_q == nhead_stride_do
-        ret &= batch_stride_q == batch_stride_do
-        ret &= stride_k == stride_v
-        ret &= nhead_stride_k == nhead_stride_v
-        ret &= batch_stride_k == batch_stride_v
-        ret &= nhead_stride_k == nhead_stride_dk
-        ret &= nhead_stride_v == nhead_stride_dv
-        ret &= (batch_stride_dk / batch_stride_k) == (nhead_q / nhead_k)
-        ret &= (batch_stride_dv / batch_stride_v) == (nhead_q / nhead_k)
-        ret &= not swa
-
-        return ret
-
-    def psskddv():
-        """Check padded cases. SWA excluded — produces wrong gradients on gfx950."""
-        ret = is_v3_atomic_fp32 == True
-        ret &= hdim_q > 64 and hdim_q <= 192
-        ret &= nmask or (mask and seqlen_q == seqlen_k)
-        ret &= not swa
-
-        return ret
-
-    # Basic kernel constraints.
-    ret = alibi_slopes is None
-    ret &= bias is None
-    ret &= dropout_p == 0.0
-    ret &= not deterministic
-    ret &= hdim_q == hdim_v
-    ret &= nhead_q == nhead_k
-    ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-    ret &= np() or pssk() or pddv() or psskddv()
-
-    return ret
-
-
-def can_impl_fmha_v3_bwd_gfx950(
-    dout: jnp.ndarray,
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    dropout_p: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[jnp.ndarray],
-    alibi_slopes: Optional[jnp.ndarray],
-    dbias: Optional[jnp.ndarray],
-    deterministic: bool,
-) -> bool:
-    """Check if FMHA v3 backward kernel can be used on gfx950."""
-    _, seqlen_q, nhead_q, hdim_q = q.shape
-    _, seqlen_k, nhead_k, hdim_v = v.shape
-
-    # Normalize window sizes.
-    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
-    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    swa = (window_size_left > 0) or (window_size_right > 0)
-
-    # Single block for sk <= 256 is deterministic.
-    is_950_1block = (
-        get_gfx() == "gfx950"
-        and seqlen_k <= 256
-        and hdim_q > 64
-        and hdim_q <= 128
-        and hdim_q % 8 == 0
-        and not swa
-    )
-
-    ret = get_gfx() == "gfx950"
-    ret &= alibi_slopes is None
-    ret &= bias is None
-    ret &= dbias is None
-    ret &= dropout_p == 0.0
-    ret &= not deterministic or is_950_1block
-    ret &= hdim_q == hdim_v
-    ret &= nhead_q == nhead_k
-    ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
-    ret &= not swa
-    if causal:
-        ret &= seqlen_q <= seqlen_k
-
-    return ret
-
-
-def _cached_mha_fwd_call(
-    out_shape,
-    softmax_lse_shape,
-    p_shape,
-    rng_state_shape,
-    out_dtype,
-):
-    """Create JIT-compiled FFI call for standard MHA forward kernel."""
+def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, rng_shape, dtype):
     call = jax.ffi.ffi_call(
-        "MhaFwdJA",
+        "MhaFwdUnifiedJA",
         (
-            jax.ShapeDtypeStruct(out_shape, out_dtype),
-            jax.ShapeDtypeStruct(softmax_lse_shape, jnp.float32),
+            jax.ShapeDtypeStruct(out_shape, dtype),
+            jax.ShapeDtypeStruct(lse_shape, jnp.float32),
             jax.ShapeDtypeStruct(p_shape, jnp.uint8),
-            jax.ShapeDtypeStruct(rng_state_shape, jnp.int64),
+            jax.ShapeDtypeStruct(rng_shape, jnp.int64),
         ),
         vmap_method="broadcast_all",
     )
 
-    def _invoke(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        out_provided,
-        bias,
-        alibi_slopes,
-        gen,
-        *,
-        dropout_p,
-        softmax_scale,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        return_softmax_lse,
-        return_dropout_randval,
-    ):
-        result = call(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            out_provided,
-            bias,
-            alibi_slopes,
-            gen,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            return_softmax_lse=return_softmax_lse,
-            return_dropout_randval=return_dropout_randval,
-        )
+    def _invoke(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, *,
+                dropout_p, softmax_scale, is_causal, wl, wr,
+                return_lse, return_randval, use_asm_v3, how_v3_bf16_cvt,
+                max_seqlen_q_attr, max_seqlen_k_attr, min_seqlen_q,
+                logits_soft_cap, zero_tensors):
+        return call(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
+                    dropout_p=dropout_p, softmax_scale=softmax_scale,
+                    is_causal=is_causal, window_size_left=wl, window_size_right=wr,
+                    return_softmax_lse=return_lse,
+                    return_dropout_randval=return_randval,
+                    use_asm_v3=use_asm_v3, how_v3_bf16_cvt=how_v3_bf16_cvt,
+                    max_seqlen_q_attr=max_seqlen_q_attr,
+                    max_seqlen_k_attr=max_seqlen_k_attr,
+                    min_seqlen_q=min_seqlen_q,
+                    logits_soft_cap=logits_soft_cap,
+                    zero_tensors=zero_tensors)
 
-        return result
-
-    return jax.jit(
-        _invoke,
-        static_argnames=(
-            "dropout_p",
-            "softmax_scale",
-            "is_causal",
-            "window_size_left",
-            "window_size_right",
-            "return_softmax_lse",
-            "return_dropout_randval",
-        ),
-    )
+    return jax.jit(_invoke, static_argnames=(
+        "dropout_p", "softmax_scale", "is_causal", "wl", "wr",
+        "return_lse", "return_randval", "use_asm_v3", "how_v3_bf16_cvt",
+        "max_seqlen_q_attr", "max_seqlen_k_attr", "min_seqlen_q",
+        "logits_soft_cap", "zero_tensors"))
 
 
-def _cached_fmha_v3_fwd_call(
-    out_shape,
-    softmax_lse_shape,
-    p_shape,
-    rng_state_shape,
-    out_dtype,
-):
-    """Create JIT-compiled FFI call for FMHA v3 forward kernel."""
+# ---------------------------------------------------------------------------
+# Unified backward FFI wrapper
+# ---------------------------------------------------------------------------
+
+def _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape, sd_shape, dbias_shape, dtype):
     call = jax.ffi.ffi_call(
-        "FmhaV3FwdJA",
+        "MhaBwdUnifiedJA",
         (
-            jax.ShapeDtypeStruct(out_shape, out_dtype),
-            jax.ShapeDtypeStruct(softmax_lse_shape, jnp.float32),
-            jax.ShapeDtypeStruct(p_shape, jnp.uint8),
-            jax.ShapeDtypeStruct(rng_state_shape, jnp.int64),
+            jax.ShapeDtypeStruct(dq_shape, dtype),
+            jax.ShapeDtypeStruct(dk_shape, dtype),
+            jax.ShapeDtypeStruct(dv_shape, dtype),
+            jax.ShapeDtypeStruct(sd_shape, jnp.float32),
+            jax.ShapeDtypeStruct(dbias_shape, dtype),
         ),
         vmap_method="broadcast_all",
     )
 
-    def _invoke(
-        q,
-        k,
-        v,
-        out_provided,
-        bias,
-        alibi_slopes,
-        gen,
-        *,
-        dropout_p,
-        softmax_scale,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        return_softmax_lse,
-        return_dropout_randval,
-    ):
-        result = call(
-            q,
-            k,
-            v,
-            out_provided,
-            bias,
-            alibi_slopes,
-            gen,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            return_softmax_lse=return_softmax_lse,
-            return_dropout_randval=return_dropout_randval,
-        )
+    def _invoke(dout, q, k, v, out, lse, cu_sq, cu_sk,
+                dq, dk, dv, bias, alibi, rng, gen, *,
+                dropout_p, softmax_scale, is_causal, wl, wr,
+                deterministic, use_asm_v3, is_v3_atomic_fp32, how_v3_bf16_cvt,
+                max_seqlen_q_attr, max_seqlen_k_attr, zero_tensors):
+        return call(dout, q, k, v, out, lse, cu_sq, cu_sk,
+                    dq, dk, dv, bias, alibi, rng, gen,
+                    dropout_p=dropout_p, softmax_scale=softmax_scale,
+                    is_causal=is_causal, window_size_left=wl, window_size_right=wr,
+                    deterministic=deterministic, use_asm_v3=use_asm_v3,
+                    is_v3_atomic_fp32=is_v3_atomic_fp32,
+                    how_v3_bf16_cvt=how_v3_bf16_cvt,
+                    max_seqlen_q_attr=max_seqlen_q_attr,
+                    max_seqlen_k_attr=max_seqlen_k_attr,
+                    zero_tensors=zero_tensors)
 
-        return result
-
-    return jax.jit(
-        _invoke,
-        static_argnames=(
-            "dropout_p",
-            "softmax_scale",
-            "is_causal",
-            "window_size_left",
-            "window_size_right",
-            "return_softmax_lse",
-            "return_dropout_randval",
-        ),
-    )
+    return jax.jit(_invoke, static_argnames=(
+        "dropout_p", "softmax_scale", "is_causal", "wl", "wr",
+        "deterministic", "use_asm_v3", "is_v3_atomic_fp32", "how_v3_bf16_cvt",
+        "max_seqlen_q_attr", "max_seqlen_k_attr", "zero_tensors"))
 
 
-def _cached_mha_bwd_call(
-    dq_shape,
-    dk_shape,
-    dv_shape,
-    softmax_d_shape,
-    dbias_shape,
-    grad_dtype,
-):
-    """Create JIT-compiled FFI call for standard MHA backward kernel."""
-    call = jax.ffi.ffi_call(
-        "MhaBwdJA",
-        (
-            jax.ShapeDtypeStruct(dq_shape, grad_dtype),
-            jax.ShapeDtypeStruct(dk_shape, grad_dtype),
-            jax.ShapeDtypeStruct(dv_shape, grad_dtype),
-            jax.ShapeDtypeStruct(softmax_d_shape, jnp.float32),
-            jax.ShapeDtypeStruct(dbias_shape, grad_dtype),
-        ),
-        vmap_method="broadcast_all",
-    )
+# ---------------------------------------------------------------------------
+# Forward: single call to aiter::mha_fwd (AITER handles CK vs ASM)
+# ---------------------------------------------------------------------------
 
-    def _invoke(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        bias,
-        alibi_slopes,
-        rng_state,
-        gen,
-        *,
-        dropout_p,
-        softmax_scale,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        deterministic,
-    ):
-        result = call(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            bias,
-            alibi_slopes,
-            rng_state,
-            gen,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            deterministic=deterministic,
-        )
+def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
+                    wl, wr, return_lse, return_softmax,
+                    bias=None, alibi_slopes=None,
+                    cu_seqlens_q=None, cu_seqlens_kv=None, gen=None,
+                    max_seqlen_q=-1, max_seqlen_k=-1, min_seqlen_q=0,
+                    logits_soft_cap=0.0, zero_tensors=False):
+    """Unified forward for both batch (4D q) and varlen (3D q)."""
+    _ensure_registered("MhaFwdUnifiedJA")
 
-        return result
+    is_varlen = (q.ndim == 3)
 
-    return jax.jit(
-        _invoke,
-        static_argnames=(
-            "dropout_p",
-            "softmax_scale",
-            "is_causal",
-            "window_size_left",
-            "window_size_right",
-            "deterministic",
-        ),
-    )
+    if is_varlen:
+        total_q, hq, dq = q.shape
+        _, hk, dv = v.shape
+        batch_size = cu_seqlens_q.shape[0] - 1
+        out_shape = (total_q, hq, dv)
+        lse_shape = (hq, max_seqlen_q) if return_lse else (0,)
+        p_shape = (0,)
+    else:
+        b, sq, hq, dq = q.shape
+        _, sk, hk, dv = v.shape
+        out_shape = (b, sq, hq, dv)
+        lse_shape = (b, hq, sq) if return_lse else (0,)
+        p_shape = (b, hq, sq, sk) if (return_softmax and dropout_p > 0) else (0,)
 
-
-def _cached_fmha_v3_bwd_call(
-    dq_shape,
-    dk_shape,
-    dv_shape,
-    softmax_d_shape,
-    grad_dtype,
-):
-    """Create JIT-compiled FFI call for FMHA v3 backward kernel."""
-    call = jax.ffi.ffi_call(
-        "FmhaV3BwdJA",
-        (
-            jax.ShapeDtypeStruct(dq_shape, grad_dtype),
-            jax.ShapeDtypeStruct(dk_shape, grad_dtype),
-            jax.ShapeDtypeStruct(dv_shape, grad_dtype),
-            jax.ShapeDtypeStruct(softmax_d_shape, jnp.float32),
-        ),
-        vmap_method="broadcast_all",
-    )
-
-    def _invoke(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        alibi_slopes,
-        rng_state,
-        gen,
-        *,
-        dropout_p,
-        softmax_scale,
-        is_causal,
-        window_size_left,
-        window_size_right,
-        deterministic,
-        is_v3_atomic_fp32,
-        how_v3_bf16_cvt,
-    ):
-        result = call(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            alibi_slopes,
-            rng_state,
-            gen,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            is_causal=is_causal,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            deterministic=deterministic,
-            is_v3_atomic_fp32=is_v3_atomic_fp32,
-            how_v3_bf16_cvt=how_v3_bf16_cvt,
-        )
-
-        return result
-
-    return jax.jit(
-        _invoke,
-        static_argnames=(
-            "dropout_p",
-            "softmax_scale",
-            "is_causal",
-            "window_size_left",
-            "window_size_right",
-            "deterministic",
-            "is_v3_atomic_fp32",
-            "how_v3_bf16_cvt",
-        ),
-    )
-
-
-def mha_fwd(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[jnp.ndarray] = None,
-    bias: Optional[jnp.ndarray] = None,
-    alibi_slopes: Optional[jnp.ndarray] = None,
-    cu_seqlens_q: Optional[jnp.ndarray] = None,
-    cu_seqlens_kv: Optional[jnp.ndarray] = None,
-    gen: Optional[jnp.ndarray] = None,
-) -> List[jnp.ndarray]:
-    """Standard MHA forward kernel with support for bias and dropout."""
-    _ensure_ffi_target_registered("MhaFwdJA")
-
-    batch_size, seqlen_q, num_heads, head_size_q = q.shape
-    _, seqlen_k, num_heads_k, head_size_v = (
-        k.shape[0],
-        k.shape[1],
-        k.shape[2],
-        v.shape[3],
-    )
-
-    # Handle optional tensors.
-    if out is None:
-        out = _empty_tensor(q.dtype)
-    if bias is None:
-        bias = _empty_tensor(jnp.float32)
-    if alibi_slopes is None:
-        alibi_slopes = _empty_tensor(jnp.float32)
     if cu_seqlens_q is None:
-        cu_seqlens_q = _empty_tensor(jnp.int32)
+        cu_seqlens_q = _empty(jnp.int32)
     if cu_seqlens_kv is None:
-        cu_seqlens_kv = _empty_tensor(jnp.int32)
-    if gen is None:
-        gen = _empty_tensor(jnp.int64)
-
-    # Output shapes for MhaFwdJA.
-    out_shape = (batch_size, seqlen_q, num_heads, head_size_v)
-    softmax_lse_shape = (batch_size, num_heads, seqlen_q)
-    p_shape = (batch_size, num_heads, seqlen_q, seqlen_k)
-    rng_state_shape = (2,)
-
-    fn = _cached_mha_fwd_call(
-        out_shape,
-        softmax_lse_shape,
-        p_shape,
-        rng_state_shape,
-        q.dtype,
-    )
-
-    results = fn(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        out,
-        bias,
-        alibi_slopes,
-        gen,
-        dropout_p=_static_float(dropout_p),
-        softmax_scale=_static_float(softmax_scale),
-        is_causal=is_causal,
-        window_size_left=_static_int(window_size_left),
-        window_size_right=_static_int(window_size_right),
-        return_softmax_lse=return_softmax_lse,
-        return_dropout_randval=return_dropout_randval,
-    )
-
-    # Convert to list for consistency.
-    return list(results)
-
-
-def fmha_v3_fwd(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[jnp.ndarray] = None,
-    bias: Optional[jnp.ndarray] = None,
-    alibi_slopes: Optional[jnp.ndarray] = None,
-    gen: Optional[jnp.ndarray] = None,
-) -> List[jnp.ndarray]:
-    """FMHA v3 forward kernel optimized for bf16, head_dim=128, no bias/dropout."""
-    _ensure_ffi_target_registered("FmhaV3FwdJA")
-
-    batch_size, seqlen_q, num_heads_q, head_size_q = q.shape
-    _, seqlen_k, num_heads_v, head_size_v = v.shape
-    _, seqlen_k, num_heads_k, _ = k.shape
-
-    # Handle optional tensors.
-    if out is None:
-        out = _empty_tensor(q.dtype)
+        cu_seqlens_kv = _empty(jnp.int32)
     if bias is None:
-        bias = _empty_tensor(jnp.float32)
+        bias = _empty(q.dtype)
     if alibi_slopes is None:
-        alibi_slopes = _empty_tensor(jnp.float32)
+        alibi_slopes = _empty(jnp.float32)
     if gen is None:
-        gen = _empty_tensor(jnp.int64)
+        gen = _empty(jnp.int64)
 
-    # Output shapes.
-    out_shape = (batch_size, seqlen_q, num_heads_q, head_size_v)
-    softmax_lse_shape = (batch_size, num_heads_q, seqlen_q)
-    p_shape = (batch_size, num_heads_q, seqlen_q, seqlen_k)
-    rng_state_shape = (2,)
+    rng_shape = (2,)
+    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
 
-    fn = _cached_fmha_v3_fwd_call(
-        out_shape,
-        softmax_lse_shape,
-        p_shape,
-        rng_state_shape,
-        q.dtype,
-    )
-
-    results = fn(
-        q,
-        k,
-        v,
-        out,
-        bias,
-        alibi_slopes,
-        gen,
-        dropout_p=_static_float(dropout_p),
-        softmax_scale=_static_float(softmax_scale),
-        is_causal=is_causal,
-        window_size_left=_static_int(window_size_left),
-        window_size_right=_static_int(window_size_right),
-        return_softmax_lse=return_softmax_lse,
-        return_dropout_randval=return_dropout_randval,
-    )
-
-    return list(results)
+    fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape, rng_shape, q.dtype)
+    return fn(q, k, v, cu_seqlens_q, cu_seqlens_kv, _empty(q.dtype),
+              bias, alibi_slopes, gen,
+              dropout_p=_sf(dropout_p), softmax_scale=_sf(softmax_scale),
+              is_causal=causal, wl=_si(wl), wr=_si(wr),
+              return_lse=return_lse, return_randval=(return_softmax and dropout_p > 0),
+              use_asm_v3=True, how_v3_bf16_cvt=_si(bf16_cvt),
+              max_seqlen_q_attr=_si(max_seqlen_q), max_seqlen_k_attr=_si(max_seqlen_k),
+              min_seqlen_q=_si(min_seqlen_q), logits_soft_cap=_sf(logits_soft_cap),
+              zero_tensors=zero_tensors)
 
 
-def mha_bwd(
-    dout: jnp.ndarray,
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    out: jnp.ndarray,
-    softmax_lse: jnp.ndarray,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[jnp.ndarray] = None,
-    dk: Optional[jnp.ndarray] = None,
-    dv: Optional[jnp.ndarray] = None,
-    dbias: Optional[jnp.ndarray] = None,
-    bias: Optional[jnp.ndarray] = None,
-    alibi_slopes: Optional[jnp.ndarray] = None,
-    rng_state: Optional[jnp.ndarray] = None,
-    gen: Optional[jnp.ndarray] = None,
-) -> List[jnp.ndarray]:
-    """Standard MHA backward kernel with support for bias gradients."""
-    _ensure_ffi_target_registered("MhaBwdJA")
+def mha_bwd_unified(dout, q, k, v, out, lse, dropout_p, softmax_scale,
+                    causal, wl, wr, deterministic,
+                    use_asm_v3, is_v3_atomic_fp32, how_v3_bf16_cvt,
+                    bias=None, alibi_slopes=None, rng_state=None,
+                    cu_seqlens_q=None, cu_seqlens_k=None,
+                    max_seqlen_q=-1, max_seqlen_k=-1, zero_tensors=False):
+    """Unified backward for both batch (4D q) and varlen (3D q)."""
+    _ensure_registered("MhaBwdUnifiedJA")
 
-    batch_size, seqlen_q, num_heads, head_size_q = q.shape
-    _, seqlen_k, num_heads_k, _ = k.shape
-    head_size_v = v.shape[-1]
+    is_varlen = (q.ndim == 3)
 
-    # Handle optional tensors
-    if dq is None:
-        dq = _empty_tensor(q.dtype)
-    if dk is None:
-        dk = _empty_tensor(k.dtype)
-    if dv is None:
-        dv = _empty_tensor(v.dtype)
+    if is_varlen:
+        total_q, hq, dq = q.shape
+        _, hk, _ = k.shape
+        dv_dim = v.shape[-1]
+        total_k = k.shape[0]
+        dq_shape = (total_q, hq, dq)
+        dk_shape = (total_k, hk, dq)
+        dv_shape = (total_k, hk, dv_dim)
+        sd_shape = (hq, max_seqlen_q)
+        dbias_shape = (0,)
+    else:
+        b, sq, hq, dq = q.shape
+        _, sk, hk, _ = k.shape
+        dv_dim = v.shape[-1]
+        dq_shape = (b, sq, hq, dq)
+        dk_shape = (b, sk, hk, dq)
+        dv_shape = (b, sk, hk, dv_dim)
+        sd_shape = (b, hq, sq)
+        dbias_shape = (b, sq, hq, sk) if (bias is not None and bias.size > 0) else (0,)
+
+    if cu_seqlens_q is None:
+        cu_seqlens_q = _empty(jnp.int32)
+    if cu_seqlens_k is None:
+        cu_seqlens_k = _empty(jnp.int32)
     if bias is None:
-        bias = _empty_tensor(jnp.float32)
+        bias = _empty(q.dtype)
     if alibi_slopes is None:
-        alibi_slopes = _empty_tensor(jnp.float32)
+        alibi_slopes = _empty(jnp.float32)
     if rng_state is None:
-        rng_state = _empty_tensor(jnp.int64)
-    if gen is None:
-        gen = _empty_tensor(jnp.int64)
+        rng_state = _empty(jnp.int64)
 
-    has_bias = bias is not None and bias.size > 0
+    fn = _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape, sd_shape, dbias_shape, q.dtype)
+    results = fn(dout, q, k, v, out, lse,
+                 cu_seqlens_q, cu_seqlens_k,
+                 _empty(q.dtype), _empty(q.dtype), _empty(q.dtype),
+                 bias, alibi_slopes, rng_state, _empty(jnp.int64),
+                 dropout_p=_sf(dropout_p), softmax_scale=_sf(softmax_scale),
+                 is_causal=causal, wl=_si(wl), wr=_si(wr),
+                 deterministic=deterministic,
+                 use_asm_v3=use_asm_v3,
+                 is_v3_atomic_fp32=is_v3_atomic_fp32,
+                 how_v3_bf16_cvt=_si(how_v3_bf16_cvt),
+                 max_seqlen_q_attr=_si(max_seqlen_q),
+                 max_seqlen_k_attr=_si(max_seqlen_k),
+                 zero_tensors=zero_tensors)
 
-    # C++ returns dbias_expanded [b,sq,h,sk] which we reduce to [sq,sk] below.
-    dq_shape = (batch_size, seqlen_q, num_heads, head_size_q)
-    dk_shape = (batch_size, seqlen_k, num_heads_k, head_size_q)
-    dv_shape = (batch_size, seqlen_k, num_heads_k, head_size_v)
-    softmax_d_shape = (batch_size, num_heads, seqlen_q)
-    dbias_expanded_shape = (
-        (batch_size, seqlen_q, num_heads, seqlen_k) if has_bias else (0,)
-    )
-
-    fn = _cached_mha_bwd_call(
-        dq_shape,
-        dk_shape,
-        dv_shape,
-        softmax_d_shape,
-        dbias_expanded_shape,
-        q.dtype,
-    )
-
-    results = fn(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        bias,
-        alibi_slopes,
-        rng_state,
-        gen,
-        dropout_p=_static_float(dropout_p),
-        softmax_scale=_static_float(softmax_scale),
-        is_causal=is_causal,
-        window_size_left=_static_int(window_size_left),
-        window_size_right=_static_int(window_size_right),
-        deterministic=deterministic,
-    )
-
-    dq_out, dk_out, dv_out, softmax_d_out, dbias_expanded = results
-
-    # Reduce dbias_expanded: sum over batch and heads to get final [sq,sk] shape.
-    if has_bias and dbias_expanded.size > 0:
+    dq_out, dk_out, dv_out, sd_out, dbias_expanded = results
+    if not is_varlen and bias is not None and dbias_expanded.size > 0:
         dbias_out = jnp.sum(dbias_expanded, axis=(0, 2))
     else:
         dbias_out = dbias_expanded
-
-    return [dq_out, dk_out, dv_out, softmax_d_out, dbias_out]
-
-
-def fmha_v3_bwd(
-    dout: jnp.ndarray,
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    out: jnp.ndarray,
-    softmax_lse: jnp.ndarray,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    is_v3_atomic_fp32: bool,
-    how_v3_bf16_cvt: int,
-    dq: Optional[jnp.ndarray] = None,
-    dk: Optional[jnp.ndarray] = None,
-    dv: Optional[jnp.ndarray] = None,
-    dbias: Optional[jnp.ndarray] = None,
-    bias: Optional[jnp.ndarray] = None,
-    alibi_slopes: Optional[jnp.ndarray] = None,
-    rng_state: Optional[jnp.ndarray] = None,
-    gen: Optional[jnp.ndarray] = None,
-) -> List[jnp.ndarray]:
-    """FMHA v3 backward kernel optimized for bf16, no bias gradient support."""
-    _ensure_ffi_target_registered("FmhaV3BwdJA")
-
-    batch_size, seqlen_q, num_heads, head_size_q = q.shape
-    _, seqlen_k, num_heads_k, _ = k.shape
-    head_size_v = v.shape[-1]
-
-    # Handle optional tensors.
-    if dq is None:
-        dq = _empty_tensor(q.dtype)
-    if dk is None:
-        dk = _empty_tensor(k.dtype)
-    if dv is None:
-        dv = _empty_tensor(v.dtype)
-    if alibi_slopes is None:
-        alibi_slopes = _empty_tensor(jnp.float32)
-    if rng_state is None:
-        rng_state = _empty_tensor(jnp.int64)
-    if gen is None:
-        gen = _empty_tensor(jnp.int64)
-
-    # Output shapes - always allocate full tensors to avoid null buffer issues.
-    dq_shape = (batch_size, seqlen_q, num_heads, head_size_q)
-    dk_shape = (batch_size, seqlen_k, num_heads_k, head_size_q)
-    dv_shape = (batch_size, seqlen_k, num_heads_k, head_size_v)
-    softmax_d_shape = (batch_size, num_heads, seqlen_q)
-
-    fn = _cached_fmha_v3_bwd_call(
-        dq_shape,
-        dk_shape,
-        dv_shape,
-        softmax_d_shape,
-        q.dtype,
-    )
-
-    return fn(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dq,
-        dk,
-        dv,
-        alibi_slopes,
-        rng_state,
-        gen,
-        dropout_p=_static_float(dropout_p),
-        softmax_scale=_static_float(softmax_scale),
-        is_causal=is_causal,
-        window_size_left=_static_int(window_size_left),
-        window_size_right=_static_int(window_size_right),
-        deterministic=deterministic,
-        is_v3_atomic_fp32=is_v3_atomic_fp32,
-        how_v3_bf16_cvt=_static_int(how_v3_bf16_cvt),
-    )
+    return [dq_out, dk_out, dv_out, sd_out, dbias_out]
 
 
-def _flash_attn_forward(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[jnp.ndarray],
-    alibi_slopes: Optional[jnp.ndarray],
-    return_lse: bool,
-    return_softmax: bool,
-    cu_seqlens_q: Optional[jnp.ndarray] = None,
-    cu_seqlens_kv: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Forward pass with automatic kernel selection and window size normalization."""
-    _, seqlen_q, nhead_q, hdim_q = q.shape
-    _, seqlen_k, nhead_k, hdim_v = v.shape
+# ---------------------------------------------------------------------------
+# Simplified forward/backward dispatch (no can_impl_* logic)
+# ---------------------------------------------------------------------------
 
-    # Normalize window sizes for compatibility.
-    window_size_left, window_size_right = _normalize_window_size(
-        window_size_left, window_size_right, seqlen_k
-    )
+def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal,
+                        wl, wr, bias, alibi_slopes,
+                        return_lse, return_softmax,
+                        cu_seqlens_q=None, cu_seqlens_kv=None):
+    _, sk, _, _ = v.shape
+    if wl >= sk: wl = -1
+    if wr >= sk: wr = -1
 
-    # Use MHA kernel when cu_seqlens provided.
-    has_padding = cu_seqlens_q is not None and cu_seqlens_kv is not None
-
-    # Select optimal kernel.
-    can_use_v3 = (
-        False
-        if has_padding
-        else _can_impl_fmha_v3_fwd(
-            q,
-            k,
-            v,
-            dropout_p,
-            seqlen_q,
-            seqlen_k,
-            hdim_q,
-            hdim_v,
-            nhead_q,
-            nhead_k,
-            alibi_slopes,
-            bias,
-            window_size_left,
-            window_size_right,
-            return_lse,
-        )
-    )
-
-    # Prefer CK kernel for decode cases.
-    if can_use_v3 and seqlen_q > 128 and not has_padding:
-        result = fmha_v3_fwd(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            return_lse,
-            return_softmax,
-            None,  # out
-            bias,
-            alibi_slopes,
-            None,  # gen
-        )
-    else:
-        result = mha_fwd(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            return_lse,
-            return_softmax,
-            None,  # out
-            bias,
-            alibi_slopes,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            None,  # gen
-        )
-
+    result = mha_fwd_unified(
+        q, k, v, dropout_p, softmax_scale, causal, wl, wr,
+        return_lse, return_softmax,
+        bias=bias, alibi_slopes=alibi_slopes,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
     return result
 
 
-def _flash_attn_backward(
-    dout: jnp.ndarray,
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
-    out: jnp.ndarray,
-    softmax_lse: jnp.ndarray,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[jnp.ndarray],
-    alibi_slopes: Optional[jnp.ndarray],
-    deterministic: bool,
-    rng_state: Optional[jnp.ndarray] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray]]:
-    """Backward pass with automatic kernel selection and bias gradient support.
+def _flash_attn_backward(dout, q, k, v, out, lse,
+                         dropout_p, softmax_scale, causal, wl, wr,
+                         bias, alibi_slopes, deterministic,
+                         rng_state=None):
+    _, sq, hq, dq = q.shape
+    _, sk, hk, _ = k.shape
 
-    Returns: (dq, dk, dv, softmax_d, dbias) - dbias is None if no bias provided.
-    """
-    # gfx950: rtna/rtz bf16 conversion modes deprecated.
-    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
-        how_v3_bf16_cvt = 0
+    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
 
-    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
-        dout,
-        q,
-        k,
-        v,
-        jnp.empty_like(k),
-        jnp.empty_like(v),
-        (jnp.empty_like(bias) if bias is not None else None),
-        dropout_p,
-        causal,
-        window_size_left,
-        window_size_right,
-        bias,
-        alibi_slopes,
-        deterministic,
-        is_v3_atomic_fp32,
+    # v3 eligibility: exclude known-broken configs.
+    swa = (wl > 0) or (wr >= 0 and wr != -1)
+    use_v3 = True
+    if dropout_p > 0:
+        use_v3 = False
+    if hq != hk:
+        use_v3 = False
+    if bias is not None and bias.size > 0:
+        use_v3 = False
+    if swa:
+        use_v3 = False
+    if causal and get_gfx() == "gfx950" and sq > sk:
+        use_v3 = False
+
+    # gfx950 1-block override: sk<=256 with hd in (64,128]
+    is_950_1block = (
+        get_gfx() == "gfx950" and sk <= 256
+        and dq > 64 and dq <= 128 and dq % 8 == 0
     )
+    bwd_det = False if is_950_1block else deterministic
+    bwd_atomic = False if is_950_1block else use_v3
 
-    # Check gfx950 path.
-    can_impl_fmha_v3_bwd_ |= can_impl_fmha_v3_bwd_gfx950(
-        dout,
-        q,
-        k,
-        v,
-        dropout_p,
-        causal,
-        window_size_left,
-        window_size_right,
-        bias,
-        alibi_slopes,
-        (jnp.empty_like(bias) if bias is not None else None),
-        deterministic,
-    )
+    results = mha_bwd_unified(
+        dout, q, k, v, out, lse,
+        dropout_p, softmax_scale, causal, wl, wr,
+        bwd_det, use_v3, bwd_atomic, bf16_cvt,
+        bias=bias, alibi_slopes=alibi_slopes, rng_state=rng_state)
 
-    # Use v3 backward for seqlen_q > 16.
-    seqlen_q = int(q.shape[1])
-    if can_impl_fmha_v3_bwd_ and seqlen_q > 16:
-        log.info("Using FMHA v3 backward kernel")
-        results = fmha_v3_bwd(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            deterministic,
-            is_v3_atomic_fp32,
-            how_v3_bf16_cvt,
-            None,  # dq
-            None,  # dk
-            None,  # dv
-            None,  # dbias - v3 doesn't support
-            bias,
-            alibi_slopes,
-            rng_state,
-            None,  # gen
-        )
-        return results[0], results[1], results[2], results[3], None
-    else:
-        log.info("Using MHA backward kernel")
-        results = mha_bwd(
-            dout,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dropout_p,
-            softmax_scale,
-            causal,
-            window_size_left,
-            window_size_right,
-            deterministic,
-            None,  # dq
-            None,  # dk
-            None,  # dv
-            None,  # dbias
-            bias,
-            alibi_slopes,
-            rng_state,
-            None,  # gen
-        )
-        return results
+    return results[0], results[1], results[2], results[3], results[4]
 
 
-# Public API functions with custom VJP for autodiff.
+# ---------------------------------------------------------------------------
+# Public API: flash_attn_func with custom_vjp
+# ---------------------------------------------------------------------------
+
 @partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 9, 10, 11, 12, 13))
 def flash_attn_func(
     q: jnp.ndarray,
@@ -1176,285 +319,280 @@ def flash_attn_func(
     cu_seqlens_q: Optional[jnp.ndarray] = None,
     cu_seqlens_kv: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
-    """dropout_p should be set to 0.0 during evaluation
-    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
-    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
-    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
-    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+    """Flash attention with automatic CK/ASM v3 dispatch via AITER.
 
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-        1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
-
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between
-    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
-
-    Arguments:
-        q: (batch_size, seqlen, nheads, headdim_q)
-        k: (batch_size, seqlen, nheads_k, headdim_q)
-        v: (batch_size, seqlen, nheads_k, headdim_v)
-        dropout_p: float. Dropout probability.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim_q).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        bias: (seqlen_q, seqlen_k)
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
-        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
-            which is slightly slower and uses more memory. The forward pass is always deterministic.
-        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
-           testing only. The returned probabilities are not guaranteed to be correct
-           (they might not have the right scaling).
-    Return:
-        out: (batch_size, seqlen, nheads, headdim_v).
-        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
-        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
-            The output of softmax (possibly with different scaling). It also encodes the dropout
-            pattern (negative means that location was dropped, nonnegative means it was kept).
+    Args:
+        q: (batch, seqlen_q, nheads, headdim_q)
+        k: (batch, seqlen_k, nheads_k, headdim_q)
+        v: (batch, seqlen_k, nheads_k, headdim_v)
+        dropout_p: Dropout probability (0.0 during eval).
+        softmax_scale: Scaling factor (default: 1/sqrt(headdim_q)).
+        causal: Apply causal mask (bottom-right aligned).
+        window_size: (left, right) for sliding window attention.
+        bias: (seqlen_q, seqlen_k) attention bias.
+        alibi_slopes: (nheads,) or (batch, nheads) ALiBi slopes.
+        deterministic: Use deterministic backward (slower, more memory).
+        return_lse: Return log-sum-exp values.
+        return_attn_probs: Return attention probabilities (testing only).
+    Returns:
+        out: (batch, seqlen_q, nheads, headdim_v), or tuple if return_lse/return_attn_probs.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    head_size_q_og = q.shape[3]
-    head_size_v_og = v.shape[3]
+    hd_q_og = q.shape[3]
+    hd_v_og = v.shape[3]
 
-    # Pad head dimensions to multiples of 8.
-    q_padded, k_padded, v_padded = q, k, v
-    if head_size_q_og % 8 != 0:
-        pad_q = 8 - head_size_q_og % 8
-        q_padded = jnp.pad(q, ((0, 0), (0, 0), (0, 0), (0, pad_q)))
-        k_padded = jnp.pad(k, ((0, 0), (0, 0), (0, 0), (0, pad_q)))
-    if head_size_v_og % 8 != 0:
-        pad_v = 8 - head_size_v_og % 8
-        v_padded = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad_v)))
+    q_p, k_p, v_p = q, k, v
+    if hd_q_og % 8 != 0:
+        pad = 8 - hd_q_og % 8
+        q_p = jnp.pad(q, ((0, 0), (0, 0), (0, 0), (0, pad)))
+        k_p = jnp.pad(k, ((0, 0), (0, 0), (0, 0), (0, pad)))
+    if hd_v_og % 8 != 0:
+        pad = 8 - hd_v_og % 8
+        v_p = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad)))
 
-    # Normalize window sizes for consistency.
-    seqlen_k = k_padded.shape[1]
-    wl_norm, wr_norm = _normalize_window_size(window_size[0], window_size[1], seqlen_k)
+    sk = k_p.shape[1]
+    wl = -1 if window_size[0] >= sk else window_size[0]
+    wr = -1 if window_size[1] >= sk else window_size[1]
 
-    # Call forward kernel.
-    out_padded, softmax_lse, S_dmask, _ = _flash_attn_forward(
-        q_padded,
-        k_padded,
-        v_padded,
-        dropout_p,
-        softmax_scale,
-        causal=causal,
-        window_size_left=wl_norm,
-        window_size_right=wr_norm,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
+    out_p, lse, s_dmask, _ = _flash_attn_forward(
+        q_p, k_p, v_p, dropout_p, softmax_scale,
+        causal=causal, wl=wl, wr=wr,
+        bias=bias, alibi_slopes=alibi_slopes,
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=cu_seqlens_kv,
-    )
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
 
-    # Unpad output.
-    out = out_padded[..., :head_size_v_og]
-
+    out = out_p[..., :hd_v_og]
     result = [out]
     if return_lse:
-        result.append(softmax_lse)
+        result.append(lse)
     if return_attn_probs:
-        result.append(S_dmask)
-
+        result.append(s_dmask)
     return tuple(result)
 
 
-def _flash_attn_func_fwd(
-    q: jnp.ndarray,
-    k: jnp.ndarray,
-    v: jnp.ndarray,
+def _flash_attn_func_fwd(q, k, v,
+                         dropout_p=0.0, softmax_scale=None, causal=False,
+                         window_size=(-1, -1), bias=None, alibi_slopes=None,
+                         deterministic=True, return_lse=False,
+                         return_attn_probs=False,
+                         cu_seqlens_q=None, cu_seqlens_kv=None):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    hd_q_og = q.shape[3]
+    hd_v_og = v.shape[3]
+
+    q_p, k_p, v_p = q, k, v
+    if hd_q_og % 8 != 0:
+        pad = 8 - hd_q_og % 8
+        q_p = jnp.pad(q, ((0, 0), (0, 0), (0, 0), (0, pad)))
+        k_p = jnp.pad(k, ((0, 0), (0, 0), (0, 0), (0, pad)))
+    if hd_v_og % 8 != 0:
+        pad = 8 - hd_v_og % 8
+        v_p = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad)))
+
+    sk = k_p.shape[1]
+    wl = -1 if window_size[0] >= sk else window_size[0]
+    wr = -1 if window_size[1] >= sk else window_size[1]
+
+    out_p, lse, s_dmask, rng_state = _flash_attn_forward(
+        q_p, k_p, v_p, dropout_p, softmax_scale,
+        causal=causal, wl=wl, wr=wr,
+        bias=bias, alibi_slopes=alibi_slopes,
+        return_lse=True, return_softmax=return_attn_probs and dropout_p > 0,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
+
+    out = out_p[..., :hd_v_og]
+    result = [out]
+    if return_lse:
+        result.append(lse)
+    if return_attn_probs:
+        result.append(s_dmask)
+    result = tuple(result)
+
+    residuals = (q_p, k_p, v_p, out_p, lse, rng_state,
+                 dropout_p, softmax_scale, causal, (wl, wr),
+                 bias, alibi_slopes, deterministic, hd_q_og, hd_v_og)
+    return result, residuals
+
+
+def _flash_attn_func_bwd(dropout_p, softmax_scale, causal, window_size,
+                         deterministic, return_lse, return_attn_probs,
+                         cu_seqlens_q, cu_seqlens_kv,
+                         residuals, grad_outputs):
+    (q_p, k_p, v_p, out_p, lse, rng_state,
+     res_dp, res_scale, res_causal, res_ws,
+     res_bias, res_alibi, res_det, hd_q_og, hd_v_og) = residuals
+
+    dout = grad_outputs[0] if isinstance(grad_outputs, tuple) else grad_outputs
+    if dout.shape[-1] != out_p.shape[-1]:
+        pad = out_p.shape[-1] - dout.shape[-1]
+        dout = jnp.pad(dout, ((0, 0), (0, 0), (0, 0), (0, pad)))
+
+    dq_p, dk_p, dv_p, _, dbias = _flash_attn_backward(
+        dout, q_p, k_p, v_p, out_p, lse,
+        res_dp, res_scale, res_causal, res_ws[0], res_ws[1],
+        res_bias, res_alibi, res_det, rng_state)
+
+    dq = dq_p[..., :hd_q_og]
+    dk = dk_p[..., :hd_q_og]
+    dv = dv_p[..., :hd_v_og]
+
+    return (dq, dk, dv, dbias, None)
+
+
+flash_attn_func.defvjp(_flash_attn_func_fwd, _flash_attn_func_bwd)
+
+
+# ---------------------------------------------------------------------------
+# Varlen public API: flash_attn_varlen with custom_vjp
+# ---------------------------------------------------------------------------
+
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11, 12))
+def flash_attn_varlen(
+    q: jnp.ndarray,              # [total_q, nheads, headdim]
+    k: jnp.ndarray,              # [total_k, nheads_k, headdim]
+    v: jnp.ndarray,              # [total_k, nheads_k, headdim_v]
+    cu_seqlens_q: jnp.ndarray,   # [batch_size + 1]
+    cu_seqlens_k: jnp.ndarray,   # [batch_size + 1]
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[int, int] = (-1, -1),
-    bias: Optional[jnp.ndarray] = None,
-    alibi_slopes: Optional[jnp.ndarray] = None,
-    deterministic: bool = True,
+    deterministic: bool = False,
     return_lse: bool = False,
-    return_attn_probs: bool = False,
-    cu_seqlens_q: Optional[jnp.ndarray] = None,
-    cu_seqlens_kv: Optional[jnp.ndarray] = None,
-):
-    """Forward pass that returns both output and residuals for backward pass."""
+) -> jnp.ndarray:
+    """Variable-length flash attention using packed sequences.
+
+    Args:
+        q: [total_q, nheads, headdim] packed query tokens.
+        k: [total_k, nheads_k, headdim] packed key tokens.
+        v: [total_k, nheads_k, headdim_v] packed value tokens.
+        cu_seqlens_q: [batch_size+1] cumulative sequence lengths for Q.
+        cu_seqlens_k: [batch_size+1] cumulative sequence lengths for K.
+        max_seqlen_q: Maximum query sequence length.
+        max_seqlen_k: Maximum key sequence length.
+    Returns:
+        out: [total_q, nheads, headdim_v].
+    """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
-    head_size_q_og = q.shape[3]
-    head_size_v_og = v.shape[3]
+    hd_q_og = q.shape[-1]
+    hd_v_og = v.shape[-1]
 
-    # Pad head dimensions to multiples of 8.
-    q_padded, k_padded, v_padded = q, k, v
-    if head_size_q_og % 8 != 0:
-        pad_q = 8 - head_size_q_og % 8
-        q_padded = jnp.pad(q, ((0, 0), (0, 0), (0, 0), (0, pad_q)))
-        k_padded = jnp.pad(k, ((0, 0), (0, 0), (0, 0), (0, pad_q)))
-    if head_size_v_og % 8 != 0:
-        pad_v = 8 - head_size_v_og % 8
-        v_padded = jnp.pad(v, ((0, 0), (0, 0), (0, 0), (0, pad_v)))
+    q_p, k_p, v_p = q, k, v
+    if hd_q_og % 8 != 0:
+        pad = 8 - hd_q_og % 8
+        q_p = jnp.pad(q, ((0, 0), (0, 0), (0, pad)))
+        k_p = jnp.pad(k, ((0, 0), (0, 0), (0, pad)))
+    if hd_v_og % 8 != 0:
+        pad = 8 - hd_v_og % 8
+        v_p = jnp.pad(v, ((0, 0), (0, 0), (0, pad)))
 
-    seqlen_k = k_padded.shape[1]
-    wl_norm, wr_norm = _normalize_window_size(window_size[0], window_size[1], seqlen_k)
+    wl = window_size[0]
+    wr = window_size[1]
 
-    # Pass normalized concrete values and cu_seqlens to forward.
-    out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
-        q_padded,
-        k_padded,
-        v_padded,
-        dropout_p,
-        softmax_scale,
-        causal=causal,
-        window_size_left=wl_norm,
-        window_size_right=wr_norm,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        return_lse=True,
-        return_softmax=return_attn_probs and dropout_p > 0,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_kv=cu_seqlens_kv,
-    )
+    out_p, lse, _, _ = mha_fwd_unified(
+        q_p, k_p, v_p, dropout_p, softmax_scale, causal, wl, wr,
+        return_lse=return_lse, return_softmax=False,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
 
-    out = out_padded[..., :head_size_v_og]
-
-    result = [out]
+    out = out_p[..., :hd_v_og]
     if return_lse:
-        result.append(softmax_lse)
-    if return_attn_probs:
-        result.append(S_dmask)
+        return (out, lse)
+    return (out,)
 
-    result = tuple(result)
 
-    # Store residuals for backward pass.
-    residuals = (
-        q_padded,
-        k_padded,
-        v_padded,
-        out_padded,
-        softmax_lse,
-        rng_state,
-        dropout_p,
-        softmax_scale,
-        causal,
-        (wl_norm, wr_norm),
-        bias,
-        alibi_slopes,
-        deterministic,
-        head_size_q_og,
-        head_size_v_og,
-    )
+def _flash_attn_varlen_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                           max_seqlen_q, max_seqlen_k, dropout_p,
+                           softmax_scale, causal, window_size,
+                           deterministic, return_lse):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
 
+    hd_q_og = q.shape[-1]
+    hd_v_og = v.shape[-1]
+
+    q_p, k_p, v_p = q, k, v
+    if hd_q_og % 8 != 0:
+        pad = 8 - hd_q_og % 8
+        q_p = jnp.pad(q, ((0, 0), (0, 0), (0, pad)))
+        k_p = jnp.pad(k, ((0, 0), (0, 0), (0, pad)))
+    if hd_v_og % 8 != 0:
+        pad = 8 - hd_v_og % 8
+        v_p = jnp.pad(v, ((0, 0), (0, 0), (0, pad)))
+
+    wl, wr = window_size
+
+    out_p, lse, _, rng_state = mha_fwd_unified(
+        q_p, k_p, v_p, dropout_p, softmax_scale, causal, wl, wr,
+        return_lse=True, return_softmax=False,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k)
+
+    out = out_p[..., :hd_v_og]
+    result = (out, lse) if return_lse else (out,)
+
+    residuals = (q_p, k_p, v_p, out_p, lse, rng_state,
+                 cu_seqlens_q, cu_seqlens_k,
+                 dropout_p, softmax_scale, causal, (wl, wr),
+                 deterministic, hd_q_og, hd_v_og,
+                 max_seqlen_q, max_seqlen_k)
     return result, residuals
 
 
-def _flash_attn_func_bwd(
-    dropout_p,
-    softmax_scale,
-    causal,
-    window_size,
-    deterministic,
-    return_lse,
-    return_attn_probs,
-    cu_seqlens_q,
-    cu_seqlens_kv,
-    residuals,
-    grad_outputs,
-):
-    """Backward pass using residuals and output gradients.
+def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
+                           softmax_scale, causal, window_size,
+                           deterministic, return_lse,
+                           residuals, grad_outputs):
+    (q_p, k_p, v_p, out_p, lse, rng_state,
+     cu_sq, cu_sk, res_dp, res_scale, res_causal, res_ws,
+     res_det, hd_q_og, hd_v_og,
+     res_max_sq, res_max_sk) = residuals
 
-    Note: With nondiff_argnums, non-differentiable arguments come first in the signature.
-    """
-    (
-        q_padded,
-        k_padded,
-        v_padded,
-        out_padded,
-        softmax_lse,
-        rng_state,
-        res_dropout_p,
-        res_softmax_scale,
-        res_causal,
-        res_window_size,
-        res_bias,
-        res_alibi_slopes,
-        res_deterministic,
-        head_size_q_og,
-        head_size_v_og,
-    ) = residuals
+    dout = grad_outputs[0] if isinstance(grad_outputs, tuple) else grad_outputs
+    if dout.shape[-1] != out_p.shape[-1]:
+        pad = out_p.shape[-1] - dout.shape[-1]
+        dout = jnp.pad(dout, ((0, 0), (0, 0), (0, pad)))
 
-    # Extract gradient for main output.
-    if isinstance(grad_outputs, tuple):
-        dout = grad_outputs[0]
-    else:
-        dout = grad_outputs
+    _, _, hq, dq = q_p.shape if q_p.ndim == 4 else (None, None, q_p.shape[1], q_p.shape[2])
+    hk = k_p.shape[1] if k_p.ndim == 3 else k_p.shape[2]
 
-    # Pad gradient to match dimensions.
-    if dout.shape[-1] != out_padded.shape[-1]:
-        pad_v = out_padded.shape[-1] - dout.shape[-1]
-        dout_padded = jnp.pad(dout, ((0, 0), (0, 0), (0, 0), (0, pad_v)))
-    else:
-        dout_padded = dout
+    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
 
-    # gfx950 1-block: sk<=256 with hd in (64,128] is inherently deterministic.
-    seqlen_k_bwd = k_padded.shape[1]
-    hdim_q_bwd = q_padded.shape[3]
-    is_950_1block = (
-        get_gfx() == "gfx950"
-        and seqlen_k_bwd <= 256
-        and hdim_q_bwd > 64
-        and hdim_q_bwd <= 128
-        and hdim_q_bwd % 8 == 0
-    )
-    bwd_deterministic = False if is_950_1block else res_deterministic
-    bwd_atomic_fp32 = False if is_950_1block else True
+    swa = (window_size[0] > 0) or (window_size[1] >= 0 and window_size[1] != -1)
+    use_v3 = True
+    if res_dp > 0:
+        use_v3 = False
+    if hq != hk:
+        use_v3 = False
+    if swa:
+        use_v3 = False
+    if causal and get_gfx() == "gfx950" and max_seqlen_k > 256:
+        use_v3 = False
 
-    dq_padded, dk_padded, dv_padded, softmax_d, dbias_grad = _flash_attn_backward(
-        dout_padded,
-        q_padded,
-        k_padded,
-        v_padded,
-        out_padded,
-        softmax_lse,
-        res_dropout_p,
-        res_softmax_scale,
-        res_causal,
-        res_window_size[0],
-        res_window_size[1],
-        res_bias,
-        res_alibi_slopes,
-        bwd_deterministic,
-        rng_state,
-        bwd_atomic_fp32,
-        1,  # how_v3_bf16_cvt (overridden to 0 for gfx950 inside _flash_attn_backward)
-    )
+    bwd_atomic = use_v3
 
-    # Unpad gradients to original dimensions.
-    dq = dq_padded[..., :head_size_q_og]
-    dk = dk_padded[..., :head_size_q_og]
-    dv = dv_padded[..., :head_size_v_og]
+    results = mha_bwd_unified(
+        dout, q_p, k_p, v_p, out_p, lse,
+        res_dp, res_scale, res_causal, res_ws[0], res_ws[1],
+        res_det, use_v3, bwd_atomic, bf16_cvt,
+        rng_state=rng_state,
+        cu_seqlens_q=cu_sq, cu_seqlens_k=cu_sk,
+        max_seqlen_q=res_max_sq, max_seqlen_k=res_max_sk)
 
-    # Return gradients for differentiable inputs.
-    return (
-        dq,  # q (index 0)
-        dk,  # k (index 1)
-        dv,  # v (index 2)
-        dbias_grad,  # bias (index 7)
-        None,  # alibi_slopes (index 8) - typically no gradient needed
-    )
+    dq = results[0][..., :hd_q_og]
+    dk = results[1][..., :hd_q_og]
+    dv = results[2][..., :hd_v_og]
+
+    return (dq, dk, dv, None, None)
 
 
-flash_attn_func.defvjp(_flash_attn_func_fwd, _flash_attn_func_bwd)
+flash_attn_varlen.defvjp(_flash_attn_varlen_fwd, _flash_attn_varlen_bwd)
