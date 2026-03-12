@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: [linux-jax-aiter-mi355-1]
+    runs-on: [self-hosted, Linux]
 
     env:
       IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
