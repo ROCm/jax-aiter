@@ -23,6 +23,12 @@ jobs:
       AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
 
     steps:
+      - name: Fix permissions from previous Docker run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R $(id -u):$(id -g) "${{ github.workspace }}" || true
+          fi
+
       - name: Checkout repository with submodules
         uses: actions/checkout@v4
         with:
