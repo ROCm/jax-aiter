@@ -107,7 +107,7 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            python3 jax_aiter/jit/build_jit.py
+            python3 jax_aiter/jit/build_jit.py --verbose
             ls -lh build/aiter_build/*.so
           '
 
