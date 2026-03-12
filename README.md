@@ -13,6 +13,10 @@ Status: experimental.
 
 Note: Python 3.12 is now required; Python 3.10 support has been dropped.
 
+## Documentation
+
+- [Design overview](docs/design-overview.md)
+
 ## AITER integration for JAX
 
 **AITER** is AMD's centralized library of AI operators optimized for ROCm GPUs.
