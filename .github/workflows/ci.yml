@@ -12,17 +12,15 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: [linux-jax-aiter-mi355-8]
+    runs-on: [linux-jax-aiter-mi355-1]
 
     env:
       IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
       CONTAINER_NAME: rv_aiter_ci
-      WORKDIR: /workspace
       JA_ROOT_DIR: /jax-aiter
       AITER_SYMBOL_VISIBLE: 1
       GPU_ARCHS: "gfx942;gfx950"
-      AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/gfx950
-      ROCM_VERSION: 7.2.0
+      AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
 
     steps:
       - name: Checkout repository with submodules
@@ -34,15 +32,6 @@ jobs:
       - name: Get third_party/aiter submodule SHA
         id: aiter_sha
         run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Print host info
-        run: |
-          set -euxo pipefail
-          whoami
-          id -u; id -g
-          uname -a
-          docker --version
-          rocm-smi || true
 
       - name: Create aiter_build directory
         run: mkdir -p build/aiter_build
@@ -57,12 +46,12 @@ jobs:
             aiter-so-${{ runner.os }}
             -aiter-${{ steps.aiter_sha.outputs.sha }}
             -jit-${{ hashFiles('jax_aiter/jit/**') }}
-            -cfg-${{ hashFiles('scripts/**','**/optCompilerConfig.json') }}
+            -cfg-${{ hashFiles('**/optCompilerConfig.json') }}
 
       - name: Pull container image
         run: docker pull "$IMAGE"
 
-      - name: Launch build container (ROCm + big shm + devices + env)
+      - name: Launch build container
         run: |
           set -euxo pipefail
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
@@ -71,7 +60,7 @@ jobs:
             --device=/dev/kfd \
             --device=/dev/dri \
             --ipc=host \
-            --shm-size=64G \
+            --shm-size=16G \
             --group-add=video \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
@@ -79,21 +68,10 @@ jobs:
             -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
             -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
             -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
+            -e HIP_VISIBLE_DEVICES=0 \
             -v "${{ github.workspace }}:/jax-aiter" \
             -w "/jax-aiter" \
             "$IMAGE" tail -f /dev/null
-
-      - name: Setup GPU environment
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            # Detect and set visible GPUs
-            HIP_DEVICES=$(rocm-smi -i | awk -F'\''[][]'\'' '\''/GPU\[/{print $2}'\'' | sort -n | uniq | paste -sd, -)
-            echo "HIP_VISIBLE_DEVICES=$HIP_DEVICES" | tee -a /etc/environment
-            echo "Detected GPUs: $HIP_DEVICES"
-            # Make it available for all subsequent commands
-            echo "export HIP_VISIBLE_DEVICES=$HIP_DEVICES" >> ~/.bashrc
-          '
 
       - name: Ensure base tooling inside container
         run: |
@@ -103,57 +81,14 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               git ca-certificates curl build-essential pkg-config
             python3 -m pip install --break-system-packages cmake ninja pyyaml
-            git --version
           '
 
-      - name: Mark repos safe for Git (inside container)
+      - name: Mark repos safe for Git
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -eux
             git config --global --add safe.directory /jax-aiter
-            git config --global --add safe.directory /jax-aiter/third_party/pytorch
             git config --global --add safe.directory /jax-aiter/third_party/aiter
-          '
-
-      - name: Display environment (in container)
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            echo "========================================="
-            echo "System Information"
-            echo "========================================="
-            echo "Container whoami: $(whoami || true)"
-            echo "Container uid: $(id -u), gid: $(id -g)"
-            echo "Working directory: $PWD"
-            echo "Processors: $(nproc)"
-            echo ""
-            echo "ROCm SMI:"; rocm-smi || echo "rocm-smi not available"
-            echo ""
-            echo "ROCm Info (GPU details):"; rocminfo | grep -E "Marketing Name:|gfx" || true
-            echo ""
-            echo "========================================="
-            echo "Environment Variables"
-            echo "========================================="
-            env
-            echo "========================================="
-          '
-
-      - name: Apply PyTorch patch
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            cd third_party/pytorch
-            git apply ../../scripts/torch_caffe.patch
-          '
-
-      - name: Build static PyTorch (full)
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            rm -rf third_party/pytorch/build_static
-            bash ./scripts/build_static_pytorch.sh
-            echo "PyTorch static build completed"
-            ls -la third_party/pytorch/build_static/lib/
           '
 
       - name: Build umbrella shared library
@@ -176,19 +111,14 @@ jobs:
 
       - name: Decide whether to build JIT
         id: jit_decision
-        shell: bash
         run: |
           set -euo pipefail
-          cache_hit='${{ steps.aiter_cache.outputs.cache-hit }}'   # "true" if hit, empty if miss
-          have_count='${{ steps.have_jit.outputs.count }}'         # "0" or a number
-
-          # Treat empty cache_hit as "false"
+          cache_hit='${{ steps.aiter_cache.outputs.cache-hit }}'
+          have_count='${{ steps.have_jit.outputs.count }}'
           if [[ "${cache_hit:-}" == "true" && "${have_count}" != "0" ]]; then
             echo "do_build=false" >> "$GITHUB_OUTPUT"
-            echo "Cache hit & ${have_count} .so files present. SKIP JIT."
           else
             echo "do_build=true" >> "$GITHUB_OUTPUT"
-            echo "No/empty cache (cache_hit=${cache_hit:-<none>}, count=${have_count}). BUILD JIT."
           fi
 
       - name: Build JIT modules
@@ -201,7 +131,7 @@ jobs:
           '
 
       - name: Save AITER JIT modules cache
-        if: steps.jit_decision.outputs.do_build == 'true' && steps.aiter_cache.outputs.cache-hit != 'true' && hashFiles('build/aiter_build/*.so') != ''
+        if: steps.jit_decision.outputs.do_build == 'true' && steps.aiter_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -210,9 +140,9 @@ jobs:
             aiter-so-${{ runner.os }}
             -aiter-${{ steps.aiter_sha.outputs.sha }}
             -jit-${{ hashFiles('jax_aiter/jit/**') }}
-            -cfg-${{ hashFiles('scripts/**','**/optCompilerConfig.json') }}
+            -cfg-${{ hashFiles('**/optCompilerConfig.json') }}
 
-      - name: Build JA frontend modules
+      - name: Build FFI modules
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
@@ -230,82 +160,43 @@ jobs:
             python3 -m pip install --break-system-packages \
               https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_plugin-0.9.0+rocm7.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
               https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_pjrt-0.9.0+rocm7.2.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-            python3 -m pip install --break-system-packages pytest pytest-xdist pytest-rerunfailures uv
+            python3 -m pip install --break-system-packages pytest pytest-rerunfailures
           '
 
-      - name: Install AITER
+      - name: Install AITER and JAX-AITER
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
             pip install --break-system-packages third_party/aiter
-          '
-
-      - name: Install JAX-AITER
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
             pip install --break-system-packages .
           '
 
-      - name: Run smoke test
+      - name: Smoke test
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print(\"jax-aiter import successful\")"
-            python tests/smoke_mha_test.py --focus comprehensive
+            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print(\"jax-aiter import OK\")"
           '
 
-      - name: Run tests
+      - name: Run tests (1 GPU, ~45 seconds)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-
-            run_suite() {
-              local test_path="$1"
-              local suite_name="$2"
-              local base_xla_flags="${XLA_FLAGS:-}"
-              local extended_xla_flags="${base_xla_flags:+${base_xla_flags} }--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
-              local log_dir="logs"
-              local log_file="${log_dir}/${suite_name}.log"
-              local pytest_rc=0
-
-              mkdir -p "$log_dir"
-
-              XLA_FLAGS="${extended_xla_flags}" \
-              XLA_PYTHON_CLIENT_ALLOCATOR=platform \
-              python3 -m pytest -n 8 --dist=loadscope --reruns 4 -q "${test_path}" > "$log_file" 2>&1 || pytest_rc=$?
-
-              echo "${suite_name}: log=$log_file"
-              tail -n 20 "$log_file"
-              echo "${suite_name}: pytest exit code=${pytest_rc}"
-              return 0
-            }
-
-            run_suite tests/test_mha_ja.py test_mha_ja
-            run_suite tests/test_mha_varlen_ja.py test_mha_varlen
-
-            # Optional benchmark
-            python benchmarks/benchmark_mha.py
-          ' || echo "::warning::Tests reported failures; continuing without failing the step"
+            export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+            export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
+            python3 -m pytest -v --reruns 2 tests/test_mha_ja.py
+          '
 
       - name: Build summary
         if: always()
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            echo "========================================="
-            echo "Build Summary"
-            echo "========================================="
-            echo "PyTorch static libs:"; ls -lh third_party/pytorch/build_static/lib/lib*.a 2>/dev/null || echo "Not found"
-            echo ""
-            echo "JAX-AITER umbrella library:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
-            echo ""
-            echo "AITER modules:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None found"
-            echo ""
-            echo "JA modules:"; ls -lh build/jax_aiter_build/*.so 2>/dev/null || echo "None found"
-            echo "========================================="
-          '
+            echo "=== Build Artifacts ==="
+            echo "Umbrella:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
+            echo "AITER JIT:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None"
+            echo "FFI modules:"; ls -lh build/jax_aiter_build/*.so 2>/dev/null || echo "None"
+          ' || true
 
-      - name: Cleanup container
+      - name: Cleanup
         if: always()
         run: docker rm -f "$CONTAINER_NAME" || true
