@@ -39,8 +39,12 @@ JA_INCLUDES := -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
                -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC) \
                -I$(AITER_INC) -I$(AITER_SRC_DIR)/csrc/include
 
+RMSNORM_INCLUDES := $(JA_INCLUDES) \
+                    -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/example/ck_tile/10_rmsnorm2d
+
 JA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
-              $(JA_BUILD_DIR)/mha_bwd_ja.so
+              $(JA_BUILD_DIR)/mha_bwd_ja.so \
+              $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so
 
 .PHONY: all clean ja_mods
 
@@ -63,6 +67,9 @@ $(JA_BUILD_DIR)/mha_fwd_ja.so: csrc/ffi/mha_fwd/mha_fwd_ja.cu | $(JA_BUILD_DIR)/
 
 $(JA_BUILD_DIR)/mha_bwd_ja.so: csrc/ffi/mha_bwd/mha_bwd_ja.cu | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
+
+$(JA_BUILD_DIR)/rmsnorm_fwd_ja.so: csrc/ffi/rmsnorm/rmsnorm_fwd_ja.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(RMSNORM_INCLUDES) $< -o $@
 
 clean:
 	rm -rf build/jax_aiter_build build/aiter_build
