@@ -83,11 +83,6 @@ Apply patches:
 cd third_party/pytorch
 git apply ../../scripts/torch_caffe.patch
 cd -
-
-# AITER integration patch
-cd third_party/aiter
-git apply ../../scripts/aiter.patch
-cd -
 ```
 
 Run the static build script:

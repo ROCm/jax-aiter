@@ -46,21 +46,20 @@ def patch_aiter_core(core_module, jax_aiter_root):
     # Add JA_ROOT_DIR to the core module's globals.
     core_module.JA_ROOT_DIR = jax_aiter_root
 
-    # Override get_asm_dir to point to parent hsa directory.
-    # This allows us to reference arch-specific paths explicitly in optCompilerConfig.json.
+    # AITER_ASM_DIR convention: base hsa/ directory without arch suffix.
     orig_asm_dir = core_module.AITER_ASM_DIR
-    gfx_dir = orig_asm_dir.rstrip(os.sep)
-    hsa_dir = os.path.dirname(gfx_dir)  # .../hsa
-    core_module.AITER_ASM_DIR = hsa_dir
-    os.environ["AITER_ASM_DIR"] = hsa_dir
+    if orig_asm_dir.rstrip(os.sep).endswith(('gfx942', 'gfx950', 'gfx1100', 'gfx1150', 'gfx1200')):
+        gfx_dir = orig_asm_dir.rstrip(os.sep)
+        hsa_dir = os.path.dirname(gfx_dir) + "/"
+        core_module.AITER_ASM_DIR = hsa_dir
+        os.environ["AITER_ASM_DIR"] = hsa_dir
+        logger.info(f"Detected old AITER_ASM_DIR convention, updated to: {hsa_dir}")
+    else:
+        logger.info(f"AITER_ASM_DIR already using new convention: {orig_asm_dir}")
 
-    # Override the cached get_asm_dir function.
-    @functools.lru_cache(maxsize=1)
-    def get_asm_dir_ja():
-        return hsa_dir
-
-    core_module.get_asm_dir = get_asm_dir_ja
-    logger.info(f"Overridden AITER_ASM_DIR to: {hsa_dir}")
+    # Propagate GPU_ARCHS to AITER_GPU_ARCHS for hsa/codegen.py.
+    if "AITER_GPU_ARCHS" not in os.environ and "GPU_ARCHS" in os.environ:
+        os.environ["AITER_GPU_ARCHS"] = os.environ["GPU_ARCHS"]
 
     # Override get_user_jit_dir to use JAX-AITER build directory.
     @functools.lru_cache(maxsize=1)
@@ -111,7 +110,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
 
         # Convert string expressions to actual values using eval.
         def eval_config_value(value):
-            if isinstance(value, str) and value.startswith("f'"):
+            if isinstance(value, str):
                 eval_globals = {
                     "os": os,
                     "subprocess": subprocess,
@@ -219,36 +218,36 @@ def patch_aiter_core(core_module, jax_aiter_root):
         import cpp_extension
 
         def _prepare_ldflags_ja(
-            extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude, prebuild=0
+            extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude
         ):
             extra_ldflags.append("-mcmodel=large")
             extra_ldflags.append("-ffunction-sections")
             extra_ldflags.append("-fdata-sections ")
             extra_ldflags.append("-Wl,--gc-sections")
+            extra_ldflags.append("-Wl,--cref")
             if not torch_exclude:
                 import torch
 
                 _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
                 TORCH_LIB_PATH = os.path.join(_TORCH_PATH, "lib")
                 extra_ldflags.append(f"-L{TORCH_LIB_PATH}")
-                if prebuild != 1:
-                    extra_ldflags.append("-lc10")
-                    if with_cuda:
-                        extra_ldflags.append(
-                            "-lc10_hip"
-                            if cpp_extension.IS_HIP_EXTENSION
-                            else "-lc10_cuda"
-                        )
-                    extra_ldflags.append("-ltorch_cpu")
-                    if with_cuda:
-                        extra_ldflags.append(
-                            "-ltorch_hip"
-                            if cpp_extension.IS_HIP_EXTENSION
-                            else "-ltorch_cuda"
-                        )
-                    extra_ldflags.append("-ltorch")
-                    if not is_standalone:
-                        extra_ldflags.append("-ltorch_python")
+                extra_ldflags.append("-lc10")
+                if with_cuda:
+                    extra_ldflags.append(
+                        "-lc10_hip"
+                        if cpp_extension.IS_HIP_EXTENSION
+                        else "-lc10_cuda"
+                    )
+                extra_ldflags.append("-ltorch_cpu")
+                if with_cuda:
+                    extra_ldflags.append(
+                        "-ltorch_hip"
+                        if cpp_extension.IS_HIP_EXTENSION
+                        else "-ltorch_cuda"
+                    )
+                extra_ldflags.append("-ltorch")
+                if not is_standalone:
+                    extra_ldflags.append("-ltorch_python")
 
                 if is_standalone:
                     extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
@@ -258,12 +257,72 @@ def patch_aiter_core(core_module, jax_aiter_root):
                     print("Detected CUDA files, patching ldflags", file=sys.stderr)
 
                 extra_ldflags.append(f'-L{cpp_extension._join_rocm_home("lib")}')
-                if prebuild != 1:
-                    extra_ldflags.append("-lamdhip64")
+                extra_ldflags.append("-lamdhip64")
 
-            return sorted(extra_ldflags)
+            return extra_ldflags
 
         cpp_extension._prepare_ldflags = _prepare_ldflags_ja
+
+        # Mock torch module for cpp_extension when torch_exclude=True.
+        original_write_ninja_file_to_build_library = cpp_extension._write_ninja_file_to_build_library
+
+        def _write_ninja_file_to_build_library_ja_inner(
+            path,
+            name,
+            sources,
+            extra_cflags,
+            extra_cuda_cflags,
+            extra_ldflags,
+            extra_include_paths,
+            with_cuda,
+            is_python_module,
+            is_standalone,
+            torch_exclude,
+        ) -> None:
+            """Wrapper to handle torch import when torch_exclude=True."""
+            if torch_exclude:
+                import sys
+                import types
+                import os
+
+                torch_site = str(core_module.JA_ROOT_DIR / "third_party" / "pytorch")
+                mock_torch = types.ModuleType('torch')
+                mock_torch.__file__ = os.path.join(torch_site, '__init__.py')
+                sys.modules['torch'] = mock_torch
+                
+                try:
+                    original_write_ninja_file_to_build_library(
+                        path=path,
+                        name=name,
+                        sources=sources,
+                        extra_cflags=extra_cflags,
+                        extra_cuda_cflags=extra_cuda_cflags,
+                        extra_ldflags=extra_ldflags,
+                        extra_include_paths=extra_include_paths,
+                        with_cuda=with_cuda,
+                        is_python_module=is_python_module,
+                        is_standalone=is_standalone,
+                        torch_exclude=torch_exclude,
+                    )
+                finally:
+                    if 'torch' in sys.modules and sys.modules['torch'] is mock_torch:
+                        del sys.modules['torch']
+            else:
+                original_write_ninja_file_to_build_library(
+                    path=path,
+                    name=name,
+                    sources=sources,
+                    extra_cflags=extra_cflags,
+                    extra_cuda_cflags=extra_cuda_cflags,
+                    extra_ldflags=extra_ldflags,
+                    extra_include_paths=extra_include_paths,
+                    with_cuda=with_cuda,
+                    is_python_module=is_python_module,
+                    is_standalone=is_standalone,
+                    torch_exclude=torch_exclude,
+                )
+        
+        cpp_extension._write_ninja_file_to_build_library = _write_ninja_file_to_build_library_ja_inner
 
         def _write_ninja_file_and_build_library_ja(
             name,
@@ -278,7 +337,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module: bool,
             is_standalone: bool = False,
             torch_exclude: bool = False,
-            prebuild: int = 0,
         ) -> None:
             cpp_extension.verify_ninja_availability()
 
@@ -294,7 +352,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 verbose,
                 is_standalone,
                 torch_exclude,
-                prebuild,
             )
             build_file_path = os.path.join(build_directory, "build.ninja")
             if verbose:
@@ -315,7 +372,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
-                prebuild=prebuild,
             )
 
             if verbose:

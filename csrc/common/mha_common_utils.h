@@ -14,9 +14,6 @@
 #include "ck_tile/host.hpp"
 #include "mask.hpp"
 
-struct fmha_fwd_args;
-struct fmha_bwd_args;
-
 #if defined(__GNUC__) || defined(__clang__)
 #define JAX_AITER_EXPORT __attribute__((visibility("default")))
 #else
