@@ -60,7 +60,7 @@ jobs:
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               git ca-certificates curl build-essential pkg-config
-            python3 -m pip install --break-system-packages cmake ninja pyyaml
+            python3 -m pip install --break-system-packages cmake ninja pyyaml psutil
 
             # JAX must be installed before build (Makefile needs jax.ffi.include_dir())
             python3 -m pip install --break-system-packages jax==0.9.0
