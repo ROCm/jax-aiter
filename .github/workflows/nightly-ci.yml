@@ -53,7 +53,7 @@ jobs:
             -w "/jax-aiter" \
             "$IMAGE" tail -f /dev/null
 
-      - name: Ensure base tooling
+      - name: Install tooling and JAX runtime
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
@@ -61,6 +61,15 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               git ca-certificates curl build-essential pkg-config
             python3 -m pip install --break-system-packages cmake ninja pyyaml
+
+            # JAX must be installed before build (Makefile needs jax.ffi.include_dir())
+            python3 -m pip install --break-system-packages jax==0.9.0
+            python3 -m pip install --break-system-packages \
+              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jaxlib-0.9.0+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+            python3 -m pip install --break-system-packages \
+              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_plugin-0.9.0+rocm7.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_pjrt-0.9.0+rocm7.2.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+            python3 -m pip install --break-system-packages pytest pytest-rerunfailures
           '
 
       - name: Mark repos safe for Git
@@ -78,8 +87,6 @@ jobs:
             echo "Processors: $(nproc)"
             rocm-smi || echo "rocm-smi not available"
             rocminfo | grep -E "Marketing Name:|gfx" || true
-            echo "=== Environment ==="
-            env | sort
           '
 
       - name: Build umbrella library
@@ -90,7 +97,7 @@ jobs:
             ls -lh build/jax_aiter_build/libjax_aiter.so
           '
 
-      - name: Build JIT modules (no cache, full rebuild)
+      - name: Build JIT modules (full rebuild, no cache)
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
@@ -104,19 +111,6 @@ jobs:
             set -euxo pipefail
             make ja_mods
             ls -lh build/jax_aiter_build/*.so
-          '
-
-      - name: Install ROCm JAX runtime packages
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            python3 -m pip install --break-system-packages jax==0.9.0
-            python3 -m pip install --break-system-packages \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jaxlib-0.9.0+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-            python3 -m pip install --break-system-packages \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_plugin-0.9.0+rocm7.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_pjrt-0.9.0+rocm7.2.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-            python3 -m pip install --break-system-packages pytest pytest-rerunfailures
           '
 
       - name: Install AITER and JAX-AITER
