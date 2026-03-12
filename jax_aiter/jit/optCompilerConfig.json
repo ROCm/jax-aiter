@@ -1,4 +1,19 @@
 {
+    "librmsnorm_fwd": {
+        "srcs": [
+            "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d/rmsnorm2d_fwd.cpp'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": [],
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d'"
+        ],
+        "verbose": "False",
+        "is_python_module": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
+    },
     "libmha_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'",

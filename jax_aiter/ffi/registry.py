@@ -26,6 +26,7 @@ _jax_initialized = False
 SYMBOL_TO_MODULE_MAP = {
     "MhaFwdUnifiedJA": "mha_fwd_ja.so",
     "MhaBwdUnifiedJA": "mha_bwd_ja.so",
+    "RmsnormFwdJA": "rmsnorm_fwd_ja.so",
 }
 
 

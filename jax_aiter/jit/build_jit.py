@@ -466,10 +466,9 @@ def build_module(core_module, module_name, verbose=False):
                 logger.info(f"Extra HIP flags: {build_args['flags_extra_hip']}")
             if build_args["blob_gen_cmd"]:
                 logger.info(f"Blob gen cmd: {build_args['blob_gen_cmd']}")
-        # libmha_ modules aren't python.
         is_python_module = (
             False
-            if module_name in ("libmha_fwd", "libmha_bwd")
+            if module_name.startswith("lib")
             else build_args.get("is_python_module", True)
         )
         core_module.build_module(
@@ -488,8 +487,8 @@ def build_module(core_module, module_name, verbose=False):
         )
         logger.info(f"Successfully built {module_name}")
 
-        # Automatically copy libmha .so files to the parent directory for proper linking.
-        if module_name.startswith("libmha_"):
+        # Automatically copy standalone lib .so files to the parent directory for proper linking.
+        if module_name.startswith("lib"):
             jit_build_dir = Path(core_module.get_user_jit_dir())
             src_so = (
                 jit_build_dir / "build" / module_name / "build" / f"{module_name}.so"
