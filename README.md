@@ -10,6 +10,10 @@ JAX-AITER integrates AMD's [AITER](https://github.com/ROCm/aiter) operator libra
 
 Status: experimental. Python 3.12 required.
 
+## Documentation
+
+- [Design overview](docs/design-overview.md)
+
 ## What is AITER?
 
 **AITER** (AI Tensor Engine for ROCm) is AMD's centralized library of AI operators optimized for ROCm GPUs (MI300, MI350). It provides hand-tuned CK (Composable Kernel) and ASM kernels for attention, normalization, activations, GEMM, and more.
