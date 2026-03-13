@@ -29,12 +29,18 @@ Status: experimental. Python 3.12 required.
 | Flash Attention (varlen) | `flash_attn_varlen(q, k, v, cu_sq, cu_sk, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | Packed variable-length sequences. |
 | RMSNorm | `rms_norm(x, gamma, epsilon)` | AITER CK | JAX | Fused square, mean, rsqrt, scale. |
 | Fused Add+RMSNorm | `rms_norm_with_add(x, residual, gamma, epsilon)` | AITER CK | JAX | `y = rms_norm(x + residual) * gamma` in one kernel. |
+| BF16 GEMM | `gemm(a, b)` | AITER ASM | JAX (transpose GEMMs) | A[M,K] @ B[N,K]^T. 24 hand-tuned kernels with heuristic selection. |
+| FP8 GEMM (MI350) | `gemm_fp8_mi350(xq, wq, x_scale, w_scale)` | AITER ASM | -- | FP8 block-scale. gfx950 only. |
+| INT8 GEMM | `gemm_i8(a, b, a_scale, b_scale, bias)` | AITER ASM | -- | Per-token quantization. gfx942 only. |
+| FP4 GEMM | `gemm_fp4(a, b, a_scale, b_scale)` | AITER ASM | -- | Packed fp4x2 with e8m0 block scales. |
+| FlatMM FP8 | `flatmm_fp8(xq, wq, x_scale, w_scale)` | AITER ASM | -- | Single-kernel FP8 matmul. gfx942 only. |
 
 ## Quick start
 
 ```python
 from jax_aiter.mha import flash_attn_func
 from jax_aiter.rmsnorm import rms_norm, rms_norm_with_add
+from jax_aiter.gemm import gemm
 
 # Attention.
 out = flash_attn_func(q, k, v, causal=True)
@@ -44,6 +50,9 @@ y = rms_norm(x, gamma, epsilon=1e-6)
 
 # Fused residual add + RMSNorm (one kernel, one memory pass).
 y, residual_out = rms_norm_with_add(x, residual, gamma, epsilon=1e-6)
+
+# BF16 GEMM: A[M,K] @ B[N,K]^T using AITER hand-tuned ASM kernels.
+out = gemm(a, b)  # bf16 inputs, bf16 output, has custom_vjp for training.
 ```
 
 ## Option A: Install from wheel
@@ -109,7 +118,8 @@ pip install .
 Smoke test:
 
 ```bash
-python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; from jax_aiter.rmsnorm import rms_norm; print('OK')"
+python3 -c "from jax_aiter.mha import flash_attn_func; from jax_aiter.rmsnorm import rms_norm; from jax_aiter.gemm import gemm; print('OK')"
+python3 tests/smoke_gemm_all_test.py
 ```
 
 Run tests:
@@ -117,8 +127,12 @@ Run tests:
 ```bash
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1"
-pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py
+pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py \
+    tests/test_gemm_fp8_mi350_ja.py tests/test_gemm_fp4_ja.py \
+    tests/test_flatmm_fp8_ja.py tests/test_gemm_i8_ja.py
 ```
+
+Tests for GPU-specific kernels auto-skip when the required `.co` files are not available (e.g., INT8/FlatMM skip on MI350, FP8 MI350 skips on MI300).
 
 ## Build wheel
 
@@ -137,7 +151,7 @@ Multiple architectures: `GPU_ARCHS="gfx942;gfx950"`.
 
 ## Troubleshooting
 
-- **Symbol not found errors.** Ensure `libmha_fwd.so`, `libmha_bwd.so`, `librmsnorm_fwd.so` are built (`ls build/aiter_build/*.so`). JIT libs must load before FFI modules.
+- **Symbol not found errors.** Ensure JIT libs are built (`ls build/aiter_build/*.so`). JIT libs must load before FFI modules.
 - **Arch mismatch.** Set `GPU_ARCHS` to match your GPU, then rebuild all steps.
 - **JIT build fails.** Run with `--verbose` for details: `python3 jax_aiter/jit/build_jit.py --verbose`.
 
@@ -145,6 +159,25 @@ Multiple architectures: `GPU_ARCHS="gfx942;gfx950"`.
 
 JIT module config: `jax_aiter/jit/optCompilerConfig.json`.
 
-Available modules:
+Available JIT modules:
 - `libmha_fwd` / `libmha_bwd` -- MHA forward/backward (CK + ASM v3).
 - `librmsnorm_fwd` -- RMSNorm forward (CK).
+
+FFI modules (built by `make ja_mods`):
+- `mha_fwd_ja.so` / `mha_bwd_ja.so` -- MHA FFI handlers.
+- `rmsnorm_fwd_ja.so` -- RMSNorm FFI handler.
+- `gemm_fwd_ja.so` -- BF16 GEMM FFI handler (24 ASM kernels, heuristic selection).
+- `gemm_fp8_mi350_ja.so` -- FP8 block-scale GEMM for MI350.
+- `gemm_i8_ja.so` -- INT8 GEMM (MI300 only).
+- `gemm_fp4_ja.so` -- FP4 GEMM.
+- `flatmm_fp8_ja.so` -- FP8 flat matmul (MI300 only).
+
+### GEMM architecture
+
+All GEMM variants bypass AITER's PyTorch wrapper and call the ASM kernels directly via HIP:
+
+```
+JAX buffer → FFI handler → KernelArgs struct (void*) → AiterAsmKernel → hipModuleLaunchKernel → .co
+```
+
+No PyTorch code at any layer. Kernel configs are auto-generated from CSV by `hsa/codegen.py`.
