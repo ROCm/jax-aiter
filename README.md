@@ -1,241 +1,150 @@
 # jax-aiter
 
-<!-- ![Nightly Passing](https://img.shields.io/github/actions/workflow/status/rocm/jax-aiter/nightly-ci.yml?branch=main&label=nightly&logo=github) -->
-![Build Status](https://img.shields.io/github/actions/workflow/status/rocm/jax-aiter/ci.yml?branch=main&label=ci&logo=github)
+![Nightly](https://img.shields.io/github/actions/workflow/status/rocm/jax-aiter/nightly-ci.yml?branch=main&label=nightly&logo=github)
+![CI](https://img.shields.io/github/actions/workflow/status/rocm/jax-aiter/ci.yml?branch=main&label=ci&logo=github)
 ![License](https://img.shields.io/github/license/ROCm/jax-aiter)
 
 <img width="256" height="391" alt="jax-aiter-github" src="https://github.com/user-attachments/assets/b30ac891-ce50-4cff-8074-8a42f46ee111" />
 
+JAX-AITER integrates AMD's [AITER](https://github.com/ROCm/aiter) operator library into JAX via XLA FFI, bringing high-performance GPU kernels to JAX on ROCm. No PyTorch dependency at runtime.
 
-JAX-AITER integrates AMD's AITER operator library into JAX, bringing AITER's high-performance attention kernels to JAX on ROCm via a stable FFI bridge and custom_vjp integration. It enables optimized MHA/FMHA (including variable-length attention) in JAX for both inference and training on AMD GPUs.
+Status: experimental. Python 3.12 required.
 
-Status: experimental.
+## What is AITER?
 
-Note: Python 3.12 is now required; Python 3.10 support has been dropped.
+**AITER** (AI Tensor Engine for ROCm) is AMD's centralized library of AI operators optimized for ROCm GPUs (MI300, MI350). It provides hand-tuned CK (Composable Kernel) and ASM kernels for attention, normalization, activations, GEMM, and more.
 
-## AITER integration for JAX
+**JAX-AITER** provides:
 
-**AITER** is AMD's centralized library of AI operators optimized for ROCm GPUs.
-It unifies multiple backends (C++, Python, CK, assembly, etc.) and exposes a consistent operator interface.
+- **JAX-native API.** Operators exposed as JAX functions with `custom_vjp` gradient wiring.
+- **Zero-copy FFI.** GPU buffers passed directly between JAX and AITER via XLA FFI.
+- **Training-ready.** Gradients flow through AITER kernels for end-to-end training.
+- **No torch dependency.** Pure JAX + AITER at runtime.
 
-**JAX-AITER** builds on that foundation by providing:
+## Supported ops
 
-- **A JAX-native API:** Operators are exposed as JAX functions with seamless `custom_vjp` (forward/backward) wiring.
-- **Automatic operator dispatch:** Dynamically chooses optimized implementations based on tensor shapes, data type, and options (e.g. causal, windowed).
-- **Zero-copy buffer exchange:** Uses JAX FFI to avoid unnecessary transfers between JAX and AITER.
-- **Training-ready:** Gradients flow natively through AITER kernels, enabling end-to-end differentiable pipelines.
-- **ROCm-native performance:** Fully integrated with AMD GPU runtime and compiler stack.
+| Op | API | Forward | Backward | Notes |
+|----|-----|---------|----------|-------|
+| Flash Attention | `flash_attn_func(q, k, v, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | MHA/MQA/GQA, causal, SWA, bias, ALiBi, dropout. |
+| Flash Attention (varlen) | `flash_attn_varlen(q, k, v, cu_sq, cu_sk, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | Packed variable-length sequences. |
+| RMSNorm | `rms_norm(x, gamma, epsilon)` | AITER CK | JAX | Fused square, mean, rsqrt, scale. |
+| Fused Add+RMSNorm | `rms_norm_with_add(x, residual, gamma, epsilon)` | AITER CK | JAX | `y = rms_norm(x + residual) * gamma` in one kernel. |
 
-## Option A: Install from a released wheel
+## Quick start
 
-If a wheel is available (e.g. from project Releases):
+```python
+from jax_aiter.mha import flash_attn_func
+from jax_aiter.rmsnorm import rms_norm, rms_norm_with_add
+
+# Attention.
+out = flash_attn_func(q, k, v, causal=True)
+
+# RMSNorm.
+y = rms_norm(x, gamma, epsilon=1e-6)
+
+# Fused residual add + RMSNorm (one kernel, one memory pass).
+y, residual_out = rms_norm_with_add(x, residual, gamma, epsilon=1e-6)
+```
+
+## Option A: Install from wheel
 
 ```bash
 pip install path/to/jax_aiter-<version>-*.whl
 ```
 
-## Option B: Build from source (Docker optional)
+## Option B: Build from source
 
-Custom build requires cmake and ninja (both installable via pip):
+Requires ROCm, `hipcc`, and JAX with ROCm support.
+
 ```bash
 pip install cmake ninja pyyaml
 ```
 
-Environment setup (run from the top of the jax-aiter project tree):
-```bash
-export JA_ROOT_DIR="$PWD"                    # Set to the top of jax-aiter project tree
-export AITER_SYMBOL_VISIBLE=1
-export GPU_ARCHS=gfx950                        # Example for MI350; use your GPU arch (e.g., gfx942 for MI300)
-# You may specify multiple archs as a semicolon-separated list, e.g.: GPU_ARCHS="gfx942;gfx950"
-export AITER_ASM_DIR="$JA_ROOT_DIR/third_party/aiter/hsa/gfx950/"  # Example path matching our CI layout
-```
-
-You can build natively or inside a ROCm container. You can pull docker images from the latest release of ROCm jax.
-
-https://hub.docker.com/r/rocm/jax/tags
-
-We suggest to use latest jax docker images:
-
-```bash
-docker pull rocm/jax:rocm7.0.2-jax0.6.0-py3.12-ubu24
-```
-
-Inside the container (or on your host with ROCm installed), proceed:
-
-### 1) Clone the repository and init submodules
+### 1) Clone with submodules
 
 ```bash
 git clone --recursive git@github.com:ROCm/jax-aiter.git
+cd jax-aiter
 ```
 
-Submodules:
-- third_party/aiter
-- third_party/pytorch
-
-### 2) Apply patches and build static PyTorch for ROCm
-
-Statically build minimal PyTorch libraries (c10, torch_cpu, torch_hip, caffe2_nvrtc) and headers for linking.
-
-Apply patches:
+### 2) Environment setup
 
 ```bash
-# PyTorch patch for caffe2_nvrtc static/PIC
-cd third_party/pytorch
-git apply ../../scripts/torch_caffe.patch
-cd -
+export JA_ROOT_DIR="$PWD"
+export AITER_SYMBOL_VISIBLE=1
+export GPU_ARCHS=gfx950                                    # gfx942 for MI300, gfx950 for MI350.
+export AITER_ASM_DIR="$JA_ROOT_DIR/third_party/aiter/hsa/" # Base path, no arch suffix.
 ```
 
-Run the static build script:
-
-```bash
-bash ./scripts/build_static_pytorch.sh
-```
-
-Script details:
-- Source: third_party/pytorch
-- Build dir: third_party/pytorch/build_static
-- Install prefix: third_party/pytorch/build_static/install
-- Tunables: ROCM_ARCH (gpu arch), ROCM_PATH (/opt/rocm), JOBS (nproc), PYTHON (python3)
-
-### 3) Build the umbrella shared library
-
-Link the required static PyTorch objects and ROCm libs into a single .so:
+### 3) Build umbrella shared library
 
 ```bash
 make
 ```
 
-Key paths (from Makefile):
-- Output: build/jax_aiter_build/libjax_aiter.so
-- Static libs: third_party/pytorch/build_static/lib
-- Include dirs: JAX FFI, PyTorch, and csrc/common are used
-
 ### 4) Build AITER JIT modules
-
-Build specific AITER modules (example: varlen fwd+bwd):
-
-```bash
-python3 jax_aiter/jit/build_jit.py --module module_fmha_v3_varlen_fwd,module_fmha_v3_varlen_bwd
-```
-
-Build all configured AITER modules:
 
 ```bash
 python3 jax_aiter/jit/build_jit.py
 ```
 
-Outputs (.so) are placed under build/aiter_build/.
+Build specific modules:
 
-Notes:
-- build_jit.py patches AITER's core to redirect user JIT dir to build/aiter_build and inject PyTorch/JAX-FFI include paths.
-- Ensure static PyTorch build completed first; headers and libs expected under third_party/pytorch/build_static and build_static/install/include.
+```bash
+python3 jax_aiter/jit/build_jit.py --module libmha_fwd,libmha_bwd,librmsnorm_fwd
+```
 
-### 5) Build JAX-AITER frontend modules
-
-Build JAX-AITER frontend modules that bridge JAX FFI to AITER:
+### 5) Build FFI modules
 
 ```bash
 make ja_mods
 ```
 
-Outputs (.so) are placed under build/jax_aiter_build/.
-
-Notes:
-- JA modules are thin host-only frontends that call into AITER implementations
-- They must be built after the umbrella and AITER modules
-
-### 6) Install runtime dependencies and test
-
-Install ROCm PyTorch wheel (ROCm 7.0.2):
+### 6) Install and test
 
 ```bash
-python3 -m pip install --break-system-packages \
-  --default-timeout=300 \
-  --retries 5 \
-  --find-links https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/ \
-  'torch==2.8.0+rocm7.0.2.lw.git245bf6ed'
-```
-
-Install AITER and JAX-AITER:
-
-```bash
-pip install --break-system-packages third_party/aiter
-pip install --break-system-packages .
+pip install .
 ```
 
 Smoke test:
 
 ```bash
-python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; print('jax-aiter import OK')"
+python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; from jax_aiter.rmsnorm import rms_norm; print('OK')"
 ```
 
-Run tests (requires JAX ROCm, PyTorch and GPU):
+Run tests:
 
 ```bash
-pip install pytest pytest-xdist
-pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_varlen_ja.py
-pytest -n 8 --dist=loadscope --reruns 4 -q tests/test_mha_ja.py
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1"
+pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py
 ```
 
-## Run benchmarks
+## Build wheel
 
-The primary benchmark compares Multi-Head Attention between:
-- Pure JAX baseline (`jax_aiter.baseline.mha_attn.attention_ref`)
-- JAX-AITER implementation (`jax_aiter.mha.flash_attn_func`)
-
-Default configuration:
-- Layout: BSHD (batch, seq_len, num_heads, head_dim)
-- Default dtype: bfloat16
-- Multiple configurations (seq_len up to 8192; head_dim 64–256; causal/non-causal)
-- 10 runs per configuration (median reported)
-
-Usage:
 ```bash
-cd jax-aiter
-python benchmarks/benchmark_mha.py
+pip wheel . --no-deps -w dist/
 ```
 
-Notes:
-- Requires a GPU-enabled JAX environment
-- Ensure AITER/JAX-AITER modules are built and importable (see steps above)
-- To change the number of runs, you can modify the call in `benchmark_mha.py` (e.g., `main(num_runs=20)`), or run:
-  ```bash
-  python -c "import importlib; m=importlib.import_module('benchmarks.benchmark_mha'); m.main(num_runs=20)"
-  ```
-- Optional CSV export: add at the end of `main()`:
-  ```python
-  export_results_csv(results, filename='benchmark_results.csv')
-  ```
+## GPU architectures
+
+| GPU | Architecture | `GPU_ARCHS` |
+|-----|-------------|-------------|
+| MI300 series | CDNA3 | `gfx942` |
+| MI350 series | CDNA4 | `gfx950` |
+
+Multiple architectures: `GPU_ARCHS="gfx942;gfx950"`.
 
 ## Troubleshooting
 
-- **Arch/driver mismatch:**
-  Set both GPU_ARCHS (e.g., gfx950 for MI350) and ROCM_ARCH for the static PyTorch build, then rebuild:
-  ```bash
-  export GPU_ARCHS=<gfx*>
-  env ROCM_ARCH=<gfx*> ./scripts/build_static_pytorch.sh
-  make
-  ```
-
-- **caffe2_nvrtc not found or not PIC:**
-  Ensure the patch (scripts/torch_caffe.patch) was applied, then rerun build_static_pytorch.sh
-
-- **JIT cannot find PyTorch headers:**
-  Confirm third_party/pytorch/build_static/install/include exists. Re-run:
-  ```bash
-  python3 jax_aiter/jit/build_jit.py --verbose --module module_fmha_v3_varlen_fwd
-  ```
-
-- **Symbol not found errors while loading .sos for MHA kernels**
-  Confirm that libmha_fwd and libmha_bwd are built and loaded before loading the respective modules.
+- **Symbol not found errors.** Ensure `libmha_fwd.so`, `libmha_bwd.so`, `librmsnorm_fwd.so` are built (`ls build/aiter_build/*.so`). JIT libs must load before FFI modules.
+- **Arch mismatch.** Set `GPU_ARCHS` to match your GPU, then rebuild all steps.
+- **JIT build fails.** Run with `--verbose` for details: `python3 jax_aiter/jit/build_jit.py --verbose`.
 
 ## Developer notes
 
-- Static PyTorch build targets:
-  - c10, torch_cpu, torch_hip, caffe2_nvrtc (static, PIC)
-- JIT module config: see jax_aiter/jit/optCompilerConfig.json for available modules:
-  - module_fmha_v3_varlen_fwd, module_fmha_v3_varlen_bwd
-  - module_mha_varlen_fwd, module_mha_varlen_bwd
-  - module_mha_fwd, module_mha_bwd
-  - libmha_fwd, libmha_bwd
-  - module_custom
+JIT module config: `jax_aiter/jit/optCompilerConfig.json`.
+
+Available modules:
+- `libmha_fwd` / `libmha_bwd` -- MHA forward/backward (CK + ASM v3).
+- `librmsnorm_fwd` -- RMSNorm forward (CK).

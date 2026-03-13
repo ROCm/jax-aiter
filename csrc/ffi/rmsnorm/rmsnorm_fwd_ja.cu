@@ -2,7 +2,9 @@
 // Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 //
 // RMSNorm forward FFI handler calling rmsnorm2d_fwd from CK.
-// Input: x [m, n], gamma [n]. Output: y [m, n], inv_rms [m].
+// Basic: Input x [m, n], gamma [n]. Output y [m, n], inv_rms [m].
+// Fused add: Also takes residual [m, n]. Computes y = rms_norm(x + residual) * gamma.
+//   Writes x + residual to residual_out [m, n].
 
 #include <hip/hip_runtime.h>
 
@@ -31,10 +33,13 @@ RmsnormFwd_Bridge(
     hipStream_t stream,
     ffi::AnyBuffer x,
     ffi::AnyBuffer gamma,
+    ffi::AnyBuffer residual,       // Empty (size 0) if no fused add.
     ffi::Result<ffi::AnyBuffer> y,
+    ffi::Result<ffi::AnyBuffer> residual_out,  // x + residual written here if fused add.
     ffi::Result<ffi::AnyBuffer> inv_rms,
     float epsilon,
-    bool save_rms) {
+    bool save_rms,
+    int fused_add) {               // 0: no add, 1: pre-add-store.
 
   if (!x.untyped_data() || !gamma.untyped_data()) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -63,6 +68,8 @@ RmsnormFwd_Bridge(
                       "gamma size must match last dim of x");
   }
 
+  bool has_residual = (fused_add > 0) && residual.element_count() > 0;
+
   std::string prec = dtype_to_prec(x_dtype);
 
   ck_tile::stream_config stream_config{stream, false, 0, -1, -1};
@@ -74,18 +81,18 @@ RmsnormFwd_Bridge(
       .prec_sy = prec,
       .save_rms = save_rms,
       .save_unquant = false,
-      .fused_add = 0,
+      .fused_add = fused_add,
       .fused_quant = 0,
       .use_model_sensitive_rmsnorm = 0
   };
 
   rmsnorm2d_fwd_args args{};
   args.p_x         = x.untyped_data();
-  args.p_x_residual = nullptr;
+  args.p_x_residual = has_residual ? residual.untyped_data() : nullptr;
   args.p_sm_scale  = nullptr;
   args.p_gamma     = gamma.untyped_data();
   args.p_y         = y->untyped_data();
-  args.p_y_residual = nullptr;
+  args.p_y_residual = has_residual ? residual_out->untyped_data() : nullptr;
   args.p_y_scale   = nullptr;
   args.p_invRms    = save_rms ? inv_rms->untyped_data() : nullptr;
   args.p_y_unquant = nullptr;
@@ -93,9 +100,9 @@ RmsnormFwd_Bridge(
   args.m           = static_cast<ck_tile::index_t>(m);
   args.n           = static_cast<ck_tile::index_t>(n);
   args.x_stride    = static_cast<ck_tile::index_t>(n);
-  args.xr_stride   = 0;
+  args.xr_stride   = has_residual ? static_cast<ck_tile::index_t>(n) : 0;
   args.y_stride    = static_cast<ck_tile::index_t>(n);
-  args.yr_stride   = 0;
+  args.yr_stride   = has_residual ? static_cast<ck_tile::index_t>(n) : 0;
 
   float elapsed = rmsnorm2d_fwd(traits, args, stream_config);
 
@@ -117,10 +124,13 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<ffi::PlatformStream<hipStream_t>>()
         .Arg<ffi::AnyBuffer>()   // x: [m, n]
         .Arg<ffi::AnyBuffer>()   // gamma: [n]
+        .Arg<ffi::AnyBuffer>()   // residual: [m, n] or empty
         .Ret<ffi::AnyBuffer>()   // y: [m, n]
+        .Ret<ffi::AnyBuffer>()   // residual_out: [m, n] or empty
         .Ret<ffi::AnyBuffer>()   // inv_rms: [m]
         .Attr<float>("epsilon")
-        .Attr<bool>("save_rms"),
+        .Attr<bool>("save_rms")
+        .Attr<int>("fused_add"),
     {xla::ffi::Traits::kCmdBufferCompatible});
 
 #pragma GCC visibility pop
