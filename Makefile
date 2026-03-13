@@ -49,7 +49,8 @@ GEMM_INCLUDES    := $(JA_INCLUDES) -I$(GEMM_CONFIG_DIR)
 JA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
               $(JA_BUILD_DIR)/mha_bwd_ja.so \
               $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
-              $(JA_BUILD_DIR)/gemm_fwd_ja.so
+              $(JA_BUILD_DIR)/gemm_fwd_ja.so \
+              $(JA_BUILD_DIR)/gemm_fp8_mi350_ja.so
 
 .PHONY: all clean ja_mods
 
@@ -81,6 +82,9 @@ $(GEMM_CONFIG_HPP): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 
 $(JA_BUILD_DIR)/gemm_fwd_ja.so: csrc/ffi/gemm_fwd/gemm_fwd_ja.cu $(GEMM_CONFIG_HPP) | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) $< -o $@
+
+$(JA_BUILD_DIR)/gemm_fp8_mi350_ja.so: csrc/ffi/gemm_fp8_mi350/gemm_fp8_mi350_ja.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
 
 clean:
 	rm -rf build/jax_aiter_build build/aiter_build
