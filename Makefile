@@ -77,7 +77,7 @@ $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so: csrc/ffi/rmsnorm/rmsnorm_fwd_ja.cu | $(JA_BUI
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(RMSNORM_INCLUDES) $< -o $@
 
 $(GEMM_CONFIG_HPP): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
-	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS=$(GPU_ARCHS) $(PYTHON3) hsa/codegen.py -m bf16gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
+	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m bf16gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
 
 $(JA_BUILD_DIR)/gemm_fwd_ja.so: csrc/ffi/gemm_fwd/gemm_fwd_ja.cu $(GEMM_CONFIG_HPP) | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) $< -o $@
