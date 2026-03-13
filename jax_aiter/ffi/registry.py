@@ -28,6 +28,7 @@ SYMBOL_TO_MODULE_MAP = {
     "MhaBwdUnifiedJA": "mha_bwd_ja.so",
     "RmsnormFwdJA": "rmsnorm_fwd_ja.so",
     "GemmFwdJA": "gemm_fwd_ja.so",
+    "GemmFp8Mi350FwdJA": "gemm_fp8_mi350_ja.so",
 }
 
 
