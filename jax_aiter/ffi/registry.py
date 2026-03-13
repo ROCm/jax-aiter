@@ -29,6 +29,9 @@ SYMBOL_TO_MODULE_MAP = {
     "RmsnormFwdJA": "rmsnorm_fwd_ja.so",
     "GemmFwdJA": "gemm_fwd_ja.so",
     "GemmFp8Mi350FwdJA": "gemm_fp8_mi350_ja.so",
+    "FlatmmFp8FwdJA": "flatmm_fp8_ja.so",
+    "GemmI8FwdJA": "gemm_i8_ja.so",
+    "GemmFp4FwdJA": "gemm_fp4_ja.so",
 }
 
 

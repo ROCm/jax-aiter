@@ -3,6 +3,49 @@
 import os
 from pathlib import Path
 
+import pytest
+
+
+def get_gpu_arch():
+    """Detect GPU architecture string (e.g., 'gfx942', 'gfx950')."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["rocminfo"], capture_output=True, text=True, timeout=10
+        )
+        for line in result.stdout.split("\n"):
+            if "gfx9" in line and "Name:" in line:
+                return line.split(":")[-1].strip()
+    except Exception:
+        pass
+    return os.environ.get("GPU_ARCHS", "gfx950").split(";")[0]
+
+
+_gpu_arch = None
+
+def gpu_arch():
+    global _gpu_arch
+    if _gpu_arch is None:
+        _gpu_arch = get_gpu_arch()
+    return _gpu_arch
+
+
+def _is_gfx942():
+    return gpu_arch() == "gfx942"
+
+def _is_gfx950():
+    return gpu_arch() == "gfx950"
+
+requires_gfx942 = pytest.mark.skipif(
+    not _is_gfx942(),
+    reason="Requires gfx942 (MI300) GPU"
+)
+
+requires_gfx950 = pytest.mark.skipif(
+    not _is_gfx950(),
+    reason="Requires gfx950 (MI350) GPU"
+)
+
 
 def pytest_configure(config):
     root = str(Path(__file__).resolve().parent.parent)

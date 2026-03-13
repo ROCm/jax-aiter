@@ -186,7 +186,7 @@ jobs:
             set -euxo pipefail
             export XLA_PYTHON_CLIENT_ALLOCATOR=platform
             export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
-            python3 -m pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py
+            python3 -m pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py tests/test_gemm_fp8_mi350_ja.py tests/test_gemm_fp4_ja.py tests/test_flatmm_fp8_ja.py tests/test_gemm_i8_ja.py
           '
 
       - name: Build summary
