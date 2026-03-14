@@ -55,6 +55,10 @@ y, residual_out = rms_norm_with_add(x, residual, gamma, epsilon=1e-6)
 out = gemm(a, b)  # bf16 inputs, bf16 output, has custom_vjp for training.
 ```
 
+## Design documentation
+
+- [Design overview](docs/design-overview.md)
+
 ## Option A: Install from wheel
 
 ```bash
