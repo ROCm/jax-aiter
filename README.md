@@ -35,6 +35,10 @@ Status: experimental. Python 3.12 required.
 | FP4 GEMM | `gemm_fp4(a, b, a_scale, b_scale)` | AITER ASM | -- | Packed fp4x2 with e8m0 block scales. |
 | FlatMM FP8 | `flatmm_fp8(xq, wq, x_scale, w_scale)` | AITER ASM | -- | Single-kernel FP8 matmul. gfx942 only. |
 
+## Design documentation
+
+- [JAX-AITER design overview](docs/design-overview.md)
+
 ## Quick start
 
 ```python
