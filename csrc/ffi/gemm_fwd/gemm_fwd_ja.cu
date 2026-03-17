@@ -4,9 +4,14 @@
 // BF16 GEMM forward FFI handler using AITER hand-tuned ASM kernels.
 // Computes Out = A @ B^T where A:[M,K] bf16, B:[N,K] bf16, Out:[M,N] bf16.
 // Kernel selection via heuristic from asm_bf16gemm_configs.hpp.
+//
+// All HIP module loads happen eagerly at first use (before any graph capture).
+// GemmFwd_Bridge is fully command-buffer-compatible: only hipMemsetAsync +
+// hipModuleLaunchKernel are called during execution.
 
 #include <cstring>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -21,12 +26,11 @@ namespace ffi = xla::ffi;
 
 namespace jax_aiter {
 
-// Packed kernel args -- must match the AITER ASM kernel ABI exactly.
 struct __attribute__((packed)) GemmKernelArgs {
-  void* ptr_D;          p2 _p0;   // output [M, N]
-  void* ptr_C;          p2 _p1;   // unused (set to nullptr)
-  void* ptr_A;          p2 _p2;   // input A [M, K]
-  void* ptr_B;          p2 _p3;   // input B [N, K]
+  void* ptr_D;          p2 _p0;
+  void* ptr_C;          p2 _p1;
+  void* ptr_A;          p2 _p2;
+  void* ptr_B;          p2 _p3;
   float alpha;           p3 _p4;
   float beta;            p3 _p5;
   unsigned int stride_D0; p3 _p6;
@@ -47,17 +51,91 @@ struct __attribute__((packed)) GemmKernelArgs {
   void* ptr_semaphore;   p2 _p21;
 };
 
+// ---------------------------------------------------------------------------
+// Cached device properties -- queried once per device.
+// hipModule_t / hipFunction_t handles are device-specific in HIP, so we need
+// a separate kernel cache per device.
+// ---------------------------------------------------------------------------
+struct DeviceInfo {
+  std::string arch_id;
+  uint32_t num_cu;
+};
+
+static constexpr int kMaxDevices = 16;
+
+static DeviceInfo& get_device_info(int dev_id) {
+  static DeviceInfo infos[kMaxDevices];
+  static std::once_flag flags[kMaxDevices];
+
+  std::call_once(flags[dev_id], [dev_id]() {
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev_id));
+    infos[dev_id].arch_id = get_gpu_arch();
+    infos[dev_id].num_cu = dev_prop.multiProcessorCount;
+  });
+  return infos[dev_id];
+}
+
+// ---------------------------------------------------------------------------
+// Per-device kernel cache.
+// hipModuleLoad binds to the current HIP context (device), so each device
+// needs its own loaded modules.  Thread-safe via per-device std::once_flag.
+// After init, lookups are lock-free (read-only map).
+// ---------------------------------------------------------------------------
+struct KernelEntry {
+  std::unique_ptr<AiterAsmKernel> impl;
+  unsigned int tileM;
+  unsigned int tileN;
+};
+
+using KernelMap = std::unordered_map<std::string, KernelEntry>;
+
+static KernelMap& get_kernel_cache_for_device(int dev_id) {
+  static KernelMap caches[kMaxDevices];
+  static std::once_flag flags[kMaxDevices];
+
+  std::call_once(flags[dev_id], [dev_id]() {
+    HIP_CALL(hipSetDevice(dev_id));
+
+    const auto& di = get_device_info(dev_id);
+    CFG* cfgs = &cfg_bf16gemm_fp32bf16;
+
+    AITER_LOG_INFO("Eagerly loading all BF16 GEMM kernels for "
+                   << di.arch_id << " on device " << dev_id);
+    int count = 0;
+    for (const auto& el : *cfgs) {
+      if (el.first.find(di.arch_id) != 0)
+        continue;
+      const auto& cfg = el.second;
+      if (caches[dev_id].count(cfg.knl_name))
+        continue;
+
+      KernelEntry entry;
+      entry.impl = std::make_unique<AiterAsmKernel>(
+          cfg.knl_name.c_str(), cfg.co_name.c_str());
+      entry.tileM = cfg.tileM;
+      entry.tileN = cfg.tileN;
+      caches[dev_id].emplace(cfg.knl_name, std::move(entry));
+      count++;
+    }
+    AITER_LOG_INFO("Loaded " << count << " BF16 GEMM kernels for "
+                   << di.arch_id << " on device " << dev_id);
+  });
+
+  return caches[dev_id];
+}
+
+// ---------------------------------------------------------------------------
+// Kernel selection heuristic -- pure CPU, no HIP calls.
+// ---------------------------------------------------------------------------
 static std::tuple<std::string, int>
-select_kernel(int M, int N, int K, CFG* cfgs, const std::string& arch_id) {
+select_kernel(int M, int N, int K, int dev_id, CFG* cfgs) {
   if (K % 64 != 0) {
     return {"", -1};
   }
 
-  hipDevice_t dev;
-  hipDeviceProp_t dev_prop;
-  HIP_CALL(hipGetDevice(&dev));
-  HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-  uint32_t num_cu = dev_prop.multiProcessorCount;
+  const auto& di = get_device_info(dev_id);
+  uint32_t num_cu = di.num_cu;
 
   uint32_t empty_cu      = num_cu;
   uint32_t pure_tg_num   = 0;
@@ -69,7 +147,7 @@ select_kernel(int M, int N, int K, CFG* cfgs, const std::string& arch_id) {
   int selectedsplitK             = 1;
 
   for (const auto& el : *cfgs) {
-    if (el.first.find(arch_id) != 0)
+    if (el.first.find(di.arch_id) != 0)
       continue;
     const auto& cfg = el.second;
 
@@ -109,26 +187,23 @@ select_kernel(int M, int N, int K, CFG* cfgs, const std::string& arch_id) {
   return {selectedKernelName, selectedsplitK};
 }
 
-static AiterAsmKernel*
-load_kernel(const std::string& name, CFG* config_map,
-            unsigned int& SUBM, unsigned int& SUBN) {
-  static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> cache;
+// ---------------------------------------------------------------------------
+// Look up a pre-loaded kernel for the given device. No HIP calls.
+// ---------------------------------------------------------------------------
+static const KernelEntry*
+lookup_kernel(const std::string& config_name, int dev_id, CFG* config_map) {
+  auto cfg_it = config_map->find(config_name);
+  if (cfg_it == config_map->end()) return nullptr;
 
-  auto it = config_map->find(name);
-  if (it == config_map->end()) return nullptr;
-
-  const auto& cfg = it->second;
-  SUBM = cfg.tileM;
-  SUBN = cfg.tileN;
-
-  auto result = cache.emplace(cfg.knl_name, nullptr);
-  if (result.second)
-    result.first->second = std::make_unique<AiterAsmKernel>(
-        cfg.knl_name.c_str(), cfg.co_name.c_str());
-
-  return result.first->second.get();
+  auto& cache = get_kernel_cache_for_device(dev_id);
+  auto it = cache.find(cfg_it->second.knl_name);
+  if (it == cache.end()) return nullptr;
+  return &it->second;
 }
 
+// ---------------------------------------------------------------------------
+// FFI bridge -- only stream-recordable HIP calls (memset + launch).
+// ---------------------------------------------------------------------------
 ffi::Error
 GemmFwd_Bridge(
     hipStream_t stream,
@@ -159,18 +234,21 @@ GemmFwd_Bridge(
                       "K must be divisible by 64 for ASM GEMM");
   }
 
-  std::string arch_id = get_gpu_arch();
+  int dev_id = 0;
+  HIP_CALL(hipGetDevice(&dev_id));
+
   CFG* config_map = &cfg_bf16gemm_fp32bf16;
 
-  auto [name, split] = select_kernel(M, N, K, config_map, arch_id);
+  auto [name, split] = select_kernel(M, N, K, dev_id, config_map);
   if (name.empty()) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                      "No suitable GEMM kernel found for these dimensions");
+                      "No suitable GEMM kernel found for these dimensions"
+                      " (M=" + std::to_string(M) + " N=" + std::to_string(N)
+                      + " K=" + std::to_string(K) + ")");
   }
 
-  unsigned int SUBM = 32, SUBN = 64;
-  AiterAsmKernel* impl = load_kernel(name, config_map, SUBM, SUBN);
-  if (!impl) {
+  const KernelEntry* entry = lookup_kernel(name, dev_id, config_map);
+  if (!entry || !entry->impl) {
     return ffi::Error(ffi::ErrorCode::kInternal, "Failed to load GEMM kernel");
   }
 
@@ -200,17 +278,39 @@ GemmFwd_Bridge(
   (void)hipMemsetAsync(semaphore->untyped_data(), 0,
                        16 * 64 * sizeof(uint32_t), stream);
 
+  unsigned int SUBM = entry->tileM;
+  unsigned int SUBN = entry->tileN;
   int gdx = (N + SUBN - 1) / SUBN;
   int gdy = (M + SUBM - 1) / SUBM;
   int gdz = split;
 
   size_t arg_size = sizeof(args);
-  impl->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
+  entry->impl->launch_kernel({&args, &arg_size, gdx, gdy, gdz, 256, 1, 1, stream});
 
   return ffi::Error::Success();
 }
 
 } // namespace jax_aiter
+
+// ---------------------------------------------------------------------------
+// Eagerly pre-load kernels for ALL visible devices.
+// Called from Python after .so is loaded (avoids static init order issues).
+// ---------------------------------------------------------------------------
+extern "C" __attribute__((visibility("default")))
+void gemm_fwd_ja_preload_kernels() {
+  int num_devices = 0;
+  auto err = hipGetDeviceCount(&num_devices);
+  if (err != hipSuccess || num_devices <= 0) return;
+
+  int orig_dev = 0;
+  hipGetDevice(&orig_dev);
+
+  for (int d = 0; d < num_devices && d < jax_aiter::kMaxDevices; d++) {
+    jax_aiter::get_kernel_cache_for_device(d);
+  }
+
+  hipSetDevice(orig_dev);
+}
 
 #pragma GCC visibility push(default)
 

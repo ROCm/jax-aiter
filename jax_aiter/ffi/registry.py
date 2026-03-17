@@ -162,9 +162,40 @@ def register_ffi_target(target_name: str, platform: str = "ROCM"):
             f"FFI target '{target_name}' from {module_name} registered successfully with JAX."
         )
 
+        if target_name == "GemmFwdJA":
+            _preload_gemm_kernels(module_name)
+        elif target_name == "GemmFp8Mi350FwdJA":
+            _preload_fp8_kernels(module_name)
+
     except Exception as e:
         logger.error(f"Failed to register FFI target '{target_name}': {e}")
         raise
+
+
+def _preload_gemm_kernels(module_name: str):
+    """Pre-load BF16 GEMM kernels on all visible devices to avoid blocking collectives."""
+    try:
+        handle = _module_handles.get(module_name)
+        if handle is None:
+            return
+        preload_fn = getattr(handle, "gemm_fwd_ja_preload_kernels", None)
+        if preload_fn is not None:
+            preload_fn()
+    except Exception as e:
+        logger.warning(f"Failed to preload GEMM kernels: {e}")
+
+
+def _preload_fp8_kernels(module_name: str):
+    """Pre-load FP8 GEMM kernels on all visible devices."""
+    try:
+        handle = _module_handles.get(module_name)
+        if handle is None:
+            return
+        preload_fn = getattr(handle, "gemm_fp8_mi350_ja_preload_kernels", None)
+        if preload_fn is not None:
+            preload_fn()
+    except Exception as e:
+        logger.warning(f"Failed to preload FP8 kernels: {e}")
 
 
 def get_available_symbols() -> List[str]:
