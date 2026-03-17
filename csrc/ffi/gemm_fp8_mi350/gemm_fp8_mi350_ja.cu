@@ -5,10 +5,12 @@
 // Computes Out = dequant(A, a_scale) @ dequant(B, b_scale)^T
 // where A:[M,K] fp8, B:[N,K] fp8, a_scale:[K/128,M] f32, b_scale:[K/128,N/128] f32.
 // Output: [M,N] bf16.
-// Uses 2 hardcoded AITER ASM kernels: x128 (M>32) and x32 (M<=32).
+// Uses 2 AITER ASM kernels per device: x128 (M>32) and x32 (M<=32).
+// Kernels are loaded eagerly per-device to avoid hipModuleLoad during graph capture.
 
 #include <cstring>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <string>
 
 #include "xla/ffi/api/c_api.h"
@@ -20,40 +22,64 @@ namespace ffi = xla::ffi;
 
 namespace jax_aiter {
 
+static constexpr int kMaxDevices = 16;
+
+struct Fp8KernelPair {
+  std::unique_ptr<AiterAsmKernel> x128;
+  std::unique_ptr<AiterAsmKernel> x32;
+};
+
+static Fp8KernelPair& get_fp8_kernels(int dev_id) {
+  static Fp8KernelPair pairs[kMaxDevices];
+  static std::once_flag flags[kMaxDevices];
+
+  std::call_once(flags[dev_id], [dev_id]() {
+    HIP_CALL(hipSetDevice(dev_id));
+    AITER_LOG_INFO("Loading FP8 MI350 kernels on device " << dev_id);
+    pairs[dev_id].x128 = std::make_unique<AiterAsmKernel>(
+        "f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
+    pairs[dev_id].x32 = std::make_unique<AiterAsmKernel>(
+        "f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
+    AITER_LOG_INFO("Loaded FP8 MI350 kernels on device " << dev_id);
+  });
+
+  return pairs[dev_id];
+}
+
 struct __attribute__((packed)) Fp8Mi350KernelArgs {
-  void *ptr_C;     p2 _p0;   // output [M, N] bf16
-  void *ptr_X;     p2 _p1;   // input A [M, K] fp8
-  void *ptr_W;     p2 _p2;   // input B [N, K] fp8
-  void *ptr_XC;    p2 _p3;   // unused
-  void *ptr_XQ;    p2 _p4;   // a_scale [K/128, M] f32
-  void *ptr_WQ;    p2 _p5;   // b_scale [K/128, N/128] f32
-  void *ptr_tmp0;  p2 _p6;   // unused
-  void *ptr_tmp1;  p2 _p7;   // unused
-  void *ptr_tmp2;  p2 _p8;   // unused
+  void *ptr_C;     p2 _p0;
+  void *ptr_X;     p2 _p1;
+  void *ptr_W;     p2 _p2;
+  void *ptr_XC;    p2 _p3;
+  void *ptr_XQ;    p2 _p4;
+  void *ptr_WQ;    p2 _p5;
+  void *ptr_tmp0;  p2 _p6;
+  void *ptr_tmp1;  p2 _p7;
+  void *ptr_tmp2;  p2 _p8;
   unsigned int K;   p3 _p9;
   unsigned int N;   p3 _p10;
   unsigned int M;   p3 _p11;
   unsigned int eprt_cnt; p3 _p12;
-  unsigned int Xs;  p3 _p13;  // stride A in bytes
-  unsigned int Ws;  p3 _p14;  // stride B in bytes
-  unsigned int Cs;  p3 _p15;  // stride C in bytes
+  unsigned int Xs;  p3 _p13;
+  unsigned int Ws;  p3 _p14;
+  unsigned int Cs;  p3 _p15;
   unsigned int tmp0; p3 _p16;
   unsigned int tmp1; p3 _p17;
   unsigned int tmp2; p3 _p18;
   unsigned int tmp3; p3 _p19;
   unsigned int splitk; p3 _p20;
   unsigned int activation; p3 _p21;
-  void *ptr_tmp3;  p2 _p22;  // unused
+  void *ptr_tmp3;  p2 _p22;
 };
 
 ffi::Error
 GemmFp8Mi350Fwd_Bridge(
     hipStream_t stream,
-    ffi::AnyBuffer xq,       // A: [M, K] fp8
-    ffi::AnyBuffer wq,       // B: [N, K] fp8
-    ffi::AnyBuffer x_scale,  // [K/128, M] f32
-    ffi::AnyBuffer w_scale,  // [K/128, N/128] f32
-    ffi::Result<ffi::AnyBuffer> out) {  // [M, N] bf16
+    ffi::AnyBuffer xq,
+    ffi::AnyBuffer wq,
+    ffi::AnyBuffer x_scale,
+    ffi::AnyBuffer w_scale,
+    ffi::Result<ffi::AnyBuffer> out) {
 
   auto xq_dims = xq.dimensions();
   auto wq_dims = wq.dimensions();
@@ -74,7 +100,7 @@ GemmFp8Mi350Fwd_Bridge(
 
   constexpr int TileN = 128;
   constexpr int TileK = 128;
-  constexpr int GridTileN = TileN * 2;  // kernel processes 2 N-tiles per workgroup
+  constexpr int GridTileN = TileN * 2;
 
   if (N % GridTileN != 0 || K % TileK != 0) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -89,13 +115,12 @@ GemmFp8Mi350Fwd_Bridge(
                       "K must be >= 512 for MI350 FP8 GEMM");
   }
 
-  int TileM = (M <= 32) ? 32 : 128;
+  int dev_id = 0;
+  HIP_CALL(hipGetDevice(&dev_id));
 
-  static AiterAsmKernel kernel_x128("f8_block_scale_mi350_x128",
-                                     "f8_block_scale_mi350_x128.co");
-  static AiterAsmKernel kernel_x32("f8_block_scale_mi350_x32",
-                                    "f8_block_scale_mi350_x32.co");
-  AiterAsmKernel* impl = (M <= 32) ? &kernel_x32 : &kernel_x128;
+  int TileM = (M <= 32) ? 32 : 128;
+  auto& kp = get_fp8_kernels(dev_id);
+  AiterAsmKernel* impl = (M <= 32) ? kp.x32.get() : kp.x128.get();
 
   const int fp8_elem_size = 1;
 
@@ -111,7 +136,7 @@ GemmFp8Mi350Fwd_Bridge(
   args.eprt_cnt = 1;
   args.Xs       = K * fp8_elem_size;
   args.Ws       = K * fp8_elem_size;
-  args.Cs       = N * 2;  // bf16 output = 2 bytes
+  args.Cs       = N * 2;
   args.splitk   = 0;
   args.activation = 0;
 
@@ -125,6 +150,23 @@ GemmFp8Mi350Fwd_Bridge(
 }
 
 } // namespace jax_aiter
+
+// Eagerly pre-load FP8 kernels for all visible devices.
+extern "C" __attribute__((visibility("default")))
+void gemm_fp8_mi350_ja_preload_kernels() {
+  int num_devices = 0;
+  auto err = hipGetDeviceCount(&num_devices);
+  if (err != hipSuccess || num_devices <= 0) return;
+
+  int orig_dev = 0;
+  hipGetDevice(&orig_dev);
+
+  for (int d = 0; d < num_devices && d < jax_aiter::kMaxDevices; d++) {
+    jax_aiter::get_fp8_kernels(d);
+  }
+
+  hipSetDevice(orig_dev);
+}
 
 #pragma GCC visibility push(default)
 
