@@ -3,7 +3,9 @@
 """BF16 GEMM via AITER ASM kernels with custom_vjp + custom_partitioning.
 
 Forward: Out = A @ B^T using hand-tuned ASM kernels via FFI.
-Backward: dA = dOut @ B, dB = dOut^T @ A (both via the same GEMM FFI).
+Backward:
+  dA = dOut @ B -- AITER on 1-GPU (via pre-transposed B), hipBLASLt on multi-GPU
+  dB = dOut^T @ A -- hipBLASLt (needs NN layout that AITER doesn't support)
 
 GSPMD sharding: custom_partitioning tells XLA how to partition the FFI call.
   Out[M,N] = A[M,K] @ B[N,K]^T
@@ -41,6 +43,9 @@ def _gemm_fwd_call(out_shape, sem_shape, dtype):
             jax.ShapeDtypeStruct(sem_shape, jnp.uint32),
         ),
         vmap_method="broadcast_all",
+        input_layouts=[None, None],
+        output_layouts=[None, None],
+        has_side_effect=False,
     )
 
     def _invoke(a, b):
@@ -145,17 +150,24 @@ def gemm(
 
 def _gemm_fwd(a, b):
     out = gemm(a, b)
+    if jax.device_count() == 1:
+        b_t = jnp.transpose(b, (1, 0))
+        return out, (a, b_t)
     return out, (a, b)
 
 
 def _gemm_bwd(residuals, grad_out):
-    a, b = residuals
-    # Use lax.dot_general for backward -- XLA handles transposed layouts natively
-    # without needing explicit transpose kernels.
+    a, b_or_bt = residuals
     # Forward was: Out[M,N] = A[M,K] @ B[N,K]^T
-    # dA[M,K] = grad_out[M,N] @ B[N,K]  (contract on N)
-    da = jax.lax.dot_general(grad_out, b, (((1,), (0,)), ((), ())))
-    # dB[N,K] = grad_out^T[N,M] @ A[M,K]  (contract on M)
+    if jax.device_count() == 1:
+        # 1-GPU: dA via AITER (pre-transposed B avoids layout issues)
+        da = gemm(grad_out, b_or_bt)
+        b = jnp.transpose(b_or_bt, (1, 0))
+    else:
+        # Multi-GPU: dA via hipBLASLt to preserve collective-matmul overlap
+        b = b_or_bt
+        da = jax.lax.dot_general(grad_out, b, (((1,), (0,)), ((), ())))
+    # dB[N,K] = grad_out^T[N,M] @ A[M,K] -- always hipBLASLt (needs NN layout)
     db = jax.lax.dot_general(grad_out, a, (((0,), (0,)), ((), ())))
 
     return da, db
