@@ -8,7 +8,7 @@
 
 JAX-AITER integrates AMD's [AITER](https://github.com/ROCm/aiter) operator library into JAX via XLA FFI, bringing high-performance GPU kernels to JAX on ROCm. No PyTorch dependency at runtime.
 
-Status: experimental. Python 3.12 required.
+Python 3.12 required. ROCm 7.2+.
 
 ## What is AITER?
 
@@ -25,22 +25,30 @@ Status: experimental. Python 3.12 required.
 
 | Op | API | Forward | Backward | Notes |
 |----|-----|---------|----------|-------|
+| **MXFP4 GEMM (training)** | `gemm_fp4_bf16(a, b)` | AITER ASM (35 kernels) | AITER ASM dA + hipBLASLt FP8 dB | BF16 in/out with `custom_vjp`. Beats FP8 by +1.4% at 70B. |
+| MXFP4 Cast | `CastMxfp4JA` / `CastMxfp4DualJA` | Fused HIP kernel | -- | BF16 to MXFP4 (E2M1 + E8M0 block scales) with transpose + shuffle. |
+| FP4 GEMM (low-level) | `gemm_fp4(a, b, a_scale, b_scale)` | AITER ASM | -- | Pre-quantized fp4x2 inputs with e8m0 block scales. |
+| BF16 GEMM (training) | `gemm(a, b)` | AITER ASM | AITER ASM dX + hipBLASLt dW | A[M,K] @ B[N,K]^T with `custom_vjp`. 24 hand-tuned kernels. |
 | Flash Attention | `flash_attn_func(q, k, v, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | MHA/MQA/GQA, causal, SWA, bias, ALiBi, dropout. |
 | Flash Attention (varlen) | `flash_attn_varlen(q, k, v, cu_sq, cu_sk, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | Packed variable-length sequences. |
 | RMSNorm | `rms_norm(x, gamma, epsilon)` | AITER CK | JAX | Fused square, mean, rsqrt, scale. |
 | Fused Add+RMSNorm | `rms_norm_with_add(x, residual, gamma, epsilon)` | AITER CK | JAX | `y = rms_norm(x + residual) * gamma` in one kernel. |
-| BF16 GEMM | `gemm(a, b)` | AITER ASM | JAX (transpose GEMMs) | A[M,K] @ B[N,K]^T. 24 hand-tuned kernels with heuristic selection. |
-| FP8 GEMM (MI350) | `gemm_fp8_mi350(xq, wq, x_scale, w_scale)` | AITER ASM | -- | FP8 block-scale. gfx950 only. |
-| INT8 GEMM | `gemm_i8(a, b, a_scale, b_scale, bias)` | AITER ASM | -- | Per-token quantization. gfx942 only. |
-| FP4 GEMM | `gemm_fp4(a, b, a_scale, b_scale)` | AITER ASM | -- | Packed fp4x2 with e8m0 block scales. |
-| FlatMM FP8 | `flatmm_fp8(xq, wq, x_scale, w_scale)` | AITER ASM | -- | Single-kernel FP8 matmul. gfx942 only. |
+| SiLU-and-Mul | `silu_and_mul(x)` | AITER HIP | -- | Fused `silu(x[:half]) * x[half:]` activation. |
 
 ## Quick start
 
 ```python
+from jax_aiter.gemm_fp4 import gemm_fp4_bf16
+from jax_aiter.gemm import gemm
 from jax_aiter.mha import flash_attn_func
 from jax_aiter.rmsnorm import rms_norm, rms_norm_with_add
-from jax_aiter.gemm import gemm
+
+# MXFP4 GEMM: BF16 inputs, FP4 quantization + ASM GEMM, BF16 output.
+# Has custom_vjp for training (dA via FP4 ASM, dB via hipBLASLt FP8).
+out = gemm_fp4_bf16(activations, weights)
+
+# BF16 GEMM: A[M,K] @ B[N,K]^T using AITER hand-tuned ASM kernels.
+out = gemm(a, b)  # bf16 inputs, bf16 output, has custom_vjp for training.
 
 # Attention.
 out = flash_attn_func(q, k, v, causal=True)
@@ -50,9 +58,6 @@ y = rms_norm(x, gamma, epsilon=1e-6)
 
 # Fused residual add + RMSNorm (one kernel, one memory pass).
 y, residual_out = rms_norm_with_add(x, residual, gamma, epsilon=1e-6)
-
-# BF16 GEMM: A[M,K] @ B[N,K]^T using AITER hand-tuned ASM kernels.
-out = gemm(a, b)  # bf16 inputs, bf16 output, has custom_vjp for training.
 ```
 
 ## Option A: Install from wheel
@@ -118,7 +123,7 @@ pip install .
 Smoke test:
 
 ```bash
-python3 -c "from jax_aiter.mha import flash_attn_func; from jax_aiter.rmsnorm import rms_norm; from jax_aiter.gemm import gemm; print('OK')"
+python3 -c "from jax_aiter.mha import flash_attn_func; from jax_aiter.gemm_fp4 import gemm_fp4_bf16; from jax_aiter.gemm import gemm; print('OK')"
 python3 tests/smoke_gemm_all_test.py
 ```
 
@@ -126,13 +131,10 @@ Run tests:
 
 ```bash
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1"
+export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
 pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py \
-    tests/test_gemm_fp8_mi350_ja.py tests/test_gemm_fp4_ja.py \
-    tests/test_flatmm_fp8_ja.py tests/test_gemm_i8_ja.py
+    tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py
 ```
-
-Tests for GPU-specific kernels auto-skip when the required `.co` files are not available (e.g., INT8/FlatMM skip on MI350, FP8 MI350 skips on MI300).
 
 ## Build wheel
 
@@ -166,11 +168,10 @@ Available JIT modules:
 FFI modules (built by `make ja_mods`):
 - `mha_fwd_ja.so` / `mha_bwd_ja.so` -- MHA FFI handlers.
 - `rmsnorm_fwd_ja.so` -- RMSNorm FFI handler.
+- `silu_and_mul_ja.so` -- SiLU activation FFI handler.
 - `gemm_fwd_ja.so` -- BF16 GEMM FFI handler (24 ASM kernels, heuristic selection).
-- `gemm_fp8_mi350_ja.so` -- FP8 block-scale GEMM for MI350.
-- `gemm_i8_ja.so` -- INT8 GEMM (MI300 only).
-- `gemm_fp4_ja.so` -- FP4 GEMM.
-- `flatmm_fp8_ja.so` -- FP8 flat matmul (MI300 only).
+- `gemm_fp4_ja.so` -- FP4 GEMM (35 ASM kernels).
+- `cast_mxfp4_ja.so` -- MXFP4 cast + transpose + shuffle (BF16 to E2M1+E8M0).
 
 ### GEMM architecture
 
@@ -181,3 +182,16 @@ JAX buffer → FFI handler → KernelArgs struct (void*) → AiterAsmKernel → 
 ```
 
 No PyTorch code at any layer. Kernel configs are auto-generated from CSV by `hsa/codegen.py`.
+
+### MXFP4 training architecture
+
+The MXFP4 path (`gemm_fp4_bf16`) uses `custom_vjp` + `custom_partitioning` for FSDP-compatible training:
+
+```
+Forward:  CastMxfp4JA(act) + CastMxfp4DualJA(wt) + GemmFp4FwdJA    (3 FFI calls)
+Backward: CastMxfp4JA(grad) + GemmFp4FwdJA(dA)                      (2 FFI calls)
+          hipBLASLt FP8 dB via lax.dot_general                       (native XLA)
+```
+
+FP4 ASM kernels are 1.19-1.54x faster than hipBLASLt FP8 at MLP shapes. The dB backward
+uses native FP8 `dot_general` so XLA can overlap it with FSDP communication.

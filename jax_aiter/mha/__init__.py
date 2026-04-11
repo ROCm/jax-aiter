@@ -16,7 +16,6 @@ from .mha import (
     flash_attn_func,
     flash_attn_varlen,
 )
-
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen",

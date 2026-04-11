@@ -5,7 +5,7 @@
 - Forward accuracy vs JAX reference (mean-square, rsqrt, scale).
 - Backward accuracy via custom_vjp (JAX-computed grad).
 - Covers bf16/fp16, typical MaxText hidden dims (4096, 8192, 14336).
-- TE-style tolerances (eps^(2/3)).
+- Dtype-based tolerances (eps^(2/3)).
 """
 
 import pytest

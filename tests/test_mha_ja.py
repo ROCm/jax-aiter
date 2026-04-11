@@ -2,9 +2,9 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 """Comprehensive tests for unified MHA handlers (mha_v2).
 
-Test strategy modeled after Transformer Engine's fused attention tests:
-- TE-style dtype-based tolerances (eps^(2/3))
-- Dropout: shape/crash check only (no numeric comparison, per TE convention)
+Test strategy:
+- Dtype-based tolerances (eps^(2/3))
+- Dropout: shape/crash check only (no numeric comparison)
 - Covers all head dims, seqlen combos, MHA/MQA/GQA, features, edge cases
 - Regression guards for every historical bug found during AITER bump
 """
@@ -244,7 +244,7 @@ def test_batch_bwd_accuracy(b, sq, sk, hq, hk, d, dtype):
 
 
 # ===========================================================================
-# DROPOUT TESTS (shape/crash only, per TE convention)
+# DROPOUT TESTS (shape/crash only, no numeric comparison)
 # ===========================================================================
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16], ids=["fp16", "bf16"])

@@ -79,3 +79,12 @@ hipify_output_dict_dump.txt
 Thumbs.db
 jax_aiter/_hsa/
 jax_aiter/_lib/
+
+# Local-only experimental modules (not committed upstream).
+jax_aiter/gemm_fp8/
+jax_aiter/triton/
+csrc/ffi/gemm_fp8_mi350/
+
+# HLO dumps and investigation logs.
+hlo_dumps/
+docs/logs/
