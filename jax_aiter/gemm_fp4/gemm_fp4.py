@@ -444,6 +444,8 @@ def prepack_fp4_weight(b_bf16):
         b_packed: [N, K//2] uint8 — packed + shuffled FP4 weights.
         b_scales: [N_pad, K_pad//32] uint8 — shuffled E8M0 block scales.
     """
+    if _use_fused_quant():
+        return _cast_mxfp4_fused_wt(b_bf16)
     b_packed, b_scales = bf16_to_mxfp4(b_bf16)
     return shuffle_weight(b_packed), e8m0_shuffle(b_scales)
 
@@ -855,8 +857,11 @@ def gemm_fp4_weight_only(a, b_bf16, b_packed, b_scales):
     Returns:
         out: [M, N] bfloat16
     """
-    a_packed, a_scales = bf16_to_mxfp4(a)
-    a_scales_sh = e8m0_shuffle(a_scales)
+    if _use_fused_quant():
+        a_packed, a_scales_sh = _cast_mxfp4_fused_act(a)
+    else:
+        a_packed, a_scales = bf16_to_mxfp4(a)
+        a_scales_sh = e8m0_shuffle(a_scales)
     return _fp4_ffi_partitioned(a_packed, b_packed, a_scales_sh, b_scales)
 
 
