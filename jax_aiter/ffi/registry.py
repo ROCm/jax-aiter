@@ -27,11 +27,19 @@ SYMBOL_TO_MODULE_MAP = {
     "MhaFwdUnifiedJA": "mha_fwd_ja.so",
     "MhaBwdUnifiedJA": "mha_bwd_ja.so",
     "RmsnormFwdJA": "rmsnorm_fwd_ja.so",
+    "SiluAndMulJA": "silu_and_mul_ja.so",
     "GemmFwdJA": "gemm_fwd_ja.so",
+    "GemmBwdMaskedJA": "gemm_bwd_masked_ja.so",
+    "GemmBwdFusedJA": "gemm_bwd_fused_ja.so",
+    "GemmDbTiledJA": "gemm_db_tiled_ja.so",
+    "GemmCkDbJA": "gemm_ck_db_ja.so",
     "GemmFp8Mi350FwdJA": "gemm_fp8_mi350_ja.so",
+    "GemmFp8CkJA": "gemm_fp8_ck_ja.so",
     "FlatmmFp8FwdJA": "flatmm_fp8_ja.so",
     "GemmI8FwdJA": "gemm_i8_ja.so",
     "GemmFp4FwdJA": "gemm_fp4_ja.so",
+    "CastMxfp4JA": "cast_mxfp4_ja.so",
+    "CastMxfp4DualJA": "cast_mxfp4_ja.so",
 }
 
 
@@ -164,6 +172,12 @@ def register_ffi_target(target_name: str, platform: str = "ROCM"):
 
         if target_name == "GemmFwdJA":
             _preload_gemm_kernels(module_name)
+        elif target_name == "GemmBwdMaskedJA":
+            _preload_bwd_masked_kernels(module_name)
+        elif target_name == "GemmBwdFusedJA":
+            _preload_bwd_fused_kernels(module_name)
+        elif target_name == "GemmDbTiledJA":
+            _preload_db_tiled_kernels(module_name)
         elif target_name == "GemmFp8Mi350FwdJA":
             _preload_fp8_kernels(module_name)
 
@@ -183,6 +197,45 @@ def _preload_gemm_kernels(module_name: str):
             preload_fn()
     except Exception as e:
         logger.warning(f"Failed to preload GEMM kernels: {e}")
+
+
+def _preload_bwd_masked_kernels(module_name: str):
+    """Pre-load BF16 GEMM kernels for masked backward on all visible devices."""
+    try:
+        handle = _module_handles.get(module_name)
+        if handle is None:
+            return
+        preload_fn = getattr(handle, "gemm_bwd_masked_ja_preload_kernels", None)
+        if preload_fn is not None:
+            preload_fn()
+    except Exception as e:
+        logger.warning(f"Failed to preload masked backward GEMM kernels: {e}")
+
+
+def _preload_db_tiled_kernels(module_name: str):
+    """Pre-load BF16 GEMM kernels for tiled dB on all visible devices."""
+    try:
+        handle = _module_handles.get(module_name)
+        if handle is None:
+            return
+        preload_fn = getattr(handle, "gemm_db_tiled_ja_preload_kernels", None)
+        if preload_fn is not None:
+            preload_fn()
+    except Exception as e:
+        logger.warning(f"Failed to preload tiled dB kernels: {e}")
+
+
+def _preload_bwd_fused_kernels(module_name: str):
+    """Pre-load BF16 GEMM kernels for fused backward on all visible devices."""
+    try:
+        handle = _module_handles.get(module_name)
+        if handle is None:
+            return
+        preload_fn = getattr(handle, "gemm_bwd_fused_ja_preload_kernels", None)
+        if preload_fn is not None:
+            preload_fn()
+    except Exception as e:
+        logger.warning(f"Failed to preload fused backward GEMM kernels: {e}")
 
 
 def _preload_fp8_kernels(module_name: str):

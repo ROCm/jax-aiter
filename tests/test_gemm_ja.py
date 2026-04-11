@@ -5,7 +5,7 @@
 - Forward accuracy vs JAX reference (A @ B^T in float32).
 - Backward accuracy via custom_vjp.
 - Covers bf16/fp16, Llama3-70B projection shapes, edge cases.
-- TE-style tolerances scaled by sqrt(K) for GEMM accumulation noise.
+- Tolerances scaled by sqrt(K) for GEMM accumulation noise.
 """
 
 import math

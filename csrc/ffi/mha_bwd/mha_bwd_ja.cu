@@ -4,8 +4,13 @@
 // Unified MHA backward FFI handler for both batch and varlen modes.
 // Detects mode from tensor rank: 4D = batch [b,s,h,d], 3D = varlen [total,h,d].
 // Calls aiter::mha_bwd(args, stream) which handles CK vs ASM v3 internally.
+//
+// Multi-GPU note: AITER's fmha_v3_bwd impl_ptr_map is now protected by a
+// mutex (Xinya's fix cherry-picked onto third_party/aiter), so ASM v3
+// kernels can be used on all devices concurrently.
 
 #include <hip/hip_runtime.h>
+#include <set>
 #include <vector>
 
 #include "xla/ffi/api/c_api.h"
@@ -19,6 +24,41 @@
 namespace ffi = xla::ffi;
 
 namespace jax_aiter {
+
+// Persistent workspace pool: reuses device memory across calls to avoid
+// per-call hipMalloc/hipFree which synchronises the device.
+// Device-aware: re-allocates when the current device changes.
+struct WorkspacePool {
+  void *ptr = nullptr;
+  size_t cap = 0;
+  int dev = -1;
+
+  void *get(size_t bytes, hipStream_t stream, bool zero = true) {
+    int cur_dev = -1;
+    hipGetDevice(&cur_dev);
+    if (cur_dev != dev || bytes > cap) {
+      if (ptr) { hipSetDevice(dev); hipFree(ptr); hipSetDevice(cur_dev); }
+      hipMalloc(&ptr, bytes);
+      cap = bytes;
+      dev = cur_dev;
+    }
+    if (zero) hipMemsetAsync(ptr, 0, bytes, stream);
+    return ptr;
+  }
+
+  ~WorkspacePool() {
+    if (ptr) {
+      int cur; hipGetDevice(&cur);
+      hipSetDevice(dev); hipFree(ptr); hipSetDevice(cur);
+    }
+  }
+};
+
+static thread_local WorkspacePool s_dq_acc_pool;
+static thread_local WorkspacePool s_dk_exp_pool;
+static thread_local WorkspacePool s_dv_exp_pool;
+static thread_local WorkspacePool s_dbias_pool;
+static thread_local WorkspacePool s_rng_pool;
 
 static size_t compute_dq_acc_size_unified(
     bool is_varlen, int64_t batch_size, int64_t seqlen_q_or_total,
@@ -180,8 +220,7 @@ ffi::Error MhaBwdUnified_Bridge(
 
   if (has_dbias) {
     size_t dbias_sz = batch_size * seqlen_q * num_heads * seqlen_k * mha_utils::dtype_size(q.element_type());
-    HIP_CHECK(hipMalloc(&dbias_expanded_ptr, dbias_sz));
-    HIP_CHECK(hipMemsetAsync(dbias_expanded_ptr, 0, dbias_sz, stream));
+    dbias_expanded_ptr = s_dbias_pool.get(dbias_sz, stream);
     stride_dbias = num_heads * seqlen_k;
     nhead_stride_dbias = seqlen_k;
     batch_stride_dbias = seqlen_q * num_heads * seqlen_k;
@@ -196,8 +235,7 @@ ffi::Error MhaBwdUnified_Bridge(
     } catch (...) { /* fallthrough to dummy */ }
   }
   if (!seed_ptr) {
-    HIP_CHECK(hipMalloc(&dummy_rng, 2 * sizeof(uint64_t)));
-    HIP_CHECK(hipMemsetAsync(dummy_rng, 0, 2 * sizeof(uint64_t), stream));
+    dummy_rng = (uint64_t *)s_rng_pool.get(2 * sizeof(uint64_t), stream, /*zero=*/false);
     seed_ptr = dummy_rng; offset_ptr = dummy_rng + 1;
   }
 
@@ -208,9 +246,7 @@ ffi::Error MhaBwdUnified_Bridge(
       num_heads, head_size_q, deterministic, use_asm_v3, is_v3_atomic_fp32,
       q.element_type(), dq_acc_shape);
 
-  void *dq_acc_ptr = nullptr;
-  HIP_CHECK(hipMalloc(&dq_acc_ptr, dq_acc_bytes));
-  HIP_CHECK(hipMemsetAsync(dq_acc_ptr, 0, dq_acc_bytes, stream));
+  void *dq_acc_ptr = s_dq_acc_pool.get(dq_acc_bytes, stream);
 
   // dq_acc strides
   ck_tile::index_t split_stride_dq_acc = 1, batch_stride_dq_acc = 0;
@@ -247,8 +283,8 @@ ffi::Error MhaBwdUnified_Bridge(
   if (is_mqa_gqa) {
     size_t dk_sz = (is_varlen ? seqlen_k : batch_size * seqlen_k) * num_heads * head_size_q * mha_utils::dtype_size(q.element_type());
     size_t dv_sz = (is_varlen ? seqlen_k : batch_size * seqlen_k) * num_heads * head_size_v * mha_utils::dtype_size(v.element_type());
-    HIP_CHECK(hipMalloc(&dk_expanded_ptr, dk_sz));
-    HIP_CHECK(hipMalloc(&dv_expanded_ptr, dv_sz));
+    dk_expanded_ptr = s_dk_exp_pool.get(dk_sz, stream);
+    dv_expanded_ptr = s_dv_exp_pool.get(dv_sz, stream);
     dk_final = dk_expanded_ptr; dv_final = dv_expanded_ptr;
   }
 
@@ -382,15 +418,17 @@ ffi::Error MhaBwdUnified_Bridge(
       .drop_seed_offset = std::make_pair(seed_ptr, offset_ptr)
   };
 
+  // Ensure HIP device context matches the data device.  XLA usually sets
+  // this, but being explicit prevents WorkspacePool and kernel loads from
+  // targeting the wrong device.
+  HIP_CHECK(hipSetDevice(dev_idx));
+
+  args.use_asm_v3 = use_asm_v3;
+
   auto stream_config = mha_utils::create_stream_config(stream);
   float runtime = aiter::mha_bwd(args, stream_config);
 
   if (runtime < 0) {
-    hipFree(dq_acc_ptr);
-    if (dk_expanded_ptr) hipFree(dk_expanded_ptr);
-    if (dv_expanded_ptr) hipFree(dv_expanded_ptr);
-    if (dbias_expanded_ptr) hipFree(dbias_expanded_ptr);
-    if (dummy_rng) hipFree(dummy_rng);
     return ffi::Error(ffi::ErrorCode::kInternal, "aiter::mha_bwd failed");
   }
 
@@ -410,19 +448,15 @@ ffi::Error MhaBwdUnified_Bridge(
         is_varlen ? seqlen_k : seqlen_k,
         num_heads, num_heads_k, head_size_v, groups, v.element_type(), stream);
 
-    HIP_CHECK(hipFree(dk_expanded_ptr));
-    HIP_CHECK(hipFree(dv_expanded_ptr));
+    // dk/dv expanded buffers managed by pool -- no free needed
   }
 
   if (has_dbias && dbias_expanded_ptr) {
     size_t dbias_sz = batch_size * seqlen_q * num_heads * seqlen_k * mha_utils::dtype_size(q.element_type());
     HIP_CHECK(hipMemcpyAsync(dbias_ret->untyped_data(), dbias_expanded_ptr,
                              dbias_sz, hipMemcpyDeviceToDevice, stream));
-    HIP_CHECK(hipFree(dbias_expanded_ptr));
   }
-
-  hipFree(dq_acc_ptr);
-  if (dummy_rng) hipFree(dummy_rng);
+  // All workspace buffers managed by pools -- no hipFree needed
 
   return ffi::Error::Success();
 }

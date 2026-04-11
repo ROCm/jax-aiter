@@ -4,7 +4,7 @@
 # Targets: all (umbrella lib), ja_mods (FFI modules), clean.
 
 HIPCC        ?= /opt/rocm/bin/hipcc
-ROCM_ARCH    ?= gfx942
+ROCM_ARCH    ?= gfx950
 PYTHON3      ?= python3
 HIP_LIB      := /opt/rocm/lib
 
@@ -44,18 +44,16 @@ RMSNORM_INCLUDES := $(JA_INCLUDES) \
 
 GEMM_CONFIG_DIR  := build/generated
 GEMM_BF16_CFG    := $(GEMM_CONFIG_DIR)/asm_bf16gemm_configs.hpp
-GEMM_I8_CFG      := $(GEMM_CONFIG_DIR)/asm_i8gemm_configs.hpp
 GEMM_FP4_CFG     := $(GEMM_CONFIG_DIR)/asm_f4gemm_configs.hpp
 GEMM_INCLUDES    := $(JA_INCLUDES) -I$(GEMM_CONFIG_DIR)
 
 JA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
               $(JA_BUILD_DIR)/mha_bwd_ja.so \
               $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
+              $(JA_BUILD_DIR)/silu_and_mul_ja.so \
               $(JA_BUILD_DIR)/gemm_fwd_ja.so \
-              $(JA_BUILD_DIR)/gemm_fp8_mi350_ja.so \
-              $(JA_BUILD_DIR)/flatmm_fp8_ja.so \
-              $(JA_BUILD_DIR)/gemm_i8_ja.so \
-              $(JA_BUILD_DIR)/gemm_fp4_ja.so
+              $(JA_BUILD_DIR)/gemm_fp4_ja.so \
+              $(JA_BUILD_DIR)/cast_mxfp4_ja.so
 
 .PHONY: all clean ja_mods
 
@@ -82,11 +80,11 @@ $(JA_BUILD_DIR)/mha_bwd_ja.so: csrc/ffi/mha_bwd/mha_bwd_ja.cu | $(JA_BUILD_DIR)/
 $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so: csrc/ffi/rmsnorm/rmsnorm_fwd_ja.cu | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(RMSNORM_INCLUDES) $< -o $@
 
+$(JA_BUILD_DIR)/silu_and_mul_ja.so: csrc/ffi/activation/silu_and_mul_ja.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
+
 $(GEMM_BF16_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m bf16gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
-
-$(GEMM_I8_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
-	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m i8gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
 
 $(GEMM_FP4_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m f4gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
@@ -94,17 +92,14 @@ $(GEMM_FP4_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 $(JA_BUILD_DIR)/gemm_fwd_ja.so: csrc/ffi/gemm_fwd/gemm_fwd_ja.cu $(GEMM_BF16_CFG) | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) $< -o $@
 
-$(JA_BUILD_DIR)/gemm_fp8_mi350_ja.so: csrc/ffi/gemm_fp8_mi350/gemm_fp8_mi350_ja.cu | $(JA_BUILD_DIR)/
-	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
-
-$(JA_BUILD_DIR)/flatmm_fp8_ja.so: csrc/ffi/flatmm_fp8/flatmm_fp8_ja.cu | $(JA_BUILD_DIR)/
-	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
-
-$(JA_BUILD_DIR)/gemm_i8_ja.so: csrc/ffi/gemm_i8/gemm_i8_ja.cu $(GEMM_I8_CFG) | $(JA_BUILD_DIR)/
-	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) $< -o $@
-
 $(JA_BUILD_DIR)/gemm_fp4_ja.so: csrc/ffi/gemm_fp4/gemm_fp4_ja.cu $(GEMM_FP4_CFG) | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) $< -o $@
+
+CAST_MXFP4_SRC := csrc/ffi/cast_mxfp4/cast_mxfp4_ja.cu
+CAST_MXFP4_KERNEL := csrc/ffi/cast_mxfp4/cast_transpose_mxfp4_kernel_shuffled.cu
+$(JA_BUILD_DIR)/cast_mxfp4_ja.so: $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) \
+		-Icsrc/ffi/cast_mxfp4 $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) -o $@
 
 clean:
 	rm -rf build/jax_aiter_build build/aiter_build
