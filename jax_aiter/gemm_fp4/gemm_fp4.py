@@ -26,12 +26,13 @@ import jax.numpy as jnp
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from ..ops.gemm_fp4 import (
+    gemm_fp4 as _gemm_fp4_ffi,
+    cast_mxfp4 as _cast_mxfp4_op,
+    cast_mxfp4_dual as _cast_mxfp4_dual_op,
+)
 from ..ffi.registry import register_ffi_target
 from .fp4_utils import bf16_to_mxfp4, e8m0_shuffle, shuffle_weight
-
-
-def _ensure_registered():
-    register_ffi_target("GemmFp4FwdJA", "ROCM")
 
 
 _FUSED_QUANT_CACHE = None
@@ -76,67 +77,19 @@ def _use_hadamard():
 
 
 # ---------------------------------------------------------------------------
-# FFI call wrappers
+# FFI call wrappers — delegate to ops/ layer with env-var config
 # ---------------------------------------------------------------------------
 
 def _cast_mxfp4_fused_impl(x, shuffle_fp4):
     """Fused BF16 -> MXFP4 quantization + shuffle via HIP kernel (single FFI call)."""
-    register_ffi_target("CastMxfp4JA", "ROCM")
-    M, K = x.shape
-    scale_n = (K + 31) // 32
-    m_pad = ((M + 255) // 256) * 256
-    scale_n_pad = ((scale_n + 7) // 8) * 8
-
-    out_shapes = (
-        jax.ShapeDtypeStruct((M, K // 2), jnp.uint8),
-        jax.ShapeDtypeStruct((m_pad, scale_n_pad), jnp.uint8),
-    )
-    call = jax.ffi.ffi_call(
-        "CastMxfp4JA", out_shapes,
-        vmap_method="broadcast_all",
-        has_side_effect=False,
-    )
-    return call(x, shuffle_fp4=shuffle_fp4,
-                shuffle_scales=True, use_hadamard=_use_hadamard())
+    return _cast_mxfp4_op(x, shuffle_fp4=shuffle_fp4, use_hadamard=_use_hadamard())
 
 
 def _cast_mxfp4_dual_impl(x, shuffle_fp4, shuffle_colwise_fp4=True):
-    """Fused BF16 -> MXFP4 with BOTH rowwise and columnwise output in one kernel launch.
-
-    Returns rowwise (for forward GEMM) + columnwise (for dA/dB backward GEMM).
-    Scale layout is always shuffled for AITER ASM.
-    FP4 data shuffle is controlled independently for rowwise and columnwise:
-      shuffle_fp4: controls rowwise B-preshuffle (True for weights, False for activations)
-      shuffle_colwise_fp4: controls columnwise B-preshuffle
-        True  -> colwise output suitable as GEMM B operand (dA backward)
-        False -> colwise output is linear layout, equivalent to rowwise of x^T
-                 (suitable as GEMM A operand for dB backward)
-    """
-    register_ffi_target("CastMxfp4DualJA", "ROCM")
-    M, K = x.shape
-
-    rscale_n = (K + 31) // 32
-    r_m_pad = ((M + 255) // 256) * 256
-    rscale_n_pad = ((rscale_n + 7) // 8) * 8
-
-    cscale_n = (M + 31) // 32
-    c_k_pad = ((K + 255) // 256) * 256
-    cscale_n_pad = ((cscale_n + 7) // 8) * 8
-
-    out_shapes = (
-        jax.ShapeDtypeStruct((M, K // 2), jnp.uint8),
-        jax.ShapeDtypeStruct((r_m_pad, rscale_n_pad), jnp.uint8),
-        jax.ShapeDtypeStruct((K, M // 2), jnp.uint8),
-        jax.ShapeDtypeStruct((c_k_pad, cscale_n_pad), jnp.uint8),
-    )
-    call = jax.ffi.ffi_call(
-        "CastMxfp4DualJA", out_shapes,
-        vmap_method="broadcast_all",
-        has_side_effect=False,
-    )
-    return call(x, shuffle_fp4=shuffle_fp4,
-                shuffle_colwise_fp4=shuffle_colwise_fp4,
-                use_hadamard=_use_hadamard())
+    """Fused BF16 -> MXFP4 with BOTH rowwise and columnwise output in one kernel launch."""
+    return _cast_mxfp4_dual_op(x, shuffle_fp4=shuffle_fp4,
+                               shuffle_colwise_fp4=shuffle_colwise_fp4,
+                               use_hadamard=_use_hadamard())
 
 
 def _cast_mxfp4_raw_act(x):
@@ -349,20 +302,6 @@ _cast_mxfp4_fused_grad_dual.def_partition(
 # ---------------------------------------------------------------------------
 # FP4 GEMM FFI call + custom_partitioning
 # ---------------------------------------------------------------------------
-
-def _gemm_fp4_ffi(a_packed, b_packed, a_scale, b_scale):
-    """Raw FP4 FFI GEMM call. Inputs must already be quantized and shuffled."""
-    _ensure_registered()
-    M = a_packed.shape[0]
-    N = b_packed.shape[0]
-    call = jax.ffi.ffi_call(
-        "GemmFp4FwdJA",
-        jax.ShapeDtypeStruct((M, N), jnp.bfloat16),
-        vmap_method="broadcast_all",
-        has_side_effect=False,
-    )
-    return jax.jit(call)(a_packed, b_packed, a_scale, b_scale)
-
 
 def gemm_fp4(a, b, a_scale, b_scale):
     """Low-level FP4 GEMM with pre-quantized + pre-shuffled inputs."""
