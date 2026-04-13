@@ -8,7 +8,7 @@ from .ja_compat.config import set_aiter_asm_dir
 
 set_aiter_asm_dir()
 
-__all__ = ["mha"]
+__all__ = ["mha", "ops"]
 
 
 def __getattr__(name):

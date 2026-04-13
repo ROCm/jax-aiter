@@ -15,40 +15,8 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
-from ..ffi.registry import register_ffi_target
-
-
-def _ensure_registered():
-    register_ffi_target("SiluAndMulJA", "ROCM")
-
-
-# ---------------------------------------------------------------------------
-# FFI call wrapper
-# ---------------------------------------------------------------------------
-
-def _silu_and_mul_ffi_call(out_shape, dtype):
-    """Create a JIT-compiled FFI call for SiluAndMul."""
-    call = jax.ffi.ffi_call(
-        "SiluAndMulJA",
-        jax.ShapeDtypeStruct(out_shape, dtype),
-        vmap_method="broadcast_all",
-    )
-    return jax.jit(call)
-
-
-def _silu_and_mul_ffi(gate: jnp.ndarray, up: jnp.ndarray) -> jnp.ndarray:
-    """Low-level FFI call: concatenate gate/up → [M, 2*D], call kernel → [M, D]."""
-    _ensure_registered()
-
-    # Concatenate gate and up along last axis: [*, D] + [*, D] → [*, 2*D]
-    combined = jnp.concatenate([gate, up], axis=-1)
-
-    # Output shape is gate's shape (= up's shape).
-    out_shape = gate.shape
-    fn = _silu_and_mul_ffi_call(out_shape, gate.dtype)
-    return fn(combined)
+from ..ops.activation import silu_and_mul as _silu_and_mul_ffi
 
 
 # ---------------------------------------------------------------------------

@@ -12,37 +12,8 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
-from ..ffi.registry import register_ffi_target
-
-
-def _ensure_registered():
-    register_ffi_target("RmsnormFwdJA", "ROCM")
-
-
-def _empty(dtype):
-    return jnp.zeros((0,), dtype=dtype)
-
-
-def _rmsnorm_fwd_call(y_shape, residual_out_shape, inv_rms_shape, dtype):
-    call = jax.ffi.ffi_call(
-        "RmsnormFwdJA",
-        (
-            jax.ShapeDtypeStruct(y_shape, dtype),
-            jax.ShapeDtypeStruct(residual_out_shape, dtype),
-            jax.ShapeDtypeStruct(inv_rms_shape, dtype),
-        ),
-        vmap_method="broadcast_all",
-    )
-
-    def _invoke(x, gamma, residual, *, epsilon, save_rms, fused_add):
-        return call(x, gamma, residual,
-                    epsilon=np.float32(epsilon),
-                    save_rms=save_rms,
-                    fused_add=np.int32(fused_add))
-
-    return jax.jit(_invoke, static_argnames=("epsilon", "save_rms", "fused_add"))
+from ..ops.rmsnorm import rmsnorm_fwd as _rmsnorm_fwd_op
 
 
 # ---------------------------------------------------------------------------
@@ -56,20 +27,12 @@ def rms_norm(
     epsilon: float = 1e-6,
 ) -> jnp.ndarray:
     """RMSNorm: y = x / sqrt(mean(x^2) + eps) * gamma."""
-    _ensure_registered()
-
-    fn = _rmsnorm_fwd_call(x.shape, (0,), x.shape[:-1], x.dtype)
-    y, _, _ = fn(x, gamma, _empty(x.dtype),
-                 epsilon=epsilon, save_rms=False, fused_add=0)
+    y, _, _ = _rmsnorm_fwd_op(x, gamma, epsilon=epsilon)
     return y
 
 
 def _rms_norm_fwd(x, gamma, epsilon):
-    _ensure_registered()
-
-    fn = _rmsnorm_fwd_call(x.shape, (0,), x.shape[:-1], x.dtype)
-    y, _, _ = fn(x, gamma, _empty(x.dtype),
-                 epsilon=epsilon, save_rms=False, fused_add=0)
+    y, _, _ = _rmsnorm_fwd_op(x, gamma, epsilon=epsilon)
     return y, (x, gamma)
 
 
@@ -114,20 +77,14 @@ def rms_norm_with_add(
 
     Returns (y, residual_out) where residual_out = x + residual.
     """
-    _ensure_registered()
-
-    fn = _rmsnorm_fwd_call(x.shape, x.shape, x.shape[:-1], x.dtype)
-    y, residual_out, _ = fn(x, gamma, residual,
-                            epsilon=epsilon, save_rms=False, fused_add=1)
+    y, residual_out, _ = _rmsnorm_fwd_op(x, gamma, residual,
+                                         epsilon=epsilon, fused_add=True)
     return y, residual_out
 
 
 def _rms_norm_with_add_fwd(x, residual, gamma, epsilon):
-    _ensure_registered()
-
-    fn = _rmsnorm_fwd_call(x.shape, x.shape, x.shape[:-1], x.dtype)
-    y, residual_out, _ = fn(x, gamma, residual,
-                            epsilon=epsilon, save_rms=False, fused_add=1)
+    y, residual_out, _ = _rmsnorm_fwd_op(x, gamma, residual,
+                                         epsilon=epsilon, fused_add=True)
     return (y, residual_out), (residual_out, gamma)
 
 
