@@ -303,6 +303,32 @@ _cast_mxfp4_fused_grad_dual.def_partition(
 # FP4 GEMM FFI call + custom_partitioning
 # ---------------------------------------------------------------------------
 
+_KERNEL_SEL_CACHE = None
+
+
+def _use_kernel_selection():
+    """Use per-shape kernel selection via AITER's tuned CSV. Enable with AITER_KERNEL_SEL=1."""
+    global _KERNEL_SEL_CACHE
+    if _KERNEL_SEL_CACHE is None:
+        import os
+        _KERNEL_SEL_CACHE = os.environ.get("AITER_KERNEL_SEL", "0") == "1"
+    return _KERNEL_SEL_CACHE
+
+
+def _get_kernel_name(M, N, K):
+    """Look up the best kernel for a given shape from AITER's tuned CSV."""
+    if not _use_kernel_selection():
+        return ""
+    try:
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+        cfg = get_GEMM_config(M, N, K)
+        if cfg is not None:
+            return cfg["kernelName"]
+    except Exception:
+        pass
+    return ""
+
+
 def gemm_fp4(a, b, a_scale, b_scale):
     """Low-level FP4 GEMM with pre-quantized + pre-shuffled inputs."""
     return _gemm_fp4_ffi(a, b, a_scale, b_scale)
@@ -366,6 +392,150 @@ _fp4_ffi_partitioned.def_partition(
     sharding_rule="m kp, n kp, m ks, n ks -> m n",
     need_replication_factors=("kp", "ks"),
 )
+
+
+# ---------------------------------------------------------------------------
+# Wgrad-layout FP4 GEMM with correct NT-layout sharding.
+#
+# The FP4 FFI computes OUT[M_k, N_k] = A[M_k, K_k/2] @ B[N_k, K_k/2]^T where
+# the K_k axis is the contraction. For **fprop/dgrad** K_k is a hidden
+# dimension (typically replicated across FSDP), so the existing
+# `_fp4_ffi_partitioned` declares K as replication-required.
+#
+# For **wgrad** the contraction axis is M_batch (batch * seq), which IS
+# FSDP-sharded. We therefore need a separate partition callback that:
+#   - Accepts sharding on the SECOND (packed-K) axis of both operands.
+#   - Computes the local partial GEMM on each shard.
+#   - Emits ``jax.lax.psum`` across the FSDP mesh axis to sum partials.
+# This mirrors how XLA lowers ``lax.dot_general`` over a sharded contraction:
+# local matmul + reduce-scatter/all-reduce.
+#
+# Operand layout for wgrad (after dual-cast of grad_out and activation):
+#   A = grad_col_fp4   [N, M/2]   (grad_out's columnwise, unshuffled)
+#   B = input_col_fp4  [K, M/2]   (activation's columnwise, shuffled for B)
+#   OUT = dB           [N, K]     (weight-gradient)
+# ---------------------------------------------------------------------------
+@custom_partitioning
+def _fp4_ffi_partitioned_wgrad(a_packed, b_packed, a_scale, b_scale):
+    """FP4 GEMM for wgrad: contraction axis is allowed to be sharded."""
+    return _gemm_fp4_ffi(a_packed, b_packed, a_scale, b_scale)
+
+
+def _extract_fsdp_axis(spec, dim_index):
+    """Return the mesh-axis name(s) sharded on ``spec[dim_index]`` or ``None``."""
+    if spec is None:
+        return None
+    if dim_index >= len(spec):
+        return None
+    return spec[dim_index]
+
+
+def _fp4_wgrad_infer_sharding(mesh, arg_shapes, result_shape):
+    """Output sharding for wgrad.
+
+    Output ``dB[N, K]``: the first dim (N) inherits from A's row sharding and
+    the second dim (K) inherits from B's row sharding. Both are usually
+    replicated after the reduction, matching how XLA outputs a reduce-scatter
+    result.
+    """
+    a_spec = _get_spec(arg_shapes[0])
+    b_spec = _get_spec(arg_shapes[1])
+    n_axis = a_spec[0] if a_spec is not None and len(a_spec) >= 1 else None
+    k_axis = b_spec[0] if b_spec is not None and len(b_spec) >= 1 else None
+    return NamedSharding(mesh, P(n_axis, k_axis))
+
+
+def _fp4_wgrad_partition(mesh, arg_shapes, result_shape):
+    """Partition callback that locally computes dB then ``psum``s over M.
+
+    Expects inputs with sharding:
+      a_packed: P(N_axis_or_None, M_axis)
+      b_packed: P(K_axis_or_None, M_axis)
+    The M_axis shared between the two second dims is the FSDP contraction
+    axis. After the local FP4 GEMM we ``psum`` across that mesh axis.
+    """
+    a_spec = _get_spec(arg_shapes[0])
+    b_spec = _get_spec(arg_shapes[1])
+
+    n_axis = _extract_fsdp_axis(a_spec, 0)
+    k_axis = _extract_fsdp_axis(b_spec, 0)
+    m_axis_a = _extract_fsdp_axis(a_spec, 1)
+    m_axis_b = _extract_fsdp_axis(b_spec, 1)
+
+    m_axis = m_axis_a if m_axis_a is not None else m_axis_b
+    if m_axis_a is not None and m_axis_b is not None and m_axis_a != m_axis_b:
+        m_axis = m_axis_a
+
+    n_set = (set(n_axis) if isinstance(n_axis, tuple)
+             else {n_axis} if n_axis is not None else set())
+    k_set = (set(k_axis) if isinstance(k_axis, tuple)
+             else {k_axis} if k_axis is not None else set())
+    if n_set & k_set:
+        remaining = k_set - n_set
+        k_axis = (next(iter(remaining)) if len(remaining) == 1
+                  else tuple(sorted(remaining)) if remaining else None)
+
+    a_pspec = P(n_axis, m_axis)
+    b_pspec = P(k_axis, m_axis)
+    s_a_pspec = P(n_axis, m_axis)
+    s_b_pspec = P(k_axis, m_axis)
+    out_pspec = P(n_axis, k_axis)
+
+    # Normalize the reduction axis to an iterable for ``jax.lax.psum``.
+    if m_axis is None:
+        psum_axes = ()
+    elif isinstance(m_axis, tuple):
+        psum_axes = m_axis
+    else:
+        psum_axes = (m_axis,)
+
+    def _lowered(a_packed, b_packed, a_scale, b_scale):
+        partial = _gemm_fp4_ffi(a_packed, b_packed, a_scale, b_scale)
+        if psum_axes:
+            partial = jax.lax.psum(partial, axis_name=psum_axes)
+        return partial
+
+    return (mesh, _lowered,
+            NamedSharding(mesh, out_pspec),
+            (NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec),
+             NamedSharding(mesh, s_a_pspec), NamedSharding(mesh, s_b_pspec)))
+
+
+# Shardy rule: the reduction axis is labelled ``mp`` (packed M) and it appears
+# on both inputs' second dims but **not** on the output. In Shardy, an axis
+# that is present on inputs but absent from the output is a reduction axis;
+# XLA will automatically insert the reduce-scatter / all-reduce around the
+# local call. This matches how ``lax.dot_general`` lowers a sharded
+# contraction.
+_fp4_ffi_partitioned_wgrad.def_partition(
+    _fp4_wgrad_partition,
+    infer_sharding_from_operands=_fp4_wgrad_infer_sharding,
+    sharding_rule="n mp, k mp, n ms, k ms -> n k",
+    need_replication_factors=(),
+)
+
+
+# ---------------------------------------------------------------------------
+# All-FP4 training recipe (TE-parity): FP4 fwd + FP4 dA (NN) + FP4 dB (NT).
+# ---------------------------------------------------------------------------
+_ALL_FP4_CACHE = None
+
+
+def _use_all_fp4():
+    """Use the full all-FP4 training recipe (FP4 fwd + FP4 dA + FP4 dB).
+
+    When enabled, backward uses :func:`_fp4_ffi_partitioned_wgrad` for dB with
+    correct NT-layout sharding (M_batch as reduction axis), removing the
+    dependency on FP8 ``dot_general`` for weight gradients.
+
+    Requires fused HIP quant (``AITER_FUSED_QUANT=1``). Off by default while
+    this path is being perf-validated; enable with ``AITER_ALL_FP4=1``.
+    """
+    global _ALL_FP4_CACHE
+    if _ALL_FP4_CACHE is None:
+        import os
+        _ALL_FP4_CACHE = os.environ.get("AITER_ALL_FP4", "0") == "1"
+    return _ALL_FP4_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +761,85 @@ def gemm_fp4_bf16(a, b):
     return _fp4_ffi_partitioned(a_packed, b_packed, a_scales_sh, b_scales_sh)
 
 
+_LAZY_WEIGHT_COL_CACHE = None
+
+
+def _use_lazy_weight_col():
+    """Defer weight columnwise quantization to backward (saves ~37 GB persistent).
+
+    Forward produces weight rowwise only via CastMxfp4JA.  Backward creates
+    columnwise on demand via CastMxfp4DualJA for dgrad, then discards it.
+    Saves memory because the columnwise data doesn't persist across scan
+    iterations.
+
+    Enable with AITER_LAZY_WEIGHT_COL=1.  Requires fused quant + FP4 dA.
+    """
+    global _LAZY_WEIGHT_COL_CACHE
+    if _LAZY_WEIGHT_COL_CACHE is None:
+        import os
+        _LAZY_WEIGHT_COL_CACHE = os.environ.get("AITER_LAZY_WEIGHT_COL", "0") == "1"
+    return _LAZY_WEIGHT_COL_CACHE
+
+
+_FP4_RESIDUALS_CACHE = None
+
+
+def _use_fp4_residuals():
+    """Save activation residuals as FP4 instead of BF16 (4x smaller scan carry).
+
+    The forward saves (a_fp4_packed, a_fp4_scales, col_b_fp4, col_b_scale)
+    instead of (a_bf16, col_b_fp4, col_b_scale).  The backward dequantizes
+    a_fp4 back to BF16 for the native FP8 dB path, keeping FSDP
+    reduce-scatter fusion intact while cutting residual memory ~4x.
+
+    Enable with AITER_FP4_RESIDUALS=1.  Requires fused quant + FP4 dA.
+    """
+    global _FP4_RESIDUALS_CACHE
+    if _FP4_RESIDUALS_CACHE is None:
+        import os
+        _FP4_RESIDUALS_CACHE = os.environ.get("AITER_FP4_RESIDUALS", "0") == "1"
+    return _FP4_RESIDUALS_CACHE
+
+
+def _dequant_fp4_for_db(a_packed, a_scales_sh):
+    """Dequantize saved FP4 activation back to BF16 for native FP8 dB.
+
+    a_packed is linear (shuffle_fp4=False) FP4 data from CastMxfp4JA.
+    a_scales_sh is SHUFFLED E8M0 scales.  We unshuffle before decoding.
+    """
+    from .fp4_utils import MXFP4_BLOCK_SIZE
+    M = a_packed.shape[0]
+    K_half = a_packed.shape[1]
+    K = K_half * 2
+
+    lut = jnp.array([
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ], dtype=jnp.float32)
+
+    low = (a_packed & jnp.uint8(0xF)).astype(jnp.int32)
+    high = (a_packed >> jnp.uint8(4)).astype(jnp.int32)
+    vals = jnp.empty((M, K), dtype=jnp.float32)
+    vals = vals.at[:, 0::2].set(lut[low])
+    vals = vals.at[:, 1::2].set(lut[high])
+
+    scales_flat = _unshuffle_e8m0(a_scales_sh)
+
+    num_blocks = K // MXFP4_BLOCK_SIZE
+    scale_f32 = jnp.exp2(scales_flat[:M, :num_blocks].astype(jnp.float32) - 127.0)
+    scale_expanded = jnp.repeat(scale_f32, MXFP4_BLOCK_SIZE, axis=-1)
+
+    return (vals * scale_expanded).astype(jnp.bfloat16)
+
+
+def _unshuffle_e8m0(scales_sh):
+    """Inverse of e8m0_shuffle: recover linear [M, N] layout from ASM-shuffled scales."""
+    sm, sn = scales_sh.shape
+    reshaped = scales_sh.reshape(sm // 32, sn // 32, 4, 16, 2, 2)
+    permuted = reshaped.transpose(0, 5, 3, 1, 4, 2)
+    return permuted.reshape(sm, sn)
+
+
 def _gemm_fp4_bf16_fwd(a, b):
     if _use_fused_quant() and _use_fp4_da():
         if _use_composite_fp4():
@@ -600,13 +849,28 @@ def _gemm_fp4_bf16_fwd(a, b):
             out, col_b_fp4, col_b_scale = _composite_fp4_fwd_dual_raw(a, b)
             return out, (a, col_b_fp4, col_b_scale)
 
-        if _use_fp4_db():
+        # TE-parity all-FP4 path: dual-cast activations so col_a is available
+        # for the FP4 wgrad in backward. Same FFI kernel, just both outputs.
+        if _use_all_fp4() or _use_fp4_db():
             (a_packed, a_scales_sh,
              col_a_fp4, col_a_scale) = _cast_mxfp4_fused_act_dual(a)
             (b_packed, b_scales_sh,
              col_b_fp4, col_b_scale) = _cast_mxfp4_fused_dual(b)
             out = _fp4_ffi_partitioned(a_packed, b_packed, a_scales_sh, b_scales_sh)
             return out, (col_a_fp4, col_a_scale, col_b_fp4, col_b_scale)
+
+        if _use_fp4_residuals():
+            a_packed, a_scales_sh = _cast_mxfp4_fused_act(a)
+            (b_packed, b_scales_sh,
+             col_b_fp4, col_b_scale) = _cast_mxfp4_fused_dual(b)
+            out = _fp4_ffi_partitioned(a_packed, b_packed, a_scales_sh, b_scales_sh)
+            return out, (a_packed, a_scales_sh, col_b_fp4, col_b_scale)
+
+        if _use_lazy_weight_col():
+            a_packed, a_scales_sh = _cast_mxfp4_fused_act(a)
+            b_packed, b_scales_sh = _cast_mxfp4_fused_wt(b)
+            out = _fp4_ffi_partitioned(a_packed, b_packed, a_scales_sh, b_scales_sh)
+            return out, (a, b)
 
         a_packed, a_scales_sh = _cast_mxfp4_fused_act(a)
         (b_packed, b_scales_sh,
@@ -745,12 +1009,39 @@ def _fp4_da_with_columnwise(grad_out, col_b_fp4, col_b_scale):
 
 
 def _gemm_fp4_bf16_bwd(residuals, grad_out):
-    if _use_fused_quant() and _use_fp4_da() and _use_fp4_db():
+    # TE-parity all-FP4 path: dual-cast grad_out once, compute FP4 dA (NN)
+    # and FP4 dB (NT with correct wgrad sharding) in one backward rule.
+    if _use_fused_quant() and _use_fp4_da() and (_use_all_fp4() or _use_fp4_db()):
         col_a_fp4, col_a_scale, col_b_fp4, col_b_scale = residuals
         (go_packed, go_scales,
          go_col_fp4, go_col_scale) = _cast_mxfp4_fused_grad_dual(grad_out)
         da = _fp4_ffi_partitioned(go_packed, col_b_fp4, go_scales, col_b_scale)
-        db = _fp4_ffi_partitioned(go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
+        if _use_all_fp4():
+            # NT-layout wgrad with M (batch) as the reduction axis. The
+            # partition callback emits psum across the FSDP mesh axis.
+            db = _fp4_ffi_partitioned_wgrad(
+                go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
+        else:
+            # Legacy FP4 dB (no wgrad-aware sharding); kept for regression
+            # comparison. Deprecated once AITER_ALL_FP4=1 becomes default.
+            db = _fp4_ffi_partitioned(
+                go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
+    elif _use_fused_quant() and _use_fp4_da() and _use_fp4_residuals():
+        a_packed, a_scales_sh, col_b_fp4, col_b_scale = residuals
+        da = _fp4_da_with_columnwise(grad_out, col_b_fp4, col_b_scale)
+        a_bf16 = _dequant_fp4_for_db(a_packed, a_scales_sh)
+        if _use_fp8_db():
+            db = _fp8_dot_general_db(grad_out, a_bf16)
+        else:
+            db = jax.lax.dot_general(grad_out, a_bf16, (((0,), (0,)), ((), ())))
+    elif _use_fused_quant() and _use_fp4_da() and _use_lazy_weight_col():
+        a, b = residuals
+        (_, _, col_b_fp4, col_b_scale) = _cast_mxfp4_fused_dual(b)
+        da = _fp4_da_with_columnwise(grad_out, col_b_fp4, col_b_scale)
+        if _use_fp8_db():
+            db = _fp8_dot_general_db(grad_out, a)
+        else:
+            db = jax.lax.dot_general(grad_out, a, (((0,), (0,)), ((), ())))
     elif _use_fused_quant() and _use_fp4_da():
         a, col_b_fp4, col_b_scale = residuals
         da = _fp4_da_with_columnwise(grad_out, col_b_fp4, col_b_scale)

@@ -71,7 +71,7 @@ jobs:
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               git ca-certificates curl build-essential pkg-config
-            python3 -m pip install --break-system-packages --upgrade pip
+            curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --break-system-packages
             python3 -m pip install --break-system-packages cmake ninja pyyaml psutil pandas
 
             # JAX must be installed before build (Makefile needs jax.ffi.include_dir())
@@ -136,7 +136,7 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euxo pipefail
-            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; from jax_aiter.rmsnorm import rms_norm; from jax_aiter.gemm import gemm; from jax_aiter.gemm_fp4 import gemm_fp4_bf16; print(\"jax-aiter import OK\")"
+            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; from jax_aiter.rmsnorm import rms_norm; from jax_aiter.gemm import gemm; from jax_aiter.gemm_fp4 import gemm_fp4_bf16, MXFP4Quantizer, WeightWorkspace, gemm_fp4_gate_up_bf16; print(\"jax-aiter import OK\")"
             python3 tests/smoke_gemm_test.py
             python3 tests/smoke_gemm_all_test.py
           '
@@ -147,7 +147,11 @@ jobs:
             set -euxo pipefail
             export XLA_PYTHON_CLIENT_ALLOCATOR=platform
             export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
-            python3 -m pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py
+            python3 -m pytest -v --reruns 2 \
+              tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py \
+              tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py \
+              tests/test_mxfp4_quantizer.py tests/test_weight_workspace.py \
+              tests/test_all_fp4_wgrad.py tests/test_gate_up_fusion.py
           '
 
       - name: Build summary
