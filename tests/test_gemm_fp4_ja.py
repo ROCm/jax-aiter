@@ -170,174 +170,52 @@ def test_fp4_gemm_zeros():
     assert jnp.all(jnp.isfinite(out))
 
 
-# --- High-level API tests (gemm_fp4_bf16 and gemm_fp4_weight_only) ---
+# --- High-level API tests (gemm_fp4_bf16) ---
 
-from jax_aiter.gemm_fp4 import gemm_fp4_bf16, gemm_fp4_weight_only, prepack_fp4_weight
+from jax_aiter.gemm_fp4 import gemm_fp4_bf16
 
 
 @pytest.mark.parametrize("M,N,K", [
-    pytest.param(256, 256, 256, id="256x256x256"),
-    pytest.param(256, 512, 512, id="256x512x512"),
+    pytest.param(256, 256, 256, id="small_256"),
+    pytest.param(256, 512, 512, id="medium_256x512"),
     pytest.param(1024, 1024, 512, id="1k_sq"),
 ])
-def test_weight_only_matches_per_step(M, N, K):
-    """Weight-only path must produce identical output to per-step path."""
+def test_gemm_fp4_bf16_forward(M, N, K):
+    """gemm_fp4_bf16 produces finite output of the right shape/dtype."""
     key = jax.random.PRNGKey(7)
     k1, k2 = jax.random.split(key)
     a = jax.random.normal(k1, (M, K), dtype=jnp.bfloat16)
     b = jax.random.normal(k2, (N, K), dtype=jnp.bfloat16)
 
-    out_per_step = gemm_fp4_bf16(a, b)
+    out = gemm_fp4_bf16(a, b)
 
-    b_packed, b_scales = prepack_fp4_weight(b)
-    out_weight_only = gemm_fp4_weight_only(a, b, b_packed, b_scales)
-
-    np.testing.assert_array_equal(
-        np.asarray(out_per_step), np.asarray(out_weight_only),
-        err_msg=f"Weight-only output differs from per-step at {M}x{N}x{K}",
-    )
+    assert out.shape == (M, N)
+    assert out.dtype == jnp.bfloat16
+    assert jnp.all(jnp.isfinite(out)), "Non-finite values in gemm_fp4_bf16 output"
 
 
 @pytest.mark.parametrize("M,N,K", [
-    pytest.param(256, 256, 256, id="256x256x256"),
-    pytest.param(256, 512, 512, id="256x512x512"),
+    pytest.param(256, 256, 256, id="small_256"),
+    pytest.param(256, 512, 512, id="medium_256x512"),
 ])
-def test_weight_only_backward(M, N, K):
-    """Weight-only backward produces finite gradients for a and b_bf16."""
-    key = jax.random.PRNGKey(13)
+def test_gemm_fp4_bf16_gradient_flow(M, N, K):
+    """gemm_fp4_bf16 backward produces finite gradients for a and b.
+
+    Backward path: dual-cast grad_out (Hadamard ON) -> FP4 dA (NN) +
+    FP4 dB (NT wgrad).
+    """
+    key = jax.random.PRNGKey(99)
     k1, k2 = jax.random.split(key)
     a = jax.random.normal(k1, (M, K), dtype=jnp.bfloat16)
     b = jax.random.normal(k2, (N, K), dtype=jnp.bfloat16)
 
-    b_packed, b_scales = prepack_fp4_weight(b)
-
-    def loss_fn(a_, b_bf16_, b_p_, b_s_):
-        return jnp.sum(gemm_fp4_weight_only(a_, b_bf16_, b_p_, b_s_))
-
-    grads = jax.grad(loss_fn, argnums=(0, 1))(a, b, b_packed, b_scales)
-    da, db = grads
-
-    assert da.shape == a.shape, f"da shape {da.shape} != {a.shape}"
-    assert db.shape == b.shape, f"db shape {db.shape} != {b.shape}"
-    assert da.dtype == jnp.bfloat16
-    assert db.dtype == jnp.bfloat16
-    assert jnp.all(jnp.isfinite(da)), "Non-finite da"
-    assert jnp.all(jnp.isfinite(db)), "Non-finite db"
-    assert jnp.any(da != 0), "da is all zeros"
-    assert jnp.any(db != 0), "db is all zeros"
-
-
-@pytest.mark.parametrize("M,N,K", [
-    pytest.param(256, 256, 256, id="256x256x256"),
-    pytest.param(256, 512, 512, id="256x512x512"),
-])
-def test_weight_only_backward_matches_per_step(M, N, K):
-    """Weight-only backward must match per-step backward for a and b."""
-    key = jax.random.PRNGKey(21)
-    k1, k2 = jax.random.split(key)
-    a = jax.random.normal(k1, (M, K), dtype=jnp.bfloat16)
-    b = jax.random.normal(k2, (N, K), dtype=jnp.bfloat16)
-
-    da_ps, db_ps = jax.grad(
+    da, db = jax.grad(
         lambda a_, b_: jnp.sum(gemm_fp4_bf16(a_, b_)), argnums=(0, 1)
     )(a, b)
 
-    b_packed, b_scales = prepack_fp4_weight(b)
-    da_wo, db_wo = jax.grad(
-        lambda a_, b_, bp_, bs_: jnp.sum(gemm_fp4_weight_only(a_, b_, bp_, bs_)),
-        argnums=(0, 1),
-    )(a, b, b_packed, b_scales)
-
-    np.testing.assert_allclose(
-        np.asarray(da_wo.astype(jnp.float32)),
-        np.asarray(da_ps.astype(jnp.float32)),
-        rtol=1e-3, atol=1e-5,
-        err_msg=f"da mismatch at {M}x{N}x{K}",
-    )
-    np.testing.assert_allclose(
-        np.asarray(db_wo.astype(jnp.float32)),
-        np.asarray(db_ps.astype(jnp.float32)),
-        rtol=0.05, atol=1.0,
-        err_msg=f"db mismatch at {M}x{N}x{K}",
-    )
-
-
-# --- FP8 dB backward tests ---
-
-from jax_aiter.gemm_fp4.gemm_fp4 import _fp8_dot_general_db
-
-
-@pytest.mark.parametrize("M,N,K", [
-    pytest.param(256, 256, 256, id="small_256"),
-    pytest.param(256, 512, 512, id="medium_256x512"),
-    pytest.param(1024, 1024, 512, id="1k_sq"),
-    pytest.param(9216, 14336, 4096, id="8B_gate_up_dB"),
-    pytest.param(9216, 4096, 14336, id="8B_down_dB"),
-])
-def test_fp8_db_accuracy(M, N, K):
-    """FP8 dB must approximate BF16 dB within reasonable tolerance.
-
-    dB[N,K] = grad_out^T[N,M] @ A[M,K]
-    Operands: grad_out[M,N], a[M,K], contraction on dim 0.
-    """
-    key = jax.random.PRNGKey(42)
-    k1, k2 = jax.random.split(key)
-    grad_out = jax.random.normal(k1, (M, N), dtype=jnp.bfloat16)
-    a = jax.random.normal(k2, (M, K), dtype=jnp.bfloat16)
-
-    db_bf16 = jax.lax.dot_general(grad_out, a, (((0,), (0,)), ((), ())))
-    db_fp8 = _fp8_dot_general_db(grad_out, a)
-
-    assert db_fp8.shape == db_bf16.shape
-    assert db_fp8.dtype == jnp.bfloat16
-    assert jnp.all(jnp.isfinite(db_fp8)), "Non-finite values in FP8 dB"
-
-    ref = db_bf16.astype(jnp.float32)
-    test = db_fp8.astype(jnp.float32)
-    abs_err = jnp.abs(ref - test)
-    scale = jnp.maximum(jnp.abs(ref), 1.0)
-    rel_err = abs_err / scale
-    mean_rel = float(jnp.mean(rel_err))
-
-    assert mean_rel < 0.15, (
-        f"FP8 dB mean relative error {mean_rel:.4f} too large at {M}x{N}x{K}"
-    )
-
-
-@pytest.mark.parametrize("M,N,K", [
-    pytest.param(256, 256, 256, id="small_256"),
-    pytest.param(256, 512, 512, id="medium_256x512"),
-])
-def test_fp8_db_gradient_flow(M, N, K):
-    """FP8 dB path produces correct gradient shapes and finite values
-    when used inside gemm_fp4_bf16 backward with AITER_FP8_DB=1."""
-    import os
-    old_val = os.environ.get("AITER_FP8_DB")
-    os.environ["AITER_FP8_DB"] = "1"
-
-    from jax_aiter.gemm_fp4.gemm_fp4 import _FP8_DB_CACHE
-    import jax_aiter.gemm_fp4.gemm_fp4 as _mod
-    _mod._FP8_DB_CACHE = None
-
-    try:
-        key = jax.random.PRNGKey(99)
-        k1, k2 = jax.random.split(key)
-        a = jax.random.normal(k1, (M, K), dtype=jnp.bfloat16)
-        b = jax.random.normal(k2, (N, K), dtype=jnp.bfloat16)
-
-        da, db = jax.grad(
-            lambda a_, b_: jnp.sum(gemm_fp4_bf16(a_, b_)), argnums=(0, 1)
-        )(a, b)
-
-        assert da.shape == a.shape
-        assert db.shape == b.shape
-        assert jnp.all(jnp.isfinite(da)), "Non-finite da with FP8 dB"
-        assert jnp.all(jnp.isfinite(db)), "Non-finite db with FP8 dB"
-        assert jnp.any(da != 0), "da all zeros"
-        assert jnp.any(db != 0), "db all zeros"
-    finally:
-        _mod._FP8_DB_CACHE = None
-        if old_val is None:
-            os.environ.pop("AITER_FP8_DB", None)
-        else:
-            os.environ["AITER_FP8_DB"] = old_val
+    assert da.shape == a.shape
+    assert db.shape == b.shape
+    assert jnp.all(jnp.isfinite(da)), "Non-finite da"
+    assert jnp.all(jnp.isfinite(db)), "Non-finite db"
+    assert jnp.any(da != 0), "da all zeros"
+    assert jnp.any(db != 0), "db all zeros"

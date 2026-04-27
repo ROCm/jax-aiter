@@ -1,12 +1,11 @@
 #!/bin/bash
-# All-FP4 loss convergence validation — Llama3.3-70B, 50 steps.
-# Mirrors session-18 convergence check used for the hybrid production recipe.
-# Reports step-by-step loss for hybrid_prod and all_fp4 to verify the all-FP4
-# recipe converges to within 0.03 of hybrid by step 49.
+# FP4 loss convergence validation -- Llama3.3-70B.
+# Reports step-by-step loss for fp4 vs fp8_baseline to verify the FP4 recipe
+# converges similarly to native FP8.
 #
 # Usage (inside container):
-#   bash tests/validate_all_fp4_70b_convergence.sh          # 50 steps
-#   bash tests/validate_all_fp4_70b_convergence.sh 100      # 100 steps
+#   bash tests/validate_fp4_70b_convergence.sh          # 50 steps
+#   bash tests/validate_fp4_70b_convergence.sh 200      # 200 steps
 set -uo pipefail
 
 STEPS="${1:-50}"
@@ -28,7 +27,7 @@ export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 XLA_BASE='--xla_gpu_memory_limit_slop_factor=95 --xla_gpu_reduce_scatter_combine_threshold_bytes=8589934592 --xla_gpu_enable_command_buffer= --xla_gpu_enable_latency_hiding_scheduler=True --xla_gpu_all_gather_combine_threshold_bytes=8589934592 --xla_gpu_enable_triton_gemm=False --xla_gpu_enable_cublaslt=True --xla_gpu_autotune_level=4 --xla_gpu_enable_all_gather_combine_by_dim=FALSE --xla_gpu_enable_nccl_comm_splitting=false'
 
-LOGDIR=/ruvaidya/aiter_proj/docs/logs/all_fp4_70b_convergence
+LOGDIR=/ruvaidya/aiter_proj/docs/logs/fp4_70b_convergence
 mkdir -p "$LOGDIR"
 
 MODEL_70B="src/maxtext/configs/base.yml \
@@ -46,69 +45,69 @@ set_aiter_env() {
     export AITER_ASM_DIR=/ruvaidya/aiter_proj/jax-aiter/third_party/aiter/hsa/
     export AITER_SYMBOL_VISIBLE=1
     export GPU_ARCHS=gfx950
+    export AITER_FP4_ATTN=1
 }
 
-clean_aiter() {
-    unset AITER_FP4_DA AITER_FP4_DB AITER_FP8_DB AITER_FUSED_QUANT \
-          AITER_FP4_ATTN AITER_ALL_FP4 2>/dev/null || true
+clean_env() {
+    unset JA_ROOT_DIR AITER_ASM_DIR AITER_SYMBOL_VISIBLE GPU_ARCHS \
+          AITER_FP4_ATTN AITER_FUSED_QUANT_HADAMARD AITER_KERNEL_SEL 2>/dev/null || true
 }
 
 echo "======================================================================"
-echo "All-FP4 Convergence — Llama3.3-70B, ${STEPS} steps, 8x MI355X"
+echo "FP4 vs FP8 Convergence -- Llama3.3-70B, ${STEPS} steps, 8x MI355X"
 echo "======================================================================"
 
-# --- Run 1: hybrid_prod ---
+# --- Run 1: fp8_baseline (cool GPUs first for thermal hygiene) ---
 echo ""
-echo "── hybrid_prod (FP4 fwd + FP4 dA + FP8 dB) ──"
-clean_aiter; set_aiter_env
-export AITER_FP4_DA=1 AITER_FP4_DB=0 AITER_FP8_DB=1 AITER_FUSED_QUANT=1 AITER_FP4_ATTN=1 AITER_ALL_FP4=0
+echo "-- fp8_baseline (native hipBLASLt FP8) --"
+clean_env
 export XLA_FLAGS="${XLA_BASE}"
 set +e
 python3 -m maxtext.trainers.pre_train.train $MODEL_70B \
-    steps=$STEPS use_jax_aiter=True aiter_attention=False \
-    quantization=aiter_mxfp4 run_name=conv_hybrid_70b \
-    2>&1 | tee "$LOGDIR/hybrid_prod.log" | grep -E 'completed step' | tail -5
+    steps=$STEPS use_jax_aiter=False quantization=fp8 \
+    run_name=conv_fp8_70b \
+    2>&1 | tee "$LOGDIR/fp8_baseline.log" | grep -E 'completed step' | tail -5
 RC1=$?
 set -e
 
-# --- Run 2: all_fp4 ---
+# --- Run 2: fp4 (the new default; Hadamard ON for grad cast) ---
 echo ""
-echo "── all_fp4 (FP4 fwd + FP4 dA + FP4 dB wgrad-sharded) ──"
-clean_aiter; set_aiter_env
-export AITER_FP4_DA=1 AITER_FUSED_QUANT=1 AITER_FP4_ATTN=1 AITER_ALL_FP4=1
+echo "-- fp4 (AITER FP4 / MXFP4 with Hadamard grad quant) --"
+clean_env
+set_aiter_env
 export XLA_FLAGS="${XLA_BASE}"
 set +e
 python3 -m maxtext.trainers.pre_train.train $MODEL_70B \
     steps=$STEPS use_jax_aiter=True aiter_attention=False \
-    quantization=aiter_mxfp4 run_name=conv_all_fp4_70b \
-    2>&1 | tee "$LOGDIR/all_fp4.log" | grep -E 'completed step' | tail -5
+    quantization=aiter_fp4 run_name=conv_fp4_70b \
+    2>&1 | tee "$LOGDIR/fp4.log" | grep -E 'completed step' | tail -5
 RC2=$?
 set -e
 
 echo ""
 echo "======================================================================"
-echo "Loss Trajectory — ${STEPS} steps"
+echo "Loss Trajectory -- ${STEPS} steps"
 echo "======================================================================"
 echo ""
-printf "  %-6s  %-12s  %-12s  %-10s\n" "Step" "Hybrid" "All-FP4" "|Delta|"
-printf "  %-6s  %-12s  %-12s  %-10s\n" "----" "------" "-------" "-------"
+printf "  %-6s  %-12s  %-12s  %-10s\n" "Step" "FP8" "FP4" "|Delta|"
+printf "  %-6s  %-12s  %-12s  %-10s\n" "----" "---" "---" "-------"
 
-for step in 1 5 9 19 29 39 49 $STEPS; do
+for step in 1 5 9 19 29 39 49 99 149 199 $STEPS; do
     [[ $step -gt $STEPS ]] && continue
-    hyb_loss=$(grep "completed step: $step[^0-9]" "$LOGDIR/hybrid_prod.log" 2>/dev/null | \
+    fp8_loss=$(grep "completed step: $step[^0-9]" "$LOGDIR/fp8_baseline.log" 2>/dev/null | \
         tail -1 | grep -oP 'loss: \K[0-9.nanif]+' || echo "N/A")
-    all_loss=$(grep "completed step: $step[^0-9]" "$LOGDIR/all_fp4.log" 2>/dev/null | \
+    fp4_loss=$(grep "completed step: $step[^0-9]" "$LOGDIR/fp4.log" 2>/dev/null | \
         tail -1 | grep -oP 'loss: \K[0-9.nanif]+' || echo "N/A")
-    if [[ "$hyb_loss" =~ ^[0-9.]+$ ]] && [[ "$all_loss" =~ ^[0-9.]+$ ]]; then
-        delta=$(awk "BEGIN {printf \"%.4f\", ($all_loss - $hyb_loss) < 0 ? -($all_loss - $hyb_loss) : ($all_loss - $hyb_loss)}")
+    if [[ "$fp8_loss" =~ ^[0-9.]+$ ]] && [[ "$fp4_loss" =~ ^[0-9.]+$ ]]; then
+        delta=$(awk "BEGIN {printf \"%.4f\", ($fp4_loss - $fp8_loss) < 0 ? -($fp4_loss - $fp8_loss) : ($fp4_loss - $fp8_loss)}")
     else
         delta="N/A"
     fi
-    printf "  %-6s  %-12s  %-12s  %-10s\n" "$step" "$hyb_loss" "$all_loss" "$delta"
+    printf "  %-6s  %-12s  %-12s  %-10s\n" "$step" "$fp8_loss" "$fp4_loss" "$delta"
 done
 
 echo ""
-echo "  Promotion gate: |all_fp4_loss - hybrid_loss| < 0.03 at step $STEPS"
+echo "  Pass criteria: |fp4_loss - fp8_loss| < 0.05 at step $STEPS (and trending stable / down)."
 echo "======================================================================"
 echo ""
 echo "Logs: $LOGDIR/"

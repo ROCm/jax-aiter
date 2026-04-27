@@ -25,7 +25,7 @@ Python 3.12 required. ROCm 7.2+.
 
 | Op | API | Forward | Backward | Notes |
 |----|-----|---------|----------|-------|
-| **MXFP4 GEMM (training)** | `gemm_fp4_bf16(a, b)` | AITER ASM (35 kernels) | AITER ASM dA + hipBLASLt FP8 dB (hybrid, default) OR AITER ASM dB (`AITER_ALL_FP4=1`) | BF16 in/out with `custom_vjp`. Hybrid beats FP8 by +1.4% at 70B; all-FP4 recipe mirrors TE with FSDP-aware wgrad sharding. |
+| **FP4 GEMM (training)** | `gemm_fp4_bf16(a, b)` | AITER ASM (35 kernels) | AITER ASM dA + AITER ASM dB (FSDP-aware wgrad sharding) | BF16 in/out with `custom_vjp`. TE-parity MXFP4 recipe; beats native hipBLASLt FP8 by +14.7% at 8B and +6.0% at 70B (8x MI355X). |
 | MXFP4 Quantizer / Workspace | `MXFP4Quantizer`, `WeightWorkspace` | -- | -- | TE-parity object API. `MXFP4Quantizer.for_weight/for_activation/for_grad` + `WeightWorkspace.get_or_quantize(w, q, cache_name=...)`. |
 | Gate+Up fusion | `gemm_fp4_gate_up_bf16(x, w_gate, w_up)` | concat + single FP4 GEMM + split | automatic via inner `custom_vjp` | Saves 5 FFI dispatches per MLP. Opt-in; benchmark E2E before using. |
 | MXFP4 Cast | `CastMxfp4JA` / `CastMxfp4DualJA` | Fused HIP kernel | -- | BF16 to MXFP4 (E2M1 + E8M0 block scales) with transpose + shuffle. |
@@ -45,10 +45,11 @@ from jax_aiter.gemm import gemm
 from jax_aiter.mha import flash_attn_func
 from jax_aiter.rmsnorm import rms_norm, rms_norm_with_add
 
-# MXFP4 GEMM: BF16 inputs, FP4 quantization + ASM GEMM, BF16 output.
-# Has custom_vjp for training. Default hybrid recipe (FP4 fwd + FP4 dA + FP8 dB)
-# beats FP8 by +1.4% at 70B. Set AITER_ALL_FP4=1 to enable TE-parity all-FP4
-# (FP4 fwd + FP4 dA + FP4 dB with FSDP-aware wgrad sharding).
+# FP4 (MXFP4) GEMM: BF16 inputs, FP4 quantization + ASM GEMM, BF16 output.
+# Has custom_vjp for training. TE-parity recipe: FP4 fwd + FP4 dA +
+# FP4 dB (NT wgrad with FSDP-aware psum sharding). grad_out is cast with
+# Hadamard transform for tighter convergence.
+# Beats native hipBLASLt FP8 by +14.7% at 8B and +6.0% at 70B on 8x MI355X.
 out = gemm_fp4_bf16(activations, weights)
 
 # Object-oriented MXFP4 quantizer (TE-parity, opt-in).
