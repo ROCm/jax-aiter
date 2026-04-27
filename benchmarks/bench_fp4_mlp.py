@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
-"""Single-GPU kernel microbenchmark for the all-FP4 MLP backward path.
+"""Single-GPU kernel microbenchmark for the FP4 MLP backward path.
 
 Measures the per-projection cost of fwd + dA + dB at 8B/70B production shapes
 under three configurations:
   - Hybrid (current production): FP4 fwd + FP4 dA + native FP8 ``dot_general`` dB.
-  - All-FP4 (new recipe):        FP4 fwd + FP4 dA + FP4 wgrad ``GemmFp4FwdJA``
+  - FP4 (default recipe):        FP4 fwd + FP4 dA + FP4 wgrad ``GemmFp4FwdJA``
                                   via ``_fp4_ffi_partitioned_wgrad``.
   - BF16 reference:              plain ``lax.dot_general`` for all three GEMMs.
 
@@ -15,7 +15,7 @@ Usage (inside container):
       JA_ROOT_DIR=$PWD AITER_ASM_DIR=$PWD/third_party/aiter/hsa/ \\
       AITER_SYMBOL_VISIBLE=1 GPU_ARCHS=gfx950 \\
       HIP_VISIBLE_DEVICES=0 \\
-      python3 benchmarks/bench_all_fp4_mlp.py [--size 8b|70b|both]
+      python3 benchmarks/bench_fp4_mlp.py [--size 8b|70b|both]
 """
 
 from __future__ import annotations
@@ -69,17 +69,6 @@ def bench(fn, *args):
     return float(np.median(times))
 
 
-def _set_recipe(all_fp4: bool):
-    """Set AITER_ALL_FP4 env var and bust the env caches in gemm_fp4 module."""
-    os.environ["AITER_ALL_FP4"] = "1" if all_fp4 else "0"
-    import importlib
-    m = importlib.import_module("jax_aiter.gemm_fp4.gemm_fp4")
-    m._ALL_FP4_CACHE = None
-    m._FP4_DA_CACHE = None
-    m._FP4_DB_CACHE = None
-    m._FP8_DB_CACHE = None
-
-
 def run_one(name, M, N, K):
     key = jax.random.PRNGKey(0)
     kx, kw = jax.random.split(key)
@@ -95,13 +84,7 @@ def run_one(name, M, N, K):
         return jnp.mean(y.astype(jnp.float32) ** 2)
 
     g_fn = jax.jit(jax.value_and_grad(mlp, argnums=(0, 1)))
-
-    _set_recipe(False)
-    t_hybrid = bench(g_fn, x, w)
-
-    _set_recipe(True)
-    t_all_fp4 = bench(g_fn, x, w)
-    _set_recipe(False)
+    t_fp4 = bench(g_fn, x, w)
 
     def bf16_mlp(x, w):
         y = jax.lax.dot_general(x, w, (((1,), (1,)), ((), ())))
@@ -110,14 +93,14 @@ def run_one(name, M, N, K):
     bf16_fn = jax.jit(jax.value_and_grad(bf16_mlp, argnums=(0, 1)))
     t_bf16 = bench(bf16_fn, x, w)
 
-    # Total flops for fwd + dA + dB is 3 * 2 * M * N * K (approx).
+    # Total FLOPs for fwd + dA + dB ~= 3 * 2 * M * N * K.
     fwd_da_db_flops = 3 * total_flops
 
     def fmt(t):
         return f"{t*1000:7.2f} ms  {fwd_da_db_flops/t/1e12:7.1f} TF/s"
 
-    print(f"  {name:<15s}  hybrid={fmt(t_hybrid)}  all_fp4={fmt(t_all_fp4)}  bf16={fmt(t_bf16)}  "
-          f"all_fp4/hybrid={t_hybrid/t_all_fp4:.2f}x  hybrid/bf16={t_bf16/t_hybrid:.2f}x")
+    print(f"  {name:<15s}  fp4={fmt(t_fp4)}  bf16={fmt(t_bf16)}  "
+          f"fp4/bf16={t_bf16/t_fp4:.2f}x speedup")
 
 
 def main():

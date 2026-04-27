@@ -13,16 +13,13 @@ Usage (inside container):
       HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \\
       python3 scripts/dump_hlo_mlp.py --size 8b --out docs/logs/hlo_hybrid_8b.hlo
 
-    # Compare hybrid vs all-FP4 at 70B:
-    python3 scripts/dump_hlo_mlp.py --size 70b --out docs/logs/hlo_hybrid_70b.hlo
-    AITER_ALL_FP4=1 python3 scripts/dump_hlo_mlp.py --size 70b \\
-        --out docs/logs/hlo_all_fp4_70b.hlo
+    # Dump 70B MLP block HLO:
+    python3 scripts/dump_hlo_mlp.py --size 70b --out docs/logs/hlo_70b.hlo
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -102,8 +99,7 @@ def main():
     out_path = Path(args.out)
     if out_path.is_dir() or args.out.endswith("/"):
         out_path.mkdir(parents=True, exist_ok=True)
-        tag = os.environ.get("AITER_ALL_FP4", "") and "all_fp4" or "hybrid"
-        out_file = out_path / f"hlo_{tag}_{args.size}.hlo"
+        out_file = out_path / f"hlo_fp4_{args.size}.hlo"
     else:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_file = out_path
