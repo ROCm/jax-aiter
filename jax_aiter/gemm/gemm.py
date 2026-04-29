@@ -237,9 +237,6 @@ def _gemm_bwd(residuals, grad_out):
     elif backend == "triton":
         from ..triton import gemm_db_triton
         db = gemm_db_triton(grad_out, a)
-    elif os.environ.get("AITER_FP8_DB", "0") == "1":
-        from ..gemm_fp4.gemm_fp4 import _fp8_dot_general_db
-        db = _fp8_dot_general_db(grad_out, a)
     else:
         # hipblaslt (default): XLA-native, gets pipelined across scan layers
         db = jax.lax.dot_general(grad_out, a, (((0,), (0,)), ((), ())))

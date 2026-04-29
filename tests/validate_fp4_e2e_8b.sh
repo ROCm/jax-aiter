@@ -30,6 +30,9 @@ export PYTHONPATH=/ruvaidya/aiter_proj/maxtext/src:${PYTHONPATH:-}
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 XLA_BASE='--xla_gpu_memory_limit_slop_factor=95 --xla_gpu_reduce_scatter_combine_threshold_bytes=8589934592 --xla_gpu_enable_command_buffer= --xla_gpu_enable_latency_hiding_scheduler=True --xla_gpu_all_gather_combine_threshold_bytes=8589934592 --xla_gpu_enable_triton_gemm=False --xla_gpu_enable_cublaslt=True --xla_gpu_autotune_level=4 --xla_gpu_enable_all_gather_combine_by_dim=FALSE --xla_gpu_enable_nccl_comm_splitting=false'
+# Append additional XLA flags via env var (e.g., for command-buffer experiments):
+#   XLA_FLAGS_EXTRA='--xla_gpu_enable_command_buffer=FUSION,CUSTOM_CALL' bash ...
+XLA_BASE="${XLA_BASE} ${XLA_FLAGS_EXTRA:-}"
 
 LOGDIR=/ruvaidya/aiter_proj/docs/logs/fp4_8b
 mkdir -p "$LOGDIR"
@@ -48,6 +51,14 @@ MODEL="src/maxtext/configs/base.yml \
 declare -a CFG_NAME=( "fp8_baseline" "fp4"      )
 declare -a CFG_AITER=( "False"        "True"     )
 declare -a CFG_QUANT=( "fp8"          "aiter_fp4" )
+
+# Skip FP8 baseline if already measured: SKIP_FP8=1 bash tests/validate_fp4_e2e_8b.sh ...
+# (FP8 numbers are stable; re-running wastes ~5 min GPU.)
+if [[ "${SKIP_FP8:-0}" == "1" ]]; then
+    declare -a CFG_NAME=( "fp4" )
+    declare -a CFG_AITER=( "True" )
+    declare -a CFG_QUANT=( "aiter_fp4" )
+fi
 
 set_aiter_env() {
     export JA_ROOT_DIR=/ruvaidya/aiter_proj/jax-aiter
