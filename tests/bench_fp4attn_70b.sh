@@ -48,7 +48,7 @@ MODEL_70B="src/maxtext/configs/base.yml \
 
 clean_aiter_env() {
     unset JA_ROOT_DIR AITER_ASM_DIR AITER_SYMBOL_VISIBLE GPU_ARCHS 2>/dev/null || true
-    unset AITER_FP4_DA AITER_FP8_DB AITER_FP4_DB AITER_FUSED_QUANT AITER_COMPOSITE_FP4 AITER_FP4_ATTN 2>/dev/null || true
+    unset AITER_FP4_ATTN AITER_FUSED_QUANT_HADAMARD AITER_KERNEL_SEL 2>/dev/null || true
 }
 
 set_aiter_env() {
@@ -72,32 +72,32 @@ echo "======================================================================"
 echo "FP4 Attention 70B Benchmark — Llama3.3-70B, $STEPS steps, 8x MI355X"
 echo "======================================================================"
 
-# --- Run 1: MXFP4 + FP4 attn + FP8 dB (new best candidate) ---
+# --- Run 1: FP4 with FP4 attention ---
 echo ""
-echo "── Run 1/3: MXFP4 + FP4 attn + FP8 dB ──"
+echo "── Run 1/3: FP4 with FP4 attention (AITER_FP4_ATTN=1) ──"
 clean_aiter_env; set_aiter_env
-export AITER_FP4_DA=1 AITER_FP4_DB=0 AITER_FP8_DB=1 AITER_FUSED_QUANT=1 AITER_FP4_ATTN=1
+export AITER_FP4_ATTN=1
 export XLA_FLAGS="${XLA_BASE}"
 set +e
 python3 -m maxtext.trainers.pre_train.train $MODEL_70B \
     steps=$STEPS use_jax_aiter=True aiter_attention=False \
-    quantization=aiter_mxfp4 run_name=fp4attn_70b \
-    2>&1 | tee "$LOGDIR/70b_fp4attn_fp8db.log" | grep -E 'completed step' | tail -5
+    quantization=aiter_fp4 run_name=fp4attn_70b \
+    2>&1 | tee "$LOGDIR/70b_fp4_attn_on.log" | grep -E 'completed step' | tail -5
 RC1=$?
 set -e
 echo "  Exit: $RC1"
 
-# --- Run 2: MXFP4 + FP8 dB (prior production, BF16 attn) ---
+# --- Run 2: FP4 with BF16 attention (AITER_FP4_ATTN=0) ---
 echo ""
-echo "── Run 2/3: MXFP4 + FP8 dB (BF16 attn, prior production) ──"
+echo "── Run 2/3: FP4 with BF16 attention (AITER_FP4_ATTN=0) ──"
 clean_aiter_env; set_aiter_env
-export AITER_FP4_DA=1 AITER_FP4_DB=0 AITER_FP8_DB=1 AITER_FUSED_QUANT=1 AITER_FP4_ATTN=0
+export AITER_FP4_ATTN=0
 export XLA_FLAGS="${XLA_BASE}"
 set +e
 python3 -m maxtext.trainers.pre_train.train $MODEL_70B \
     steps=$STEPS use_jax_aiter=True aiter_attention=False \
-    quantization=aiter_mxfp4 run_name=mxfp4_70b_baseline \
-    2>&1 | tee "$LOGDIR/70b_mxfp4_fp8db.log" | grep -E 'completed step' | tail -5
+    quantization=aiter_fp4 run_name=fp4_attn_off_70b \
+    2>&1 | tee "$LOGDIR/70b_fp4_attn_off.log" | grep -E 'completed step' | tail -5
 RC2=$?
 set -e
 echo "  Exit: $RC2"
