@@ -25,10 +25,9 @@ Python 3.12 required. ROCm 7.2+.
 
 | Op | API | Forward | Backward | Notes |
 |----|-----|---------|----------|-------|
-| **FP4 GEMM (training)** | `gemm_fp4_bf16(a, b)` | AITER ASM (35 kernels) | AITER ASM dA + AITER ASM dB (FSDP-aware wgrad sharding) | BF16 in/out with `custom_vjp`. TE-parity MXFP4 recipe; beats native hipBLASLt FP8 by +14.7% at 8B and +6.0% at 70B (8x MI355X). |
+| **FP4 GEMM (training)** | `gemm_fp4_bf16(a, b)` | AITER ASM (35 kernels) | AITER ASM dA + AITER ASM dB (FSDP-aware wgrad sharding) | BF16 in/out with `custom_vjp`. TE-parity MXFP4 recipe; beats native hipBLASLt FP8 by +15.3% at 8B and +5.8% at 70B (8x MI355X). |
 | MXFP4 Quantizer / Workspace | `MXFP4Quantizer`, `WeightWorkspace` | -- | -- | TE-parity object API. `MXFP4Quantizer.for_weight/for_activation/for_grad` + `WeightWorkspace.get_or_quantize(w, q, cache_name=...)`. |
-| Gate+Up fusion | `gemm_fp4_gate_up_bf16(x, w_gate, w_up)` | concat + single FP4 GEMM + split | automatic via inner `custom_vjp` | Saves 5 FFI dispatches per MLP. Opt-in; benchmark E2E before using. |
-| MXFP4 Cast | `CastMxfp4JA` / `CastMxfp4DualJA` | Fused HIP kernel | -- | BF16 to MXFP4 (E2M1 + E8M0 block scales) with transpose + shuffle. |
+| MXFP4 Cast | `CastMxfp4JA` / `CastMxfp4DualJA` | Fused HIP kernel | -- | BF16 to MXFP4 (E2M1 + E8M0 block scales) with transpose + shuffle; dual variant emits rowwise + columnwise in one launch. |
 | FP4 GEMM (low-level) | `gemm_fp4(a, b, a_scale, b_scale)` | AITER ASM | -- | Pre-quantized fp4x2 inputs with e8m0 block scales. |
 | BF16 GEMM (training) | `gemm(a, b)` | AITER ASM | AITER ASM dX + hipBLASLt dW | A[M,K] @ B[N,K]^T with `custom_vjp`. 24 hand-tuned kernels. |
 | Flash Attention | `flash_attn_func(q, k, v, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | MHA/MQA/GQA, causal, SWA, bias, ALiBi, dropout. |
@@ -49,7 +48,7 @@ from jax_aiter.rmsnorm import rms_norm, rms_norm_with_add
 # Has custom_vjp for training. TE-parity recipe: FP4 fwd + FP4 dA +
 # FP4 dB (NT wgrad with FSDP-aware psum sharding). grad_out is cast with
 # Hadamard transform for tighter convergence.
-# Beats native hipBLASLt FP8 by +14.7% at 8B and +6.0% at 70B on 8x MI355X.
+# Beats native hipBLASLt FP8 by +15.3% at 8B and +5.8% at 70B on 8x MI355X.
 out = gemm_fp4_bf16(activations, weights)
 
 # Object-oriented MXFP4 quantizer (TE-parity, opt-in).
@@ -58,11 +57,6 @@ weight_q = MXFP4Quantizer.for_weight()
 w_fp4 = weight_q.quantize(w_bf16)            # Mxfp4Tensor(row + col + scales)
 ws = WeightWorkspace()
 w_fp4_cached = ws.get_or_quantize(w_bf16, weight_q, cache_name="mlp_gate")
-
-# Gate+Up fusion: concat gate and up weights, one FP4 GEMM, split output.
-# Saves FFI dispatches; benchmark E2E before enabling in production.
-from jax_aiter.gemm_fp4 import gemm_fp4_gate_up_bf16
-gate, up = gemm_fp4_gate_up_bf16(x, w_gate, w_up)
 
 # BF16 GEMM: A[M,K] @ B[N,K]^T using AITER hand-tuned ASM kernels.
 out = gemm(a, b)  # bf16 inputs, bf16 output, has custom_vjp for training.
@@ -150,7 +144,8 @@ Run tests:
 export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
 pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py \
-    tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py
+    tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py \
+    tests/test_mxfp4_quantizer.py tests/test_weight_workspace.py tests/test_fp4_wgrad.py
 ```
 
 ## Build wheel
@@ -205,10 +200,11 @@ No PyTorch code at any layer. Kernel configs are auto-generated from CSV by `hsa
 The MXFP4 path (`gemm_fp4_bf16`) uses `custom_vjp` + `custom_partitioning` for FSDP-compatible training:
 
 ```
-Forward:  CastMxfp4JA(act) + CastMxfp4DualJA(wt) + GemmFp4FwdJA    (3 FFI calls)
-Backward: CastMxfp4JA(grad) + GemmFp4FwdJA(dA)                      (2 FFI calls)
-          hipBLASLt FP8 dB via lax.dot_general                       (native XLA)
+Forward:  CastMxfp4DualJA(act) + CastMxfp4DualJA(wt) + GemmFp4FwdJA
+Backward: CastMxfp4DualJA(grad, Hadamard) + GemmFp4FwdJA(dA)
+          + GemmFp4FwdJA(dB wgrad, NT layout with FSDP psum)
 ```
 
-FP4 ASM kernels are 1.19-1.54x faster than hipBLASLt FP8 at MLP shapes. The dB backward
-uses native FP8 `dot_general` so XLA can overlap it with FSDP communication.
+The canonical FP4 recipe is the single default path: FP4 forward, FP4 dA, and
+FP4 dB wgrad. Grad-output quantization applies a Hadamard transform inside the
+fused cast kernel for TE-parity convergence behavior.
