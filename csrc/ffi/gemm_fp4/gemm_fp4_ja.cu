@@ -5,6 +5,7 @@
 // Out[M,N] bf16 = A[M,K/2] fp4x2 @ B[N,K/2] fp4x2 with e8m0 block scales.
 
 #include <cstdio>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <mutex>
 #include <string>
@@ -177,7 +178,30 @@ GemmFp4Fwd_Bridge(
   HIP_CALL(hipGetDevice(&dev_id));
   CFG* config_map = &cfg_f4gemm_bf16_per1x32Fp4;
 
-  auto [knl_name, log2_split] = select_fp4_kernel(M, N, K, dev_id, config_map);
+  // ---------------------------------------------------------------------
+  // Phase 3 B.0 hint API: env-var override bypasses the heuristic so a
+  // sweep harness can directly target a specific cataloged ASM variant.
+  // Default (env unset / empty) uses the existing heuristic. Set
+  //   AITER_FORCE_KERNEL_NAME=<mangled _ZN... knl_name>
+  // and optionally
+  //   AITER_FORCE_LOG2_K_SPLIT=<int> (0..4 typical)
+  // to force selection. The forced kernel must be present in the
+  // pre-loaded cache (i.e. listed in the cfg map) or the call will fail.
+  // ---------------------------------------------------------------------
+  std::string knl_name;
+  int log2_split = 0;
+  const char* force_name = std::getenv("AITER_FORCE_KERNEL_NAME");
+  if (force_name && force_name[0] != '\0') {
+    knl_name = force_name;
+    const char* force_split = std::getenv("AITER_FORCE_LOG2_K_SPLIT");
+    if (force_split && force_split[0] != '\0') {
+      log2_split = std::atoi(force_split);
+    }
+  } else {
+    auto picked = select_fp4_kernel(M, N, K, dev_id, config_map);
+    knl_name    = std::get<0>(picked);
+    log2_split  = std::get<1>(picked);
+  }
   if (knl_name.empty()) {
     char msg[256];
     snprintf(msg, sizeof(msg),
