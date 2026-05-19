@@ -94,39 +94,59 @@ __device__ __forceinline__ void bf16x4_to_float4(
 // ============================================================================
 
 /*
- * ds_swizzle Instructions
- * -----------------------
- * These perform intra-wavefront data exchange without shared memory.
- * The offset parameter encodes the permutation pattern.
- * 
- * Format: offset = (AND_mask << 10) | (OR_mask << 5) | XOR_mask
- * 
- * Common patterns:
- *   - 0x041F: XOR with lane 1 (exchange with adjacent thread)
- *   - 0x081F: XOR with lane 2 (exchange 2 positions away)
- *   - 0x101F: XOR with lane 4 (exchange 4 positions away)
- * 
- * Reference: AMD CDNA4 ISA, ds_swizzle_b32 (page 480)
+ * Cross-lane primitives — DPP (preferred) + ds_swizzle (fallback)
+ * ----------------------------------------------------------------
+ * The Hadamard XOR-1 / XOR-2 swaps and the amax-reduce XOR-1 / XOR-2
+ * steps use DPP `quad_perm` modifiers via `__builtin_amdgcn_mov_dpp`:
+ *   - XOR-1 (lane swap within quad) → quad_perm:[1,0,3,2]  (dpp_ctrl=0xB1)
+ *   - XOR-2 (pair swap within quad) → quad_perm:[2,3,0,1]  (dpp_ctrl=0x4E)
+ * DPP runs at VALU rate, requires NO `s_waitcnt lgkmcnt(0)`, and avoids
+ * LDS-unit traffic — strictly cheaper than `ds_swizzle_b32` for these
+ * patterns.
+ *
+ * The amax-reduce XOR-4 step (cross-quad swap, dpp_ctrl=0x164 / row_xmask:4)
+ * stays on `ds_swizzle_b32 offset:0x101F`. row_xmask is a gfx10+ DPP8
+ * feature and is rejected by the gfx950 (CDNA4 / gfx9-family) assembler
+ * with: "Invalid dpp_ctrl value: row_share and row_xmask are not
+ * supported before GFX10". Substitutes available on gfx9 (row_shr:4,
+ * row_ror:4, row_mirror, row_half_mirror) do NOT produce XOR-4 swap
+ * semantics — they rotate or mirror, which would corrupt the reduce.
+ * See docs/perf/mxfp4_70b_gap/cast_isa/dpp_audit.md §5.6 for the full
+ * feasibility analysis. 324 of 2,028 ds_swizzle ops (~16 %) remain.
+ *
+ * Reference for ds_swizzle (`0x101F` only):
+ *   AMD CDNA4 ISA, ds_swizzle_b32 (page 480).
+ *   offset = (AND_mask << 10) | (OR_mask << 5) | XOR_mask;
+ *   0x101F = and=0x1F or=0 xor=4 (XOR-4 within 32-lane DS group).
+ * Reference for DPP:
+ *   AMD GCN Cross-Lane Operations (https://gpuopen.com/learn/amd-gcn-assembly-cross-lane-operations/).
+ *   LLVM AMDGPU DPP encoding tables.
  */
 
+// XOR-1 (lane swap within each 4-lane quad) via DPP quad_perm:[1,0,3,2].
+// Replaces ds_swizzle_b32 offset:0x041F + s_waitcnt lgkmcnt(0).
 __device__ __forceinline__ float ds_swizzle_xor1(float val) {
-    float result;
-    asm volatile(
-        "ds_swizzle_b32 %0, %1 offset:0x041F\n\t"
-        "s_waitcnt lgkmcnt(0)"
-        : "=v"(result) : "v"(val)
-    );
-    return result;
+    uint32_t u = __float_as_uint(val);
+    uint32_t r = __builtin_amdgcn_mov_dpp(
+        u,
+        /*dpp_ctrl=*/0xB1,  // quad_perm:[1,0,3,2] — XOR-1
+        /*row_mask=*/0xF,   // all 4 rows participate
+        /*bank_mask=*/0xF,  // all 4 banks participate
+        /*bound_ctrl=*/false);
+    return __uint_as_float(r);
 }
 
+// XOR-2 (pair swap within each 4-lane quad) via DPP quad_perm:[2,3,0,1].
+// Replaces ds_swizzle_b32 offset:0x081F + s_waitcnt lgkmcnt(0).
 __device__ __forceinline__ float ds_swizzle_xor2(float val) {
-    float result;
-    asm volatile(
-        "ds_swizzle_b32 %0, %1 offset:0x081F\n\t"
-        "s_waitcnt lgkmcnt(0)"
-        : "=v"(result) : "v"(val)
-    );
-    return result;
+    uint32_t u = __float_as_uint(val);
+    uint32_t r = __builtin_amdgcn_mov_dpp(
+        u,
+        /*dpp_ctrl=*/0x4E,  // quad_perm:[2,3,0,1] — XOR-2
+        /*row_mask=*/0xF,
+        /*bank_mask=*/0xF,
+        /*bound_ctrl=*/false);
+    return __uint_as_float(r);
 }
 
 // ============================================================================
@@ -148,21 +168,26 @@ __device__ __forceinline__ float warp_reduce_max_8_dpp(float val) {
     uint32_t v = float_as_uint(val);
     uint32_t tmp;
 
-    // Step 1: Exchange with thread 4 positions away
+    // Step 1: XOR-4 exchange (cross-quad). Stays on ds_swizzle_b32 —
+    // gfx950 / CDNA4 (gfx9-family) does not support DPP `row_xmask:4`,
+    // and the gfx9-available DPP modifiers (row_shr/row_shl/row_ror/
+    // row_mirror/row_half_mirror) do not produce XOR-4 swap semantics.
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F" : "=v"(tmp) : "v"(v));
     asm volatile("s_waitcnt lgkmcnt(0)" :::);
     val = fmaxf(val, uint_as_float(tmp));
     v = float_as_uint(val);
 
-    // Step 2: Exchange with thread 2 positions away
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x081F" : "=v"(tmp) : "v"(v));
-    asm volatile("s_waitcnt lgkmcnt(0)" :::);
+    // Step 2: XOR-2 exchange (pair swap within quad) via DPP quad_perm:[2,3,0,1].
+    tmp = __builtin_amdgcn_mov_dpp(v, /*dpp_ctrl=*/0x4E,
+                                   /*row_mask=*/0xF, /*bank_mask=*/0xF,
+                                   /*bound_ctrl=*/false);
     val = fmaxf(val, uint_as_float(tmp));
     v = float_as_uint(val);
 
-    // Step 3: Exchange with adjacent thread
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x041F" : "=v"(tmp) : "v"(v));
-    asm volatile("s_waitcnt lgkmcnt(0)" :::);
+    // Step 3: XOR-1 exchange (lane swap within quad) via DPP quad_perm:[1,0,3,2].
+    tmp = __builtin_amdgcn_mov_dpp(v, /*dpp_ctrl=*/0xB1,
+                                   /*row_mask=*/0xF, /*bank_mask=*/0xF,
+                                   /*bound_ctrl=*/false);
     val = fmaxf(val, uint_as_float(tmp));
 
     return val;
