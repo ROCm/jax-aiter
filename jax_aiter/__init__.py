@@ -4,6 +4,7 @@
 
 import importlib as _importlib
 
+from .__version__ import __version__
 from .ja_compat.config import set_aiter_asm_dir
 
 set_aiter_asm_dir()

@@ -47,19 +47,28 @@ GEMM_BF16_CFG    := $(GEMM_CONFIG_DIR)/asm_bf16gemm_configs.hpp
 GEMM_FP4_CFG     := $(GEMM_CONFIG_DIR)/asm_f4gemm_configs.hpp
 GEMM_INCLUDES    := $(JA_INCLUDES) -I$(GEMM_CONFIG_DIR)
 
-JA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
-              $(JA_BUILD_DIR)/mha_bwd_ja.so \
-              $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
-              $(JA_BUILD_DIR)/silu_and_mul_ja.so \
-              $(JA_BUILD_DIR)/gemm_fwd_ja.so \
-              $(JA_BUILD_DIR)/gemm_fp4_ja.so \
-              $(JA_BUILD_DIR)/cast_mxfp4_ja.so
+# Core (non-MHA) FFI shims: shipped in both the lite and full wheels.
+JA_CORE_MODULES := $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
+                   $(JA_BUILD_DIR)/silu_and_mul_ja.so \
+                   $(JA_BUILD_DIR)/gemm_fwd_ja.so \
+                   $(JA_BUILD_DIR)/gemm_fp4_ja.so \
+                   $(JA_BUILD_DIR)/cast_mxfp4_ja.so
 
-.PHONY: all clean ja_mods
+# MHA FFI shims: full wheel only (the heavy libmha_*.so JIT libs back these).
+JA_MHA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
+                  $(JA_BUILD_DIR)/mha_bwd_ja.so
+
+# Full set (unchanged target for `make ja_mods`): core + MHA.
+JA_MODULES := $(JA_CORE_MODULES) $(JA_MHA_MODULES)
+
+.PHONY: all clean clean-stage ja_mods ja_mods_nomha
 
 all: $(OUT_SO)
 
 ja_mods: $(JA_MODULES)
+
+# Lite wheel: build only the core (non-MHA) FFI shims.
+ja_mods_nomha: $(JA_CORE_MODULES)
 
 %/: 
 	mkdir -p $@
@@ -101,5 +110,17 @@ $(JA_BUILD_DIR)/cast_mxfp4_ja.so: $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) | $(JA_
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) \
 		-Icsrc/ffi/cast_mxfp4 $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) -o $@
 
+# Stage-only clean: wipes the wheel staging dirs (pure copies of the
+# source-of-truth libs/kernels) plus the stale moe_fwd_ja.so that has no
+# source. Safe to run during release work -- it NEVER touches
+# build/aiter_build/ (the multi-GB MHA JIT libs) nor the live *_ja.so /
+# libjax_aiter.so in build/jax_aiter_build/.
+clean-stage:
+	rm -rf jax_aiter/_lib/ jax_aiter/_hsa/ build/lib/ build/jax_aiter_build/moe_fwd_ja.so
+
+# WARNING: `make clean` deletes build/aiter_build/, which holds the
+# multi-GB MHA JIT libs (libmha_fwd.so ~1.3 GB, libmha_bwd.so ~1.0 GB,
+# librmsnorm_fwd.so ~167 MB) that cost hours to rebuild. DO NOT run this
+# during lite/full wheel release work -- use `make clean-stage` instead.
 clean:
 	rm -rf build/jax_aiter_build build/aiter_build

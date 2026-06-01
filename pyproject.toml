@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Minimal PEP 517 shim. setup.py remains authoritative for all package
+# metadata (name, version, package_data, custom build_py/bdist_wheel that
+# stage the prebuilt *.so + HSA kernels, and the JA_WHEEL_VARIANT logic).
+# Do NOT migrate metadata here.
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
