@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Clean-room validation image for the jax-aiter lite wheel.
+#
+# Deliberately MINIMAL: it has the ROCm + JAX runtime base and NOTHING else
+# from this repo -- no AITER source checkout, no MaxText, no build toolchain.
+# The wheel under test is `pip install`-ed at run time (see
+# scripts/validate_wheel.sh), proving a downstream user can install and run
+# the lite wheel with no source tree.
+#
+# The ghcr.io/rocm/jax-base-ubu24.rocm720 base ships the ROCm 7.2.0 runtime
+# but NO importable `jax` in its default python (the local jax-dev image is
+# likewise missing it), so we install the matching ROCm JAX stack here.
+#
+# The build-matched stack is jax 0.9.0 + jax-rocm7-pjrt/plugin 0.9.0+rocm7.2.0,
+# published as assets on the rocm-jax v0.9.0 GitHub release (just not on the
+# PyPI/radeon pip indexes). This image pins 0.9.1 -- what `pip install` resolves
+# to from the radeon index -- for a clean hermetic network install. The lite
+# wheel's FP4 FFI handlers use the version-stable XLA FFI C API, so 0.9.0 and
+# 0.9.1 are ABI-compatible (the FP4 path is validated on both). Override with
+# --build-arg JAX_VERSION=... if needed.
+FROM ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+
+ARG JAX_VERSION=0.9.1
+ARG ROCM_FIND_LINKS=https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/
+
+# Install the ROCm JAX runtime stack (CPU jaxlib + ROCm pjrt/plugin backend).
+# The build-time import check fails fast if the stack is broken.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+      "jax-rocm7-plugin==${JAX_VERSION}" \
+      "jax-rocm7-pjrt==${JAX_VERSION}" \
+      "jax==${JAX_VERSION}" \
+      -f "${ROCM_FIND_LINKS}" \
+ && python3 -c "import jax, jaxlib; print('[validation base] jax', jax.__version__, 'jaxlib', jaxlib.__version__)"
+
+WORKDIR /test
+
+# Nothing else is COPY-ed in: the wheel + smoke test are bind-mounted at run time.
