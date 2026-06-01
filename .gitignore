@@ -87,6 +87,9 @@ csrc/ffi/gemm_fp8_mi350/
 
 # HLO dumps and investigation logs.
 hlo_dumps/
+
+# CI perf run outputs (ephemeral; produced by ci/perf/run_8b_fp4.sh).
+ci_perf_out/
 # Ignore local doc artifacts (runs/, perf/, logs/, ...) but keep committed
 # release notes trackable (a file can't be re-included if its parent dir is
 # excluded, so ignore docs/* contents rather than the docs/ dir itself).
