@@ -471,6 +471,10 @@ def build_module(core_module, module_name, verbose=False):
             if module_name.startswith("lib")
             else build_args.get("is_python_module", True)
         )
+        # v0.1.14 added a positional `third_party` param to build_module
+        # (before `hipify`). Pass the trailing params by keyword so they bind
+        # correctly: `third_party` defaults to [] (JA configs don't clone
+        # 3rdparty repos at JIT time) and `hipify` stays True for JA builds.
         core_module.build_module(
             build_args["md_name"],
             build_args["srcs"],
@@ -483,7 +487,8 @@ def build_module(core_module, module_name, verbose=False):
             is_python_module,
             build_args.get("is_standalone", False),
             build_args.get("torch_exclude", False),
-            build_args.get("hipify", True),
+            third_party=build_args.get("third_party", []),
+            hipify=build_args.get("hipify", True),
         )
         logger.info(f"Successfully built {module_name}")
 
