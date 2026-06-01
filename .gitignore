@@ -87,4 +87,9 @@ csrc/ffi/gemm_fp8_mi350/
 
 # HLO dumps and investigation logs.
 hlo_dumps/
-docs/logs/
+# Ignore local doc artifacts (runs/, perf/, logs/, ...) but keep committed
+# release notes trackable (a file can't be re-included if its parent dir is
+# excluded, so ignore docs/* contents rather than the docs/ dir itself).
+docs/*
+!docs/RELEASE_NOTES_v0.1.0-alpha.md
+.rocprofv3/

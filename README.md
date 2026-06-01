@@ -79,9 +79,34 @@ y, residual_out = rms_norm_with_add(x, residual, gamma, epsilon=1e-6)
 
 ## Option A: Install from wheel
 
+Two wheel variants are published:
+
+| Variant | Size | Contents | Use when |
+|---------|------|----------|----------|
+| **lite** (`+lite`) | ~43 MiB | MXFP4/FP4 GEMM, BF16 GEMM, MXFP4 cast, RMSNorm, SiLU-and-Mul. **No flash attention (MHA).** | MXFP4 (FP4) training path; the canonical FP4 recipe routes attention through TransformerEngine, so MHA is not needed. |
+| **full** | ~513 MiB | Everything above **plus** AITER flash attention (`flash_attn_func` / `flash_attn_varlen`). | You need AITER MHA. |
+
 ```bash
-pip install path/to/jax_aiter-<version>-*.whl
+# Lite (MXFP4 path):
+pip install jax_aiter-<version>+lite-*.whl
+
+# Full (adds AITER flash attention):
+pip install jax_aiter-<version>-*.whl
 ```
+
+Importing `jax_aiter.mha` from the lite wheel raises a clear
+`ModuleNotFoundError` directing you to the full variant. See
+[`docs/RELEASE_NOTES_v0.1.0-alpha.md`](docs/RELEASE_NOTES_v0.1.0-alpha.md) for
+the MXFP4 release scope, validation, and MaxText FP4 recipe.
+
+**ROCm JAX runtime.** jax-aiter needs a ROCm-enabled JAX. `pip install jax
+jax-rocm7-pjrt jax-rocm7-plugin` currently resolves to **0.9.1** (ABI-compatible
+with the FP4 FFI; validated in the clean-container FP4 GEMM smoke). For the
+exact build-matched **`0.9.0+rocm7.2.0`** stack, pull the `jax` / `jaxlib` /
+`jax-rocm7-pjrt` / `jax-rocm7-plugin` wheels from the
+[rocm-jax v0.9.0 release assets](https://github.com/ROCm/rocm-jax/releases/tag/rocm-jax-v0.9.0-rc3)
+(published there, not on the pip indexes). The lite wheel's FP4 path is
+validated on both 0.9.0 and 0.9.1.
 
 ## Option B: Build from source
 
@@ -154,6 +179,30 @@ pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_ge
 ```
 
 ## Build wheel
+
+Use `scripts/build_wheel.sh` to stage a lite or full wheel. It **reuses** the
+already-built AITER JIT libs in `build/aiter_build/` (it never rebuilds the
+multi-GB MHA libs — a sha256 guard aborts the build if they change):
+
+```bash
+# Lite (drops MHA libs + shims; carries the +lite local-version tag):
+bash scripts/build_wheel.sh --variant lite
+
+# Full (ships everything):
+bash scripts/build_wheel.sh --variant full
+```
+
+The wheel lands in `dist/`. Run inside the build container (e.g.
+`docker exec rv_aiter bash -lc "cd /ruvaidya/aiter_proj/jax-aiter && bash scripts/build_wheel.sh --variant lite"`).
+
+Validate the lite wheel standalone in a clean sibling container (no source
+tree, GPU FP4 GEMM smoke):
+
+```bash
+bash scripts/validate_wheel.sh   # defaults to the newest dist/*+lite-*.whl
+```
+
+Low-level alternative (no variant filtering):
 
 ```bash
 pip wheel . --no-deps -w dist/
