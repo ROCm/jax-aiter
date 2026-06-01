@@ -1,13 +1,19 @@
-name: JAX-AITER Nightly CI
+name: JAX-AITER Cache Refresh
 
+# Force-rebuilds the multi-GB MHA JIT libs weekly and reseeds the shared cache
+# under the content key, so the cache never 7-day-evicts (a restore resets the
+# eviction timer; this weekly forced rebuild guarantees a fresh entry exists).
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 3 * * 0'   # Sundays 03:00 UTC
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # needed to delete the existing cache entry before resaving
 
 env:
   IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
@@ -17,11 +23,11 @@ env:
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
 
 jobs:
-  build-and-test:
+  refresh-cache:
     runs-on: [self-hosted, Linux]
 
     env:
-      CONTAINER_NAME: rv_aiter_nightly
+      CONTAINER_NAME: rv_aiter_cache_refresh
 
     steps:
       - name: Fix permissions from previous Docker run
@@ -40,24 +46,32 @@ jobs:
         id: aiter_sha
         run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Same shared key as ci.yml / cache-refresh.yml / nightly-perf.yml so the
-      # JIT libs build once and every job reuses them (nightly now restores the
-      # cache instead of always doing a full rebuild).
+      # Identical to ci.yml / nightly-ci.yml / nightly-perf.yml.
       - name: Compute shared JIT cache key
         id: cache_key
         run: |
           echo "key=aiter-so-${{ runner.os }}-aiter-${{ steps.aiter_sha.outputs.sha }}-jit-${{ hashFiles('jax_aiter/jit/**') }}-cfg-${{ hashFiles('**/optCompilerConfig.json') }}-patches-${{ hashFiles('scripts/*.patch') }}" >> "$GITHUB_OUTPUT"
 
+      - name: Delete existing cache entry (so the rebuild reseeds it fresh)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEY: ${{ steps.cache_key.outputs.key }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # Prefer gh; fall back to the REST API (robust on runners without gh).
+          if command -v gh >/dev/null 2>&1; then
+            gh cache delete "$KEY" --repo "$REPO" && echo "deleted via gh" || echo "gh: no matching cache (ok)"
+          fi
+          curl -sS -X DELETE \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/actions/caches?key=$KEY" \
+            && echo "REST delete issued" || echo "REST delete: nothing to remove (ok)"
+
       - name: Create aiter_build directory
         run: mkdir -p build/aiter_build
-
-      - name: Restore AITER JIT modules cache
-        id: aiter_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            build/aiter_build/*.so
-          key: ${{ steps.cache_key.outputs.key }}
 
       - name: Pull container image
         run: docker pull "$IMAGE"
@@ -87,41 +101,18 @@ jobs:
       - name: Install tooling and JAX runtime
         run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
-      - name: Display environment
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            echo "=== System ==="
-            echo "Processors: $(nproc)"
-            rocm-smi || echo "rocm-smi not available"
-            rocminfo | grep -E "Marketing Name:|gfx" || true
-          '
-
-      - name: Build (umbrella + JIT[on miss] + FFI + install)
+      - name: Force rebuild JIT libs (umbrella + JIT + FFI + install)
         run: |
           docker exec \
-            -e JA_DO_JIT_BUILD="${{ steps.aiter_cache.outputs.cache-hit != 'true' }}" \
+            -e JA_DO_JIT_BUILD=true \
             "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
 
-      - name: Save AITER JIT modules cache
-        if: steps.aiter_cache.outputs.cache-hit != 'true'
+      - name: Save refreshed AITER JIT modules cache
         uses: actions/cache/save@v4
         with:
           path: |
             build/aiter_build/*.so
           key: ${{ steps.cache_key.outputs.key }}
-
-      - name: Test (smoke + unit subset, 1 GPU)
-        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/test.sh'
-
-      - name: Build summary
-        if: always()
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            echo "=== Build Artifacts ==="
-            echo "Umbrella:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
-            echo "AITER JIT:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None"
-            echo "FFI modules:"; ls -lh build/jax_aiter_build/*.so 2>/dev/null || echo "None"
-          ' || true
 
       - name: Cleanup
         if: always()

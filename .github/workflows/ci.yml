@@ -10,17 +10,19 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  GPU_ARCHS: "gfx942;gfx950"
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+
 jobs:
   build-and-test:
     runs-on: [self-hosted, Linux]
 
     env:
-      IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
       CONTAINER_NAME: rv_aiter_ci
-      JA_ROOT_DIR: /jax-aiter
-      AITER_SYMBOL_VISIBLE: 1
-      GPU_ARCHS: "gfx942;gfx950"
-      AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
 
     steps:
       - name: Fix permissions from previous Docker run
@@ -35,29 +37,30 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Apply AITER patches
-        run: |
-          cd third_party/aiter
-          git apply ../../scripts/aiter_mha_bwd_thread_local.patch
-
       - name: Get third_party/aiter submodule SHA
         id: aiter_sha
         run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Shared JIT-lib cache key. The SAME string is used by ci.yml,
+      # nightly-ci.yml, cache-refresh.yml and nightly-perf.yml so the multi-GB
+      # MHA JIT libs build once (cold miss) and every job reuses them. The
+      # `-patches-` segment makes the key change whenever a scripts/*.patch
+      # changes (AITER version is already encoded via the submodule SHA).
+      - name: Compute shared JIT cache key
+        id: cache_key
+        run: |
+          echo "key=aiter-so-${{ runner.os }}-aiter-${{ steps.aiter_sha.outputs.sha }}-jit-${{ hashFiles('jax_aiter/jit/**') }}-cfg-${{ hashFiles('**/optCompilerConfig.json') }}-patches-${{ hashFiles('scripts/*.patch') }}" >> "$GITHUB_OUTPUT"
 
       - name: Create aiter_build directory
         run: mkdir -p build/aiter_build
 
       - name: Restore AITER JIT modules cache
         id: aiter_cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             build/aiter_build/*.so
-          key: >
-            aiter-so-${{ runner.os }}
-            -aiter-${{ steps.aiter_sha.outputs.sha }}
-            -jit-${{ hashFiles('jax_aiter/jit/**') }}
-            -cfg-${{ hashFiles('**/optCompilerConfig.json') }}
+          key: ${{ steps.cache_key.outputs.key }}
 
       - name: Pull container image
         run: docker pull "$IMAGE"
@@ -85,119 +88,24 @@ jobs:
             "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX runtime
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              git ca-certificates curl build-essential pkg-config
-            python3 -m pip install --break-system-packages cmake ninja pyyaml psutil pandas
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
-            # JAX must be installed before build (Makefile needs jax.ffi.include_dir())
-            python3 -m pip install --break-system-packages jax==0.9.0
-            python3 -m pip install --break-system-packages \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jaxlib-0.9.0+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-            python3 -m pip install --break-system-packages \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_plugin-0.9.0+rocm7.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_pjrt-0.9.0+rocm7.2.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-            python3 -m pip install --break-system-packages pytest pytest-rerunfailures
-          '
-
-      - name: Mark repos safe for Git
+      - name: Build (umbrella + JIT[on miss] + FFI + install)
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -eux
-            git config --global --add safe.directory /jax-aiter
-            git config --global --add safe.directory /jax-aiter/third_party/aiter
-          '
-
-      - name: Build umbrella shared library
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            make
-            ls -lh build/jax_aiter_build/libjax_aiter.so
-          '
-
-      - name: Check if JIT outputs exist
-        id: have_jit
-        run: |
-          set -euo pipefail
-          cnt=0
-          if ls build/aiter_build/*.so >/dev/null 2>&1; then
-            cnt=$(ls build/aiter_build/*.so | wc -l)
-          fi
-          echo "count=$cnt" >> "$GITHUB_OUTPUT"
-
-      - name: Decide whether to build JIT
-        id: jit_decision
-        run: |
-          set -euo pipefail
-          cache_hit='${{ steps.aiter_cache.outputs.cache-hit }}'
-          have_count='${{ steps.have_jit.outputs.count }}'
-          if [[ "${cache_hit:-}" == "true" && "${have_count}" != "0" ]]; then
-            echo "do_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "do_build=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build JIT modules
-        if: steps.jit_decision.outputs.do_build == 'true'
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            python3 jax_aiter/jit/build_jit.py --verbose
-            ls -lh build/aiter_build/*.so
-          '
+          docker exec \
+            -e JA_DO_JIT_BUILD="${{ steps.aiter_cache.outputs.cache-hit != 'true' }}" \
+            "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
 
       - name: Save AITER JIT modules cache
-        if: steps.jit_decision.outputs.do_build == 'true' && steps.aiter_cache.outputs.cache-hit != 'true'
+        if: steps.aiter_cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             build/aiter_build/*.so
-          key: >
-            aiter-so-${{ runner.os }}
-            -aiter-${{ steps.aiter_sha.outputs.sha }}
-            -jit-${{ hashFiles('jax_aiter/jit/**') }}
-            -cfg-${{ hashFiles('**/optCompilerConfig.json') }}
+          key: ${{ steps.cache_key.outputs.key }}
 
-      - name: Build FFI modules
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            make ja_mods
-            ls -lh build/jax_aiter_build/*.so
-          '
-
-      - name: Install JAX-AITER
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            pip install --break-system-packages .
-          '
-
-      - name: Smoke test
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; from jax_aiter.rmsnorm import rms_norm; from jax_aiter.gemm import gemm; from jax_aiter.gemm_fp4 import gemm_fp4_bf16, MXFP4Quantizer, WeightWorkspace; print(\"jax-aiter import OK\")"
-            python3 tests/smoke_gemm_test.py
-            python3 tests/smoke_gemm_all_test.py
-          '
-
-      - name: Run tests (1 GPU, ~90 seconds)
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-            export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
-            python3 -m pytest -v --reruns 2 \
-              tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py \
-              tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py \
-              tests/test_mxfp4_quantizer.py tests/test_weight_workspace.py \
-              tests/test_fp4_wgrad.py
-          '
+      - name: Test (smoke + unit subset, 1 GPU)
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/test.sh'
 
       - name: Build summary
         if: always()
