@@ -1,0 +1,158 @@
+name: JAX-AITER Nightly Perf (MXFP4 8B)
+
+# Nightly MXFP4 8B FP4 end-to-end throughput leg on all 8 GPUs (FSDP=8).
+# Restores the shared JIT cache (no MHA rebuild), builds + installs jax-aiter,
+# clones MaxText + installs TransformerEngine, runs the 8B FP4 recipe, and
+# records tail-10 TFLOP/s + loss as an artifact + step summary.
+#
+# RECORD mode for now (no --gate). After the first green run:
+#   1. download the perf-8b-fp4 artifact, copy perf_8b_fp4.json ->
+#      ci/perf/baseline_8b_fp4.json, and commit it;
+#   2. add `--gate` to the "Parse perf log" step below to turn on the
+#      >5%-below-baseline throughput hard-gate (loss stays soft-warn only).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'   # after nightly-ci (01:00) has seeded the cache
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # don't kill an in-flight benchmark
+
+env:
+  IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  GPU_ARCHS: "gfx942;gfx950"
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+  # Host-side idle-GPU gate (relocated out of jax-aiter). Override per-runner.
+  WAIT_FOR_IDLE_GPU_SCRIPT: /home/ruvaidya/aiter_proj/scripts/wait_for_idle_gpu.sh
+
+jobs:
+  perf-8b-fp4:
+    runs-on: [self-hosted, Linux]
+
+    env:
+      CONTAINER_NAME: rv_aiter_perf
+
+    steps:
+      - name: Fix permissions from previous Docker run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R $(id -u):$(id -g) "${{ github.workspace }}" || true
+          fi
+
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Get third_party/aiter submodule SHA
+        id: aiter_sha
+        run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Same shared key as ci.yml / nightly-ci.yml / cache-refresh.yml.
+      - name: Compute shared JIT cache key
+        id: cache_key
+        run: |
+          echo "key=aiter-so-${{ runner.os }}-aiter-${{ steps.aiter_sha.outputs.sha }}-jit-${{ hashFiles('jax_aiter/jit/**') }}-cfg-${{ hashFiles('**/optCompilerConfig.json') }}-patches-${{ hashFiles('scripts/*.patch') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create aiter_build directory
+        run: mkdir -p build/aiter_build
+
+      - name: Restore AITER JIT modules cache
+        id: aiter_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/aiter_build/*.so
+          key: ${{ steps.cache_key.outputs.key }}
+
+      - name: Wait for idle GPU (shared-node gate)
+        run: |
+          set -uo pipefail
+          S="${WAIT_FOR_IDLE_GPU_SCRIPT:-}"
+          if [ -n "$S" ] && [ -x "$S" ] && command -v rocm-smi >/dev/null 2>&1; then
+            echo "Gating on $S"
+            bash "$S"
+          else
+            echo "WARN: GPU idle gate skipped ('$S' not executable or rocm-smi missing)."
+          fi
+
+      - name: Pull container image
+        run: docker pull "$IMAGE"
+
+      - name: Launch perf container (all 8 GPUs)
+        run: |
+          set -euxo pipefail
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host \
+            --device=/dev/kfd \
+            --device=/dev/dri \
+            --ipc=host \
+            --shm-size=16G \
+            --group-add=video \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
+            -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w "/jax-aiter" \
+            "$IMAGE" tail -f /dev/null
+
+      - name: Install tooling and JAX runtime
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
+
+      - name: Build (umbrella + JIT[on miss] + FFI + install)
+        run: |
+          docker exec \
+            -e JA_DO_JIT_BUILD="${{ steps.aiter_cache.outputs.cache-hit != 'true' }}" \
+            "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
+
+      - name: Run 8B FP4 perf leg (5 warmup + 50 timed steps)
+        run: |
+          docker exec \
+            -e PERF_OUT_DIR=/jax-aiter/ci_perf_out \
+            -e MAXTEXT_DIR=/maxtext_perf \
+            "$CONTAINER_NAME" bash -lc 'bash ci/perf/run_8b_fp4.sh'
+
+      - name: Parse perf log (record mode)
+        if: always()
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            python3 ci/perf/parse_perf_log.py \
+              --log ci_perf_out/8b_fp4/train.log \
+              --out-json ci_perf_out/perf_8b_fp4.json \
+              --label 8b_fp4 \
+              --tail-n 10 \
+              --step-summary ci_perf_out/perf_8b_fp4_summary.md
+          ' || echo "parse step skipped/failed (record-only; see train.log)"
+
+      - name: Write GitHub step summary
+        if: always()
+        run: |
+          if [ -f ci_perf_out/perf_8b_fp4_summary.md ]; then
+            cat ci_perf_out/perf_8b_fp4_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No perf summary produced (training may have failed)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-8b-fp4
+          path: |
+            ci_perf_out/8b_fp4/train.log
+            ci_perf_out/8b_fp4/warmup.log
+            ci_perf_out/perf_8b_fp4.json
+            ci_perf_out/perf_8b_fp4_summary.md
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
