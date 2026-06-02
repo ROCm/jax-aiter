@@ -2,12 +2,16 @@ name: JAX-AITER Nightly Perf (MXFP4 8B)
 
 # Nightly MXFP4 8B FP4 end-to-end throughput leg on all 8 GPUs (FSDP=8).
 #
-# LITE + MHA-INDEPENDENT: this leg uses TE attention (attention=cudnn_flash_te,
-# aiter_attention=False), so jax-aiter's MHA is NEVER exercised. It therefore
-# builds ONLY the rmsnorm JIT lib (build_jit.py --module librmsnorm_fwd) + the
-# core (non-MHA) FFI shims (make ja_mods_nomha) and installs the LITE wheel.
-# It does NOT download or build the multi-GB libmha_*.so, and is fully decoupled
-# from the prebuilt-.so release-asset hosting used by ci.yml / nightly-ci.yml.
+# LITE + MHA-INDEPENDENT + ZERO JIT LIBS: this leg uses TE attention
+# (attention=cudnn_flash_te, aiter_attention=False) and MaxText-native RMSNorm,
+# so neither jax-aiter MHA nor jax-aiter RMSNorm is ever exercised. The MXFP4
+# FP4 recipe (quantization=aiter_fp4) needs ONLY the FP4 GEMM + MXFP4 cast +
+# BF16 GEMM FFI shims, which are ALL produced by `make` + `make ja_mods_nomha`
+# (incl. the f4gemm / bf16gemm hsa/codegen.py steps). It therefore builds ZERO
+# JIT libs (JA_SKIP_JIT_BUILD=true -> build_jit.py skipped) and installs the
+# LITE wheel. It does NOT build/download the multi-GB libmha_*.so or
+# librmsnorm_fwd.so, and is fully decoupled from the prebuilt-.so release-asset
+# hosting used by ci.yml / nightly-ci.yml.
 #
 # RECORD mode for now (no --gate). After the first green run:
 #   1. download the perf-8b-fp4 artifact, copy perf_8b_fp4.json ->
@@ -90,13 +94,14 @@ jobs:
       - name: Install tooling and JAX runtime
         run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
-      # LITE build: rmsnorm JIT lib + core (non-MHA) shims + lite wheel ONLY.
-      # No libmha_*.so build, no release-asset download (MHA-independent).
-      - name: Build jax-aiter (LITE -- rmsnorm + core shims, no MHA)
+      # LITE build: core (non-MHA) FFI shims + lite wheel ONLY -- ZERO JIT libs.
+      # JA_SKIP_JIT_BUILD=true skips build_jit.py entirely; the FP4 GEMM + MXFP4
+      # cast + BF16 GEMM shims come from `make` + `make ja_mods_nomha`. No
+      # libmha_*.so / librmsnorm_fwd.so build, no release-asset download.
+      - name: Build jax-aiter (LITE -- core shims only, NO JIT libs)
         run: |
           docker exec \
-            -e JA_DO_JIT_BUILD=true \
-            -e JA_JIT_MODULES=librmsnorm_fwd \
+            -e JA_SKIP_JIT_BUILD=true \
             -e JA_MODS_TARGET=ja_mods_nomha \
             -e JA_WHEEL_VARIANT=lite \
             "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
