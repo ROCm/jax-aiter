@@ -16,6 +16,8 @@ env:
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: "gfx942;gfx950"
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+  # Prebuilt JIT-lib release the fetch step pulls the .so's from.
+  JIT_LIBS_RELEASE_TAG: v0.1.0-alpha
 
 jobs:
   build-and-test:
@@ -37,30 +39,21 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Get third_party/aiter submodule SHA
-        id: aiter_sha
-        run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      # Shared JIT-lib cache key. The SAME string is used by ci.yml,
-      # nightly-ci.yml, cache-refresh.yml and nightly-perf.yml so the multi-GB
-      # MHA JIT libs build once (cold miss) and every job reuses them. The
-      # `-patches-` segment makes the key change whenever a scripts/*.patch
-      # changes (AITER version is already encoded via the submodule SHA).
-      - name: Compute shared JIT cache key
-        id: cache_key
-        run: |
-          echo "key=aiter-so-${{ runner.os }}-aiter-${{ steps.aiter_sha.outputs.sha }}-jit-${{ hashFiles('jax_aiter/jit/**') }}-cfg-${{ hashFiles('**/optCompilerConfig.json') }}-patches-${{ hashFiles('scripts/*.patch') }}" >> "$GITHUB_OUTPUT"
-
       - name: Create aiter_build directory
         run: mkdir -p build/aiter_build
 
-      - name: Restore AITER JIT modules cache
-        id: aiter_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            build/aiter_build/*.so
-          key: ${{ steps.cache_key.outputs.key }}
+      # Download the prebuilt MHA JIT libs from the release + verify them against
+      # this checkout (aiter SHA + scripts/*.patch hash + GPU archs). On a match
+      # the libs are decompressed into build/aiter_build/ and `rebuild=false`;
+      # on any mismatch/missing asset `rebuild=true` and ci/build.sh rebuilds.
+      - name: Fetch prebuilt JIT libs (verify-or-rebuild)
+        id: fetch_jit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_RELEASE_TAG: ${{ env.JIT_LIBS_RELEASE_TAG }}
+          GH_REPO: ${{ github.repository }}
+          GPU_ARCHS: ${{ env.GPU_ARCHS }}
+        run: bash ci/fetch_jit_libs.sh
 
       - name: Pull container image
         run: docker pull "$IMAGE"
@@ -90,19 +83,11 @@ jobs:
       - name: Install tooling and JAX runtime
         run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
-      - name: Build (umbrella + JIT[on miss] + FFI + install)
+      - name: Build (umbrella + JIT[fallback] + FFI + install)
         run: |
           docker exec \
-            -e JA_DO_JIT_BUILD="${{ steps.aiter_cache.outputs.cache-hit != 'true' }}" \
+            -e JA_DO_JIT_BUILD="${{ steps.fetch_jit.outputs.rebuild }}" \
             "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
-
-      - name: Save AITER JIT modules cache
-        if: steps.aiter_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            build/aiter_build/*.so
-          key: ${{ steps.cache_key.outputs.key }}
 
       - name: Test (smoke + unit subset, 1 GPU)
         run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/test.sh'

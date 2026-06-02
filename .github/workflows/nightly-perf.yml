@@ -1,9 +1,13 @@
 name: JAX-AITER Nightly Perf (MXFP4 8B)
 
 # Nightly MXFP4 8B FP4 end-to-end throughput leg on all 8 GPUs (FSDP=8).
-# Restores the shared JIT cache (no MHA rebuild), builds + installs jax-aiter,
-# clones MaxText + installs TransformerEngine, runs the 8B FP4 recipe, and
-# records tail-10 TFLOP/s + loss as an artifact + step summary.
+#
+# LITE + MHA-INDEPENDENT: this leg uses TE attention (attention=cudnn_flash_te,
+# aiter_attention=False), so jax-aiter's MHA is NEVER exercised. It therefore
+# builds ONLY the rmsnorm JIT lib (build_jit.py --module librmsnorm_fwd) + the
+# core (non-MHA) FFI shims (make ja_mods_nomha) and installs the LITE wheel.
+# It does NOT download or build the multi-GB libmha_*.so, and is fully decoupled
+# from the prebuilt-.so release-asset hosting used by ci.yml / nightly-ci.yml.
 #
 # RECORD mode for now (no --gate). After the first green run:
 #   1. download the perf-8b-fp4 artifact, copy perf_8b_fp4.json ->
@@ -13,7 +17,7 @@ name: JAX-AITER Nightly Perf (MXFP4 8B)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * *'   # after nightly-ci (01:00) has seeded the cache
+    - cron: '0 6 * * *'   # after nightly-ci (01:00)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,27 +51,6 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-
-      - name: Get third_party/aiter submodule SHA
-        id: aiter_sha
-        run: echo "sha=$(git -C third_party/aiter rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      # Same shared key as ci.yml / nightly-ci.yml / cache-refresh.yml.
-      - name: Compute shared JIT cache key
-        id: cache_key
-        run: |
-          echo "key=aiter-so-${{ runner.os }}-aiter-${{ steps.aiter_sha.outputs.sha }}-jit-${{ hashFiles('jax_aiter/jit/**') }}-cfg-${{ hashFiles('**/optCompilerConfig.json') }}-patches-${{ hashFiles('scripts/*.patch') }}" >> "$GITHUB_OUTPUT"
-
-      - name: Create aiter_build directory
-        run: mkdir -p build/aiter_build
-
-      - name: Restore AITER JIT modules cache
-        id: aiter_cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            build/aiter_build/*.so
-          key: ${{ steps.cache_key.outputs.key }}
 
       - name: Wait for idle GPU (shared-node gate)
         run: |
@@ -107,10 +90,15 @@ jobs:
       - name: Install tooling and JAX runtime
         run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
-      - name: Build (umbrella + JIT[on miss] + FFI + install)
+      # LITE build: rmsnorm JIT lib + core (non-MHA) shims + lite wheel ONLY.
+      # No libmha_*.so build, no release-asset download (MHA-independent).
+      - name: Build jax-aiter (LITE -- rmsnorm + core shims, no MHA)
         run: |
           docker exec \
-            -e JA_DO_JIT_BUILD="${{ steps.aiter_cache.outputs.cache-hit != 'true' }}" \
+            -e JA_DO_JIT_BUILD=true \
+            -e JA_JIT_MODULES=librmsnorm_fwd \
+            -e JA_MODS_TARGET=ja_mods_nomha \
+            -e JA_WHEEL_VARIANT=lite \
             "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
 
       - name: Run 8B FP4 perf leg (5 warmup + 50 timed steps)

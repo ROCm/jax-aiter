@@ -1,0 +1,159 @@
+name: JAX-AITER Release Publish (JIT libs + wheels)
+
+# PRODUCER workflow for the prebuilt-.so release-asset flow.
+#
+# On a published release (or manual dispatch) this:
+#   1. builds the umbrella lib + ALL 3 AITER JIT libs (full) + FFI shims,
+#   2. compresses the JIT libs + emits manifest.json and uploads them to the
+#      release via ci/publish_jit_libs.sh,
+#   3. builds the lite (+ gated full) jax-aiter wheel(s) and uploads them too.
+#
+# Everything is attached to the release with the built-in GITHUB_TOKEN (no PAT
+# needed) -- `permissions: contents: write` grants the token release-asset
+# write access, which `gh release upload` consumes via the GH_TOKEN env.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the JIT libs + wheels to"
+        required: false
+        default: v0.1.0-alpha
+      build_full_wheel:
+        description: "Also build + upload the full (with-MHA) wheel"
+        required: false
+        default: "true"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # never interrupt a long release build/upload
+
+permissions:
+  contents: write   # lets the built-in GITHUB_TOKEN upload release assets
+
+env:
+  IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  GPU_ARCHS: "gfx942;gfx950"
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+
+jobs:
+  build-and-publish:
+    runs-on: [self-hosted, Linux]
+
+    env:
+      CONTAINER_NAME: rv_aiter_release
+
+    steps:
+      - name: Fix permissions from previous Docker run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R $(id -u):$(id -g) "${{ github.workspace }}" || true
+          fi
+
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            T="${{ github.event.release.tag_name }}"
+          else
+            T="${{ github.event.inputs.tag }}"
+          fi
+          echo "tag=${T:-v0.1.0-alpha}" >> "$GITHUB_OUTPUT"
+
+      - name: Create aiter_build directory
+        run: mkdir -p build/aiter_build
+
+      - name: Pull container image
+        run: docker pull "$IMAGE"
+
+      - name: Launch build container
+        run: |
+          set -euxo pipefail
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host \
+            --device=/dev/kfd \
+            --device=/dev/dri \
+            --ipc=host \
+            --shm-size=16G \
+            --group-add=video \
+            --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
+            -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
+            -e HIP_VISIBLE_DEVICES=0 \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w "/jax-aiter" \
+            "$IMAGE" tail -f /dev/null
+
+      - name: Install tooling and JAX runtime
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
+
+      # Force the FULL JIT build (all 3 libs) -- this is the producer, so there
+      # is no fetch/cache; this is the one place the multi-GB libs are built.
+      - name: Build (umbrella + FULL JIT + FFI + install)
+        run: |
+          docker exec \
+            -e JA_DO_JIT_BUILD=true \
+            "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
+
+      - name: Detect ROCm version (from build container)
+        id: rocm
+        run: |
+          v=$(docker exec "$CONTAINER_NAME" bash -lc 'cat /opt/rocm/.info/version 2>/dev/null | cut -d- -f1' || true)
+          echo "version=${v:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "build-container ROCm: ${v:-unknown}"
+
+      # Compress the JIT libs + emit manifest.json + upload to the release. Runs
+      # on the host (zstd lives there); ROCM_VERSION is the container's so the
+      # manifest records the ROCm the libs were actually built against.
+      - name: Publish JIT libs to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ROCM_VERSION: ${{ steps.rocm.outputs.version }}
+          GPU_ARCHS: ${{ env.GPU_ARCHS }}
+        run: bash ci/publish_jit_libs.sh --tag "${{ steps.tag.outputs.tag }}"
+
+      - name: Build lite wheel
+        run: |
+          docker exec \
+            -e PIP_EXTRA_ARGS=--break-system-packages \
+            "$CONTAINER_NAME" bash -lc 'bash scripts/build_wheel.sh --variant lite'
+
+      - name: Build full wheel (gated)
+        if: ${{ github.event.inputs.build_full_wheel != 'false' }}
+        run: |
+          docker exec \
+            -e PIP_EXTRA_ARGS=--break-system-packages \
+            "$CONTAINER_NAME" bash -lc 'bash scripts/build_wheel.sh --variant full'
+
+      - name: Upload wheel(s) to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euxo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ ${#wheels[@]} -eq 0 ]; then
+            echo "ERROR: no wheels found in dist/" >&2
+            exit 1
+          fi
+          gh release upload "${{ steps.tag.outputs.tag }}" --repo "$GH_REPO" --clobber "${wheels[@]}"
+          echo "Uploaded ${#wheels[@]} wheel(s) to release ${{ steps.tag.outputs.tag }}."
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
