@@ -2,47 +2,79 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
-# HOST-side validation of the jax-aiter lite wheel. Builds the clean-room
-# validation image (docker/validation/Dockerfile.lite -- ROCm + JAX base,
-# NO AITER source, NO MaxText), then runs the FP4 GEMM smoke test inside a
-# fresh SIBLING container with the wheel pip-installed at run time. This
-# proves a downstream user can install and run the lite wheel with no source.
+# HOST-side validation of a jax-aiter wheel (lite or full) in a CLEAN room.
+# Builds docker/validation/Dockerfile.lite (ROCm + JAX base, NO AITER source,
+# NO MaxText, NO build toolchain), then pip-installs the wheel in a fresh
+# SIBLING container and runs the variant's smoke test(s). This proves a
+# downstream user can install and run the wheel with no source tree.
 #
-# NOTE: this runs on the HOST and spawns a sibling docker container -- it is
-# NOT executed inside rv_aiter.
+#   lite -> FP4 GEMM smoke (smoke_fp4_gemm.py).
+#   full -> FP4 GEMM smoke + MHA flash-attn fwd/bwd smoke (smoke_mha.py),
+#           proving the bundled libmha_fwd/bwd.so load + run from the wheel.
 #
-# Usage: scripts/validate_wheel.sh [path/to/wheel.whl]
-#   default wheel = newest dist/jax_aiter-*+lite-*.whl
+# NOTE: runs on the HOST and spawns a sibling docker container -- NOT inside
+# rv_aiter. Needs host docker + GPU access (/dev/kfd, /dev/dri).
+#
+# Usage: scripts/validate_wheel.sh [--variant {lite|full}] [path/to/wheel.whl]
+#   default variant = lite; default wheel = newest matching dist/ wheel.
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG="jax-aiter-validate:lite"
+IMAGE_TAG="jax-aiter-validate:clean"
 DOCKERFILE="$REPO/docker/validation/Dockerfile.lite"
 
-WHEEL="${1:-}"
+VARIANT="lite"
+WHEEL=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --variant) VARIANT="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) WHEEL="$1"; shift ;;
+  esac
+done
+
+if [[ "$VARIANT" != "lite" && "$VARIANT" != "full" ]]; then
+  echo "ERROR: --variant must be 'lite' or 'full' (got '$VARIANT')" >&2
+  exit 1
+fi
+
+# Resolve the wheel to test (explicit path wins; else newest matching dist/).
 if [[ -z "$WHEEL" ]]; then
-  WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*+lite-*.whl 2>/dev/null | head -n1 || true)"
+  if [[ "$VARIANT" == "lite" ]]; then
+    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*+lite-*.whl 2>/dev/null | head -n1 || true)"
+  else
+    # full = the non-+lite wheel.
+    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*-cp312-*.whl 2>/dev/null | grep -v '+lite' | head -n1 || true)"
+  fi
 fi
 if [[ -z "$WHEEL" || ! -f "$WHEEL" ]]; then
-  echo "ERROR: no lite wheel found (looked for dist/jax_aiter-*+lite-*.whl)." >&2
-  echo "       Build one first: bash scripts/build_wheel.sh --variant lite" >&2
+  echo "ERROR: no $VARIANT wheel found in dist/." >&2
+  echo "       Build one first: bash scripts/build_wheel.sh --variant $VARIANT" >&2
   exit 1
 fi
 WHEEL_BASE="$(basename "$WHEEL")"
-echo "[validate_wheel] wheel = $WHEEL_BASE"
+echo "[validate_wheel] variant=$VARIANT wheel=$WHEEL_BASE"
 
-# Build the clean validation image.
+# Build the clean validation image (cached across runs).
 echo "[validate_wheel] docker build -> $IMAGE_TAG"
 docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO/docker/validation"
 
-# Run the smoke test in a fresh sibling container with GPU access.
-echo "[validate_wheel] docker run FP4 GEMM smoke"
+# Smoke command per variant.
+if [[ "$VARIANT" == "lite" ]]; then
+  SMOKE="python /test/smoke_fp4_gemm.py"
+else
+  SMOKE="python /test/smoke_fp4_gemm.py && python /test/smoke_mha.py"
+fi
+
+# Run the smoke test(s) in a fresh sibling container with GPU access.
+echo "[validate_wheel] docker run smoke ($VARIANT)"
 docker run --rm \
   --device=/dev/kfd --device=/dev/dri --group-add video \
   -v "$REPO/dist:/dist:ro" \
   -v "$REPO/docker/validation:/test:ro" \
   "$IMAGE_TAG" \
-  bash -lc "pip install --break-system-packages /dist/$WHEEL_BASE && python /test/smoke_fp4_gemm.py"
+  bash -lc "pip install --break-system-packages /dist/$WHEEL_BASE && $SMOKE"
 
-echo "[validate_wheel] PASS"
+echo "[validate_wheel] PASS ($VARIANT)"

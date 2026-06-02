@@ -1,25 +1,36 @@
 <!-- SPDX-License-Identifier: MIT -->
 <!-- Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved. -->
 
-# jax-aiter v0.1.0-alpha (LITE / MXFP4)
+# jax-aiter v0.1.0-alpha (MXFP4)
 
-First public alpha of `jax-aiter`. This release ships the **lite** wheel:
-the AMD AITER **MXFP4 (FP4) training path** for JAX on ROCm gfx950 (MI350 /
-MI355X), built on **AITER v0.1.14**.
+First public alpha of `jax-aiter`: the AMD AITER **MXFP4 (FP4) training path**
+for JAX on ROCm gfx950 (MI350 / MI355X), built on **AITER v0.1.14**. Two wheels
+are published — pick one:
 
-- **Wheel:** `jax_aiter-0.1.0a0+lite-cp312-cp312-linux_x86_64.whl` (~43 MiB)
+- **lite** `jax_aiter-0.1.0a0+lite-cp312-cp312-linux_x86_64.whl` (~54 MiB) —
+  MXFP4 path only; **no** AITER flash-attention. Sufficient for the canonical
+  FP4 recipe (attention routes through TransformerEngine).
+- **full** `jax_aiter-0.1.0a0-cp312-cp312-linux_x86_64.whl` (~739 MiB) —
+  everything in lite **plus** AITER MHA flash-attention (`flash_attn_func` /
+  `flash_attn_varlen`; bundles `libmha_fwd.so` + `libmha_bwd.so`).
+
 - **AITER pin:** `v0.1.14` (`bd0534e9630f8f142f51689f5808c627460e35bf`)
 - **Target:** ROCm 7.2+, Python 3.12, gfx950 (MI350 / MI355X)
 - **Runtime:** JAX 0.9.x + ROCm pjrt/plugin. No PyTorch at runtime.
 
 ## Scope
 
-The lite wheel is the MXFP4-focused subset. It deliberately **excludes the
-multi-GB MHA flash-attention JIT libraries** (`libmha_fwd.so` /
-`libmha_bwd.so`) and their FFI shims, keeping the wheel at ~43 MiB instead of
-~513 MiB. The canonical FP4 training recipe routes attention through
-TransformerEngine (`attention=cudnn_flash_te`), so AITER MHA is **not** needed
-for the FP4 path — the lite wheel is sufficient for the recipe below.
+Both wheels share the MXFP4 core (FP4 GEMM/cast, BF16 GEMM, RMSNorm,
+SiLU-and-mul). They differ only in AITER flash-attention:
+
+- **lite** excludes the multi-GB MHA JIT libs (`libmha_fwd.so` /
+  `libmha_bwd.so`) + their FFI shims, keeping the wheel ~54 MiB. The canonical
+  FP4 training recipe routes attention through TransformerEngine
+  (`attention=cudnn_flash_te`), so AITER MHA is **not** needed for the FP4 path
+  — lite is sufficient for the recipe below.
+- **full** adds the AITER MHA flash-attention path (forward + backward),
+  bundling the v0.1.14 `libmha_fwd.so` (1.81 GB) + `libmha_bwd.so` (1.45 GB);
+  the wheel is ~739 MiB (deflate-compressed).
 
 ### Included ops
 
@@ -32,16 +43,19 @@ for the FP4 path — the lite wheel is sufficient for the recipe below.
 | RMSNorm | `rms_norm`, `rms_norm_with_add` | See limitation note on `librmsnorm_fwd.so` below. |
 | SiLU-and-Mul | `silu_and_mul(x)` | Fused activation. |
 
-### Excluded (use the full wheel)
+### MHA flash-attention (full wheel only)
 
-- `flash_attn_func` / `flash_attn_varlen` (AITER MHA). Importing
-  `jax_aiter.mha` from the lite wheel raises a clear `ModuleNotFoundError`
-  pointing to the full variant.
+- `flash_attn_func` / `flash_attn_varlen` (AITER MHA, `custom_vjp` fwd+bwd).
+  Shipped in the **full** wheel. Importing `jax_aiter.mha` from the **lite**
+  wheel raises a clear `ModuleNotFoundError` pointing to the full variant.
 
 ## Install
 
 ```bash
+# lite (MXFP4 only):
 pip install jax_aiter-0.1.0a0+lite-cp312-cp312-linux_x86_64.whl
+# full (MXFP4 + AITER MHA flash-attention):
+pip install jax_aiter-0.1.0a0-cp312-cp312-linux_x86_64.whl
 ```
 
 **ROCm JAX runtime prerequisite.** The lite wheel needs a ROCm-enabled JAX.
@@ -61,20 +75,25 @@ The wheel bundles the gfx950 FP4 ASM kernels under `jax_aiter/_hsa/`.
 `JA_ROOT_DIR` is **unset** (leave it unset for installed-wheel use; it is only
 needed for source/dev trees).
 
-## Validation (MXFP4-only)
+## Validation
 
-Validated standalone in a **clean sibling container** with no AITER source
-tree, no MaxText, and no build toolchain (`scripts/validate_wheel.sh` →
-`docker/validation/Dockerfile.lite` + `smoke_fp4_gemm.py`):
+**Both** wheels are validated standalone in a **clean sibling container** with
+no AITER source tree, no MaxText, and no build toolchain
+(`scripts/validate_wheel.sh --variant {lite|full}` →
+`docker/validation/Dockerfile.lite` + the smoke scripts):
 
 - **Base:** `ghcr.io/rocm/jax-base-ubu24.rocm720` + ROCm JAX stack
   (`jax` / `jax-rocm7-pjrt` / `jax-rocm7-plugin` `0.9.1`, installed from
   `repo.radeon.com/rocm/manylinux/rocm-rel-7.2/`).
-- **Smoke:** `import jax_aiter` (prints `__version__ = 0.1.0a0`), then
-  `gemm_fp4_bf16` on a `1024×4096 @ 4096×4096` BF16 GEMM; asserts shape +
-  finiteness.
-- **Result:** **PASS** — ROCm detected 8× gfx950, "Loaded 35 FP4 GEMM kernels"
-  from the wheel's packaged `_hsa/`, `shape=(1024, 4096) dtype=bfloat16`.
+- **lite (`smoke_fp4_gemm.py`):** `import jax_aiter` (prints
+  `__version__ = 0.1.0a0`), then `gemm_fp4_bf16` on a `1024×4096 @ 4096×4096`
+  BF16 GEMM; asserts shape + finiteness. **PASS** — 8× gfx950, "Loaded 35 FP4
+  GEMM kernels" from the packaged `_hsa/`, `shape=(1024, 4096) dtype=bfloat16`.
+- **full (`smoke_fp4_gemm.py` + `smoke_mha.py`):** the FP4 GEMM smoke above
+  **plus** `flash_attn_func` forward **and** backward (via `jax.grad`) on a
+  `(2, 256, 4, 64)` bf16 tensor; asserts fwd + dq/dk/dv shapes + finiteness.
+  **PASS** (`MHA smoke PASS fwd+bwd shape=(2, 256, 4, 64)`) — proves the bundled
+  `libmha_fwd.so` + `libmha_bwd.so` load and run from the wheel alone.
 
 > **Validated on two jax stacks.** The lite wheel's FP4 path is validated on
 > **both** `jax 0.9.0` and `jax 0.9.1`:
@@ -95,18 +114,14 @@ release validation (MXFP4-only).
 
 ## Known limitations / caveats
 
-- **No flash attention in lite.** MHA is excluded by design. Use the full
-  wheel for `flash_attn_func` / `flash_attn_varlen`.
-- **Full wheel deferred (MHA-shim CK header conflict).** Building the full
-  wheel's MHA FFI shims (`mha_fwd_ja.so` / `mha_bwd_ja.so`) currently hits a
-  Composable Kernel (CK) header conflict against the v0.1.14 AITER/CK headers.
-  The lite wheel sidesteps this by excluding the MHA shims; the full-wheel
-  build is a tracked follow-up.
-- **`librmsnorm_fwd.so` is stale (off the MXFP4 path).** The bundled
-  `librmsnorm_fwd.so` is the pre-bump build (from AITER pin `3baf198`, not
-  rebuilt against v0.1.14). RMSNorm is **off** the MXFP4 FP4 GEMM/cast path, so
-  this does **not** affect the FP4 validation above. Rebuilding it against
-  v0.1.14 is a follow-up if RMSNorm is exercised in production.
+- **No flash attention in the lite wheel** (by design). Use the **full** wheel
+  for `flash_attn_func` / `flash_attn_varlen`.
+- **Full wheel size (~739 MiB).** It embeds the v0.1.14 MHA JIT libs
+  (`libmha_fwd.so` 1.81 GB + `libmha_bwd.so` 1.45 GB, deflate-compressed in the
+  wheel); still well under the 2 GiB GitHub release-asset limit.
+- **alpha quality.** APIs may change; gfx950-only; validated on the smoke
+  surface above (FP4 GEMM + MHA fwd/bwd), not the full op matrix. All 3 JIT
+  libs (incl. `librmsnorm_fwd.so`) are rebuilt against v0.1.14.
 
 ## MaxText FP4 integration
 
@@ -189,11 +204,14 @@ export GPU_MAX_HW_QUEUES=2 HIP_FORCE_DEV_KERNARG=1 HSA_FORCE_FINE_GRAIN_PCIE=1
 ## Reproduce
 
 ```bash
-# Build the lite wheel (inside the rv_aiter container; reuses prebuilt
-# AITER JIT libs, never rebuilds MHA — sha256-guarded).
+# Build both wheels (inside the rv_aiter container; reuses prebuilt AITER JIT
+# libs, never rebuilds them — sha256-guarded).
 docker exec rv_aiter bash -lc \
-  "cd /ruvaidya/aiter_proj/jax-aiter && bash scripts/build_wheel.sh --variant lite"
+  "cd /ruvaidya/aiter_proj/jax-aiter && \
+   bash scripts/build_wheel.sh --variant lite && \
+   bash scripts/build_wheel.sh --variant full"
 
-# Validate in a clean sibling container (host-side; GPU smoke).
-bash scripts/validate_wheel.sh
+# Validate each in a clean sibling container (host-side; GPU smoke).
+bash scripts/validate_wheel.sh --variant lite   # FP4 GEMM
+bash scripts/validate_wheel.sh --variant full   # FP4 GEMM + MHA fwd/bwd
 ```
