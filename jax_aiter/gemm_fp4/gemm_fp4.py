@@ -35,6 +35,52 @@ Env vars (advanced)
 ``AITER_KERNEL_SEL=1``
     Use AITER's per-shape tuned-kernel CSV instead of the default static
     heuristic. Opt-in.
+``JA_FP4_HIGHP_PASSES=<comma-list of {fprop,dgrad,wgrad}>``
+    Per-pass high-precision (bf16) fallback (debug / ablation). Each listed
+    pass runs its GEMM in bf16 instead of FP4. ``wgrad`` and ``dgrad`` are
+    wired (``fprop`` is not):
+      * ``wgrad`` -- backward computes ``dB = grad_out^T @ a`` from the RAW
+        bf16 grad + RAW bf16 activation (stashed by the fwd), reduced across
+        the FSDP mesh with the SAME ``psum`` as the FP4 wgrad (M/batch axis is
+        FSDP-sharded).
+      * ``dgrad`` -- backward computes ``dA = grad_out @ b`` from the RAW bf16
+        grad + RAW bf16 weight (stashed by the fwd). The contraction axis N
+        (output features) is REPLICATED under FSDP, so this is a plain bf16
+        ``dot_general`` -- NO collective.
+    ``dgrad,wgrad`` => the entire backward runs bf16 (dA + dB) while the
+    forward stays FP4, isolating forward-FP4 vs backward-FP4 error. **Unset
+    (default) => byte-identical all-FP4 backward** (4-tuple residual, FP4
+    dA + dB). Reversible debug knob.
+``JA_FP4_DGRAD_PREC=fp8``
+    FP8-precision dgrad (advanced, opt-in; independent of
+    ``JA_FP4_HIGHP_PASSES``). When ``fp8``, the dgrad GEMM ``dA = grad_out @ b``
+    runs in fp8 (``float8_e4m3fn``, the OCP fp8 native to gfx950) instead of
+    FP4 -- a candidate mixed FP4-fwd / FP8-dgrad recipe and a probe of how much
+    precision the dgrad needs. The fwd stashes the RAW bf16 weight (same
+    residual as the bf16 dgrad); the bwd casts ``grad_out`` + weight to fp8 and
+    ``dot_general``s them. XLA-ROCm lowers this to a REAL fp8 cublasLt matmul
+    (``__cublas$...$f8``; ~1.45-1.8x faster than the bf16 dgrad dot on gfx950).
+    The forward and wgrad stay FP4. N (contraction) is replicated under FSDP =>
+    NO collective. **Unset (default) => byte-identical all-FP4 dgrad.**
+    Reversible debug knob.
+``JA_CAPTURE_DIR=<dir>``
+    Offline-probe capture hook (debug / analysis only). When set, the
+    forward dumps the bf16 ``(a, b)`` operands and the backward dumps the
+    bf16 ``grad_out`` for each distinct ``(M, N, K)`` GEMM site (FIRST
+    occurrence by default), so an offline replay can rebuild the
+    ``(a, b, grad_out)`` triple per projection shape. **Unset (default) =>
+    zero effect:** the guard is a trace-time Python check, so no callback /
+    slice node is added to the graph and production numerics are
+    byte-identical. Reversible: delete the ``_capture_*`` block + the two
+    call sites in the fwd / bwd.
+``JA_CAPTURE_AFTER_STEP=<N>``
+    Steady-state capture knob (only meaningful with ``JA_CAPTURE_DIR`` set).
+    The GEMM call site does not see the training step, so this is compared
+    against a HOST-side per-shape GEMM-call (fire) counter: a site is
+    captured only once its counter reaches ``N``. With ``scan_layers``
+    (and remat) a shape fires ~``num_layers`` (or ~2x) times per step, so
+    ``N`` ~= ``target_step * fires_per_step``. Default ``0`` => capture the
+    FIRST fire (step-0 behavior, backward-compatible).
 """
 
 from __future__ import annotations
@@ -74,7 +120,66 @@ except Exception as exc:  # pragma: no cover -- build-time error path
 
 
 # Hadamard "force-on for ALL casts" override. Default is grad-only.
-_HADAMARD_ALL = os.environ.get("AITER_FUSED_QUANT_HADAMARD", "0") == "1"
+# AITER_FP4_HADAMARD_OFF=1 fully disables Hadamard on EVERY cast incl. grad
+# (debug/ablation; default off => unchanged grad-only / all-on behavior).
+_HADAMARD_NONE = os.environ.get("AITER_FP4_HADAMARD_OFF", "0") == "1"
+_HADAMARD_ALL = (os.environ.get("AITER_FUSED_QUANT_HADAMARD", "0") == "1") and not _HADAMARD_NONE
+
+
+# ---------------------------------------------------------------------------
+# Stochastic rounding (SR) for the FP32->FP4 cast (advanced, opt-in via
+# AITER_FP4_SR=1). Same E2M1 grid as the default RNE (NO extra precision) but
+# unbiased: E[dequant(SR(x))] == x. RNE's per-step rounding bias does not
+# cancel across steps; SR's does, so its payoff is cumulative over training --
+# a lever a single-step calibration cannot observe. When enabled, SR is applied
+# to ALL FP4 casts (act / weight / grad), which covers both dgrad operands
+# (grad_out + weight). Read at import (parity with _HADAMARD_ALL); the cast
+# helpers look the module global up at trace time so tests can monkeypatch it.
+# Default off => byte-identical RNE path (the kernel compiles both; the runtime
+# use_sr flag selects). Reversible debug knob.
+# ---------------------------------------------------------------------------
+_SR_ALL = os.environ.get("AITER_FP4_SR", "0") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Per-pass high-precision (bf16) fallback (advanced, opt-in via
+# JA_FP4_HIGHP_PASSES). Comma-list of {fprop,dgrad,wgrad}; each listed pass
+# runs its GEMM in bf16 instead of FP4. Default empty => every pass stays FP4
+# (production recipe unchanged). Read at import (parity with _HADAMARD_ALL);
+# the fwd/bwd look the module global up at trace time so tests can monkeypatch
+# it. Reversible debug knob: unset => byte-identical all-FP4 behavior.
+#
+# "wgrad" and "dgrad" are wired (set BOTH => the whole backward runs bf16
+# while the forward stays FP4, isolating forward-FP4 vs backward-FP4 error):
+#   * wgrad -- dB = grad_out^T @ a (contraction over the FSDP-sharded M/batch
+#     axis; needs an all-reduce). The FP4 pass most exposed to gradient
+#     under-flush: token/M-axis blocks dominated by outlier tokens set the
+#     shared E8M0 scale, flushing small entries to FP4 code 0; feeds the
+#     optimizer weight update directly.
+#   * dgrad -- dA = grad_out @ b (contraction over the output-feature axis N,
+#     which is REPLICATED under FSDP, so a plain local dot -- NO collective).
+# ---------------------------------------------------------------------------
+def _parse_highp_passes():
+    raw = os.environ.get("JA_FP4_HIGHP_PASSES", "")
+    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+_HIGHP_PASSES = _parse_highp_passes()
+_HIGHP_WGRAD = "wgrad" in _HIGHP_PASSES
+_HIGHP_DGRAD = "dgrad" in _HIGHP_PASSES
+
+
+# ---------------------------------------------------------------------------
+# FP8-precision dgrad (advanced, opt-in via JA_FP4_DGRAD_PREC=fp8). Independent
+# of JA_FP4_HIGHP_PASSES (which selects the bf16 fallback). When "fp8" the dgrad
+# GEMM dA = grad_out @ b runs in fp8 (float8_e4m3fn) instead of FP4 -- a
+# candidate mixed FP4-fwd / FP8-dgrad recipe and a probe of how much precision
+# the dgrad needs. fwd + wgrad stay FP4. Read at import (parity with
+# _HIGHP_*); the fwd/bwd look the module global up at trace time so tests can
+# monkeypatch it. Default empty => dgrad stays FP4 (byte-identical).
+# ---------------------------------------------------------------------------
+_DGRAD_PREC = os.environ.get("JA_FP4_DGRAD_PREC", "").strip().lower()
+_FP8_DGRAD = _DGRAD_PREC == "fp8"
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +218,8 @@ def _cast_act_raw(x):
 
     Used by the forward-only primal path (no autograd).
     """
-    return _cast_mxfp4_op(x, shuffle_fp4=False, use_hadamard=_HADAMARD_ALL)
+    return _cast_mxfp4_op(x, shuffle_fp4=False, use_hadamard=_HADAMARD_ALL,
+                          use_sr=_SR_ALL)
 
 
 def _cast_wt_raw(x):
@@ -121,7 +227,8 @@ def _cast_wt_raw(x):
 
     Used by the forward-only primal path (no autograd).
     """
-    return _cast_mxfp4_op(x, shuffle_fp4=True, use_hadamard=_HADAMARD_ALL)
+    return _cast_mxfp4_op(x, shuffle_fp4=True, use_hadamard=_HADAMARD_ALL,
+                          use_sr=_SR_ALL)
 
 
 def _cast_act_dual_raw(x):
@@ -135,6 +242,7 @@ def _cast_act_dual_raw(x):
         shuffle_fp4=False,
         shuffle_colwise_fp4=True,
         use_hadamard=_HADAMARD_ALL,
+        use_sr=_SR_ALL,
     )
 
 
@@ -149,6 +257,7 @@ def _cast_wt_dual_raw(x):
         shuffle_fp4=True,
         shuffle_colwise_fp4=True,
         use_hadamard=_HADAMARD_ALL,
+        use_sr=_SR_ALL,
     )
 
 
@@ -168,7 +277,8 @@ def _cast_grad_dual_raw(x):
         x,
         shuffle_fp4=False,
         shuffle_colwise_fp4=False,
-        use_hadamard=True,
+        use_hadamard=not _HADAMARD_NONE,
+        use_sr=_SR_ALL,
     )
 
 
@@ -449,6 +559,247 @@ _fp4_ffi_partitioned_wgrad.def_partition(
 
 
 # ---------------------------------------------------------------------------
+# BF16 GEMM wgrad high-precision fallback (opt-in via JA_FP4_HIGHP_PASSES=wgrad).
+#
+#   grad_out [M, N]  (raw bf16 cotangent)
+#   a        [M, K]  (raw bf16 activation, stashed by the fwd)
+#   OUT = dB [N, K] = grad_out^T @ a   (contraction over M -- FSDP-sharded)
+#
+# bf16 twin of _fp4_ffi_partitioned_wgrad. The contraction axis M is the
+# FSDP-sharded batch/token axis, so the per-shard partial products MUST be
+# reduced across the FSDP mesh -- the role the FP4 wgrad's explicit
+# jax.lax.psum plays. Here dB is declared REPLICATED (P(None, None), matching
+# the FP4 wgrad's replicated output) via dot_general's ``out_sharding``, so
+# XLA GSPMD inserts the all-reduce over the sharded contraction automatically:
+# the equivalent, verified reduction (2-device check: cos 1.0, norm-ratio 1.0;
+# a MISSING reduction would give ~0.5 norm-ratio). A plain unconstrained
+# dot_general is rejected by JAX 0.9 sharding-in-types ("Contracting
+# dimensions are sharded ... specify the output sharding via out_sharding").
+# On a single device (no sharded axis) out_sharding is None => plain local
+# dot. bf16 in, fp32 accumulate, bf16 out (matching the FP4 wgrad dB dtype so
+# the custom_vjp cotangent types agree).
+# ---------------------------------------------------------------------------
+
+def _replicated_out_sharding(x):
+    """If ``x`` carries a non-trivial mesh sharding (some dim mapped to a mesh
+    axis), return a replicated NamedSharding on that mesh -- this forces GSPMD
+    to all-reduce a sharded contraction. Else None (single-device / unsharded
+    => plain local dot)."""
+    sh = getattr(getattr(x, "aval", None), "sharding", None)
+    mesh = getattr(sh, "mesh", None)
+    spec = getattr(sh, "spec", None)
+    if mesh is not None and spec is not None and any(s is not None for s in spec):
+        return NamedSharding(mesh, P(None, None))
+    return None
+
+
+def _bf16_wgrad(grad_out, a):
+    """dB = grad_out^T @ a, contracting the M/batch axis (axis 0 of both),
+    reduced across the FSDP mesh via a replicated-output GSPMD all-reduce."""
+    db = jax.lax.dot_general(
+        grad_out, a,
+        dimension_numbers=(((0,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+        out_sharding=_replicated_out_sharding(grad_out),
+    )
+    return db.astype(grad_out.dtype)
+
+
+# ---------------------------------------------------------------------------
+# BF16 GEMM dgrad high-precision fallback (opt-in via JA_FP4_HIGHP_PASSES=dgrad).
+#
+#   grad_out [M, N]  (raw bf16 cotangent)
+#   b        [N, K]  (raw bf16 weight, stashed by the fwd)
+#   OUT = dA [M, K] = grad_out @ b   (contraction over N -- the output-feature
+#                                     axis, REPLICATED under FSDP)
+#
+# bf16 twin of the FP4 dgrad (_fp4_ffi_partitioned over go_row + col_b). Unlike
+# the wgrad, whose M contraction is FSDP-sharded and needs an all-reduce, the
+# dgrad contraction axis N is REPLICATED under FSDP (the FP4 dgrad declares the
+# contraction in need_replication_factors, i.e. each device holds the full N),
+# so NO collective is required: dA[M, K] inherits grad_out's M sharding and the
+# weight's K, the SAME output sharding as the FP4 dgrad. GSPMD therefore
+# propagates the output sharding from the operands and a plain dot_general is
+# accepted (the "Contracting dimensions are sharded" sharding-in-types error
+# only fires for a SHARDED contraction -- not this one), so no out_sharding
+# hint is needed. bf16 in, fp32 accumulate, bf16 out (matching the FP4 dgrad dA
+# dtype so the custom_vjp cotangent types agree).
+# ---------------------------------------------------------------------------
+
+def _bf16_dgrad(grad_out, b):
+    """dA = grad_out @ b, contracting the N/output-feature axis (axis 1 of
+    grad_out, axis 0 of the weight b). N is replicated under FSDP => plain
+    local dot, no collective."""
+    da = jax.lax.dot_general(
+        grad_out, b,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    return da.astype(grad_out.dtype)
+
+
+# ---------------------------------------------------------------------------
+# FP8-precision GEMM dgrad (opt-in via JA_FP4_DGRAD_PREC=fp8).
+#
+#   grad_out [M, N]  (raw bf16 cotangent)
+#   b        [N, K]  (raw bf16 weight, stashed by the fwd)
+#   OUT = dA [M, K] = grad_out @ b   (contraction over N -- REPLICATED under FSDP)
+#
+# fp8 twin of _bf16_dgrad: cast BOTH operands to float8_e4m3fn (the OCP fp8
+# format native to gfx950 / MI350) then dot_general. XLA-ROCm rewrites the
+# convert(fp8) -> dot pattern into a REAL fp8 cublasLt/hipBLASLt matmul
+# (__cublas$...$f8 in the HLO; ~1.45-1.8x faster than the bf16 dgrad dot on
+# gfx950 -- verified by the Step-0 probe). Like the bf16 dgrad, the N
+# contraction is replicated under FSDP => plain local matmul, NO collective and
+# NO out_sharding hint (the casts are elementwise, so GSPMD propagates the same
+# operand sharding as the bf16/FP4 dgrad). fp8 in, fp32 accumulate, bf16 out
+# (matching the FP4 dgrad dA dtype so the custom_vjp cotangent types agree). dB
+# (wgrad) stays FP4.
+# ---------------------------------------------------------------------------
+
+def _fp8_dgrad(grad_out, b):
+    """dA = grad_out @ b in fp8 (e4m3), contracting the N/output-feature axis
+    (axis 1 of grad_out, axis 0 of the weight b). N is replicated under FSDP =>
+    plain local fp8 matmul, no collective."""
+    da = jax.lax.dot_general(
+        grad_out.astype(jnp.float8_e4m3fn),
+        b.astype(jnp.float8_e4m3fn),
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    return da.astype(grad_out.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Offline-capture hook (env-gated via JA_CAPTURE_DIR; OFF by default).
+#
+# Purpose: dump the real bf16 (a, b, grad_out) per GEMM site so an offline
+# replay can localize which FP4 backward pass (fprop / dgrad / wgrad) damages
+# the training signal. Lives here because it must observe the *exact* tensors
+# the custom_vjp fwd / bwd receive.
+#
+# Production no-op guarantee: _capture_dir() is read at trace time. When unset
+# the helpers `return` immediately, so NO slice / callback node is emitted and
+# numerics are byte-identical. Fully reversible -- delete this block plus the
+# two `_capture_*` calls in _gemm_fp4_bf16_fwd / _gemm_fp4_bf16_bwd.
+#
+# Bounding: only a fixed leading slice (_CAPTURE_ROW_CAP rows along the token /
+# M axis, and along N for the weight) is transferred + saved, keyed by the
+# ORIGINAL (M, N, K) shape. A first-wins O_EXCL write means whichever scan
+# iteration / device fires first (past the JA_CAPTURE_AFTER_STEP threshold)
+# for a shape captures it; the rest skip. So the capture is a single
+# representative per-shard slice regardless of FSDP degree.
+#
+# Steady-state capture (JA_CAPTURE_AFTER_STEP): the GEMM call site cannot see
+# the training step, so we keep a HOST-side per-(role, shape) GEMM-call (fire)
+# counter -- bumped each time the runtime callback fires -- and only write once
+# a site's counter reaches the threshold. Default threshold 0 => write on the
+# first fire (step-0 behavior, backward-compatible). This lets an offline probe
+# compare step-0 vs steady-state under-flush from the same hook.
+# ---------------------------------------------------------------------------
+
+_CAPTURE_ROW_CAP = 4096
+
+# Host-side per-(role, shape) runtime fire counter for JA_CAPTURE_AFTER_STEP.
+_CAPTURE_CALL_COUNTS = {}
+
+
+def _capture_dir():
+    return os.environ.get("JA_CAPTURE_DIR")
+
+
+def _capture_after_step():
+    """Per-shape GEMM-call (fire) threshold; capture once a site's counter
+    reaches it. 0 (default / unparsable) => capture the first fire."""
+    v = os.environ.get("JA_CAPTURE_AFTER_STEP")
+    try:
+        return int(v) if v else 0
+    except ValueError:
+        return 0
+
+
+def _capture_count_ready(counter_key):
+    """Host-side: bump the per-(role, shape) fire counter and report whether
+    it has reached the JA_CAPTURE_AFTER_STEP threshold. Returns (ready, count)."""
+    n = _CAPTURE_CALL_COUNTS.get(counter_key, 0) + 1
+    _CAPTURE_CALL_COUNTS[counter_key] = n
+    return n >= _capture_after_step(), n
+
+
+def _capture_write(path, arr):
+    """First-wins host writer: O_EXCL means exactly one fire per shape wins.
+    Returns True if this call wrote the file, False if it already existed."""
+    import errno
+    import numpy as np
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return False  # already captured this site -- first-wins, skip.
+        raise
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            np.save(fh, np.asarray(arr, dtype=np.float32))
+        return True
+    except Exception:  # never let capture I/O perturb the run.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+
+
+def _capture_fwd(a, b):
+    """Dump bf16 (a, b) for this (M, N, K) site once its fire counter crosses
+    the JA_CAPTURE_AFTER_STEP threshold (default: first fire)."""
+    cap_dir = _capture_dir()
+    if not cap_dir:
+        return
+    M, K = a.shape
+    N = b.shape[0]
+    key = "M%d_N%d_K%d" % (M, N, K)
+    cap = _CAPTURE_ROW_CAP
+    a_s, b_s = a[:cap], b[:cap]
+
+    def _w(a_h, b_h):
+        ready, n = _capture_count_ready("fwd_" + key)
+        if not ready:
+            return
+        os.makedirs(cap_dir, exist_ok=True)
+        wrote = _capture_write(os.path.join(cap_dir, "site_%s__a.npy" % key), a_h)
+        _capture_write(os.path.join(cap_dir, "site_%s__b.npy" % key), b_h)
+        if wrote:
+            print("[ja-capture] fwd site %s (a,b) captured at fire #%d" % (key, n),
+                  flush=True)
+
+    jax.debug.callback(_w, a_s, b_s)
+
+
+def _capture_bwd(grad_out, k_dim):
+    """Dump bf16 grad_out for this (M, N, K) site once its fire counter crosses
+    the JA_CAPTURE_AFTER_STEP threshold (default: first fire)."""
+    cap_dir = _capture_dir()
+    if not cap_dir:
+        return
+    M, N = grad_out.shape
+    key = "M%d_N%d_K%d" % (M, N, k_dim)
+    cap = _CAPTURE_ROW_CAP
+    g_s = grad_out[:cap, :cap]
+
+    def _w(g_h):
+        ready, n = _capture_count_ready("bwd_" + key)
+        if not ready:
+            return
+        os.makedirs(cap_dir, exist_ok=True)
+        wrote = _capture_write(os.path.join(cap_dir, "site_%s__grad_out.npy" % key), g_h)
+        if wrote:
+            print("[ja-capture] bwd site %s grad_out captured at fire #%d" % (key, n),
+                  flush=True)
+
+    jax.debug.callback(_w, g_s)
+
+
+# ---------------------------------------------------------------------------
 # Public high-level API: BF16 in, FP4 internally, BF16 out.
 # ---------------------------------------------------------------------------
 
@@ -478,25 +829,85 @@ def gemm_fp4_bf16(a, b):
 
 
 def _gemm_fp4_bf16_fwd(a, b):
-    """Forward-with-residuals: dual-cast keeps columnwise FP4 for backward."""
+    """Forward-with-residuals: dual-cast keeps columnwise FP4 for backward.
+
+    When ``JA_FP4_HIGHP_PASSES`` selects ``wgrad`` / ``dgrad`` the RAW bf16
+    activation ``a`` / weight ``b`` is also stashed so the backward can run
+    that GEMM in bf16 instead of FP4. The extra residuals are appended in a
+    FIXED order -- ``a`` for wgrad, then ``b`` for dgrad -- so the backward
+    recovers them from the SAME module flags. Default (both unset) keeps the
+    original 4-tuple residual => byte-identical all-FP4 backward.
+    """
+    _capture_fwd(a, b)  # env-gated offline-probe hook (no-op unless JA_CAPTURE_DIR set).
     a_row, a_row_s, col_a_fp4, col_a_scale = _cast_act_dual(a)
     b_row, b_row_s, col_b_fp4, col_b_scale = _cast_wt_dual(b)
     out = _fp4_ffi_partitioned(a_row, b_row, a_row_s, b_row_s)
-    return out, (col_a_fp4, col_a_scale, col_b_fp4, col_b_scale)
+    residual = (col_a_fp4, col_a_scale, col_b_fp4, col_b_scale)
+    if _HIGHP_WGRAD:
+        residual = residual + (a,)  # RAW bf16 activation for the bf16 wgrad dB.
+    if _HIGHP_DGRAD or _FP8_DGRAD:
+        residual = residual + (b,)  # RAW bf16 weight for the bf16/fp8 dgrad dA.
+    return out, residual
 
 
 def _gemm_fp4_bf16_bwd(residuals, grad_out):
-    """Backward: FP4 dA and FP4 dB (wgrad-sharded) using saved columnwise data."""
-    col_a_fp4, col_a_scale, col_b_fp4, col_b_scale = residuals
+    """Backward: FP4 (default) or bf16 dA / dB per ``JA_FP4_HIGHP_PASSES``.
 
-    # Hadamard ON: applied inside the fused cast kernel for grad only.
-    go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
+    dA is the input-gradient (dgrad) GEMM ``grad_out @ B``, contracting the
+    output-feature axis N (REPLICATED under FSDP). dB is the weight-gradient
+    (wgrad) GEMM ``grad_out^T @ A``, contracting the FSDP-sharded M/batch axis.
+    When ``dgrad`` / ``wgrad`` is selected for high precision, that GEMM becomes
+    a bf16 dot of the RAW ``grad_out`` and the RAW bf16 weight / activation
+    (stashed in fwd) -- see ``_bf16_dgrad`` / ``_bf16_wgrad``. Selecting BOTH
+    => the whole backward is bf16 while the forward stays FP4. Alternatively
+    ``JA_FP4_DGRAD_PREC=fp8`` runs ONLY the dgrad in fp8 (e4m3) via
+    ``_fp8_dgrad`` (candidate mixed FP4-fwd / FP8-dgrad recipe), leaving wgrad
+    FP4. Whatever stays FP4 still consumes the Hadamard-transformed grad
+    dual-cast.
+    """
+    col_a_fp4, col_a_scale, col_b_fp4, col_b_scale = residuals[:4]
+    idx = 4
+    a_bf16 = b_bf16 = None
+    _dgrad_highp = _HIGHP_DGRAD or _FP8_DGRAD  # dgrad runs bf16 OR fp8 (not FP4)
+    if _HIGHP_WGRAD:
+        a_bf16 = residuals[idx]
+        idx += 1
+    if _dgrad_highp:
+        b_bf16 = residuals[idx]
+        idx += 1
 
-    # dA = grad_out @ B  -- NN layout, K is the contraction (replicated).
-    da = _fp4_ffi_partitioned(go_row, col_b_fp4, go_row_s, col_b_scale)
+    # env-gated offline-probe hook (no-op unless JA_CAPTURE_DIR set). K is the
+    # contraction dim, recovered from a saved columnwise residual ([K, .../2]).
+    _capture_bwd(grad_out, col_b_fp4.shape[0])
+
+    # Hadamard ON: applied inside the fused cast kernel for grad only. Skip the
+    # cast only when NEITHER backward GEMM is FP4 (no FP4 grad operand is
+    # consumed) so the high-precision throughput cost stays honest. dgrad is
+    # high-precision when bf16 OR fp8.
+    go_row = go_row_s = go_col_fp4 = go_col_scale = None
+    if (not _dgrad_highp) or (not _HIGHP_WGRAD):
+        go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
+
+    # dA = grad_out @ B -- NN layout, contraction over N (replicated under FSDP).
+    if _FP8_DGRAD:
+        # FP8-precision dA from RAW grad_out + RAW weight cast to e4m3 (real fp8
+        # cublasLt matmul; no FP4 quant, no Hadamard). N replicated => no
+        # collective. dB (wgrad) stays FP4 -- candidate mixed FP4-fwd/FP8-dgrad.
+        da = _fp8_dgrad(grad_out, b_bf16)
+    elif _HIGHP_DGRAD:
+        # High-precision bf16 dA from RAW grad_out + RAW weight (no FP4 quant,
+        # no Hadamard). N is replicated => plain local dot, no collective.
+        da = _bf16_dgrad(grad_out, b_bf16)
+    else:
+        da = _fp4_ffi_partitioned(go_row, col_b_fp4, go_row_s, col_b_scale)
     # dB = grad_out^T @ A -- NT layout, M_batch is the contraction (FSDP-
     # sharded). The partition callback emits psum across the FSDP mesh.
-    db = _fp4_ffi_partitioned_wgrad(go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
+    if _HIGHP_WGRAD:
+        # High-precision bf16 dB from RAW grad_out + RAW activation (no FP4
+        # quant, no Hadamard); same net FSDP reduction as the FP4 wgrad.
+        db = _bf16_wgrad(grad_out, a_bf16)
+    else:
+        db = _fp4_ffi_partitioned_wgrad(go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
     return da, db
 
 

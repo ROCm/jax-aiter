@@ -50,7 +50,8 @@ def gemm_fp4(a_packed, b_packed, a_scale, b_scale):
     return jax.jit(call)(a_packed, b_packed, a_scale, b_scale)
 
 
-def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False):
+def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
+               use_sr=False):
     """Fused BF16 -> MXFP4 quantization + shuffle via HIP kernel (single FFI call).
 
     Args:
@@ -59,6 +60,8 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False):
             True for weight operands, False for activation operands.
         shuffle_scales: Whether to shuffle E8M0 scales (always True for AITER ASM).
         use_hadamard: Apply Hadamard transform before quantization.
+        use_sr: Use stochastic rounding (unbiased) instead of RNE for the
+            FP32->FP4 convert. Default False => byte-identical RNE path.
 
     Returns:
         (fp4_packed, scales):
@@ -81,11 +84,12 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False):
         has_side_effect=False,
     )
     return call(x, shuffle_fp4=shuffle_fp4,
-                shuffle_scales=shuffle_scales, use_hadamard=use_hadamard)
+                shuffle_scales=shuffle_scales, use_hadamard=use_hadamard,
+                use_sr=use_sr)
 
 
 def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
-                     shuffle_scales=True, use_hadamard=False):
+                     shuffle_scales=True, use_hadamard=False, use_sr=False):
     """Fused BF16 -> MXFP4 with BOTH rowwise and columnwise output in one kernel launch.
 
     Returns rowwise (for forward GEMM) + columnwise (for dA/dB backward GEMM).
@@ -99,6 +103,8 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
                      (suitable as GEMM A operand for dB backward).
         shuffle_scales: Whether to shuffle E8M0 scales.
         use_hadamard: Apply Hadamard transform before quantization.
+        use_sr: Use stochastic rounding (unbiased) instead of RNE for the
+            FP32->FP4 convert. Default False => byte-identical RNE path.
 
     Returns:
         (row_fp4, row_scale, col_fp4, col_scale):
@@ -131,4 +137,4 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
     )
     return call(x, shuffle_fp4=shuffle_fp4,
                 shuffle_colwise_fp4=shuffle_colwise_fp4,
-                use_hadamard=use_hadamard)
+                use_hadamard=use_hadamard, use_sr=use_sr)

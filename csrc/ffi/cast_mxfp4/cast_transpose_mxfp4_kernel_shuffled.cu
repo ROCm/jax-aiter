@@ -339,6 +339,60 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4(
 #endif
 }
 
+/*
+ * FP32 to FP4 Conversion with Stochastic Rounding (SR)
+ * ----------------------------------------------------
+ * Drop-in unbiased alternative to cvt_f32x4_to_fp4x4 (RNE). Same E2M1 grid
+ * (NO extra precision) but rounds up/down with probability proportional to
+ * the fractional distance, so E[dequant(SR(x))] == x. The payoff is
+ * cumulative over training steps (per-step RNE bias does not cancel; SR's
+ * does), which a single-step calibration cannot observe.
+ *
+ * v_cvt_scalef32_sr_pk_fp4_f32 (gfx950 / CDNA4): packs 2 FP32 -> 2 FP4 with a
+ * per-element random dither drawn from a 32-bit RNG word, scaled inline.
+ *
+ * Per-thread PRNG seed (no host plumbing): mix the HW real-time clock with a
+ * unique global thread id so (a) threads decorrelate within a launch and
+ * (b) the SAME element decorrelates across launches/steps (the clock
+ * advances), giving the cumulative unbiased behavior. The 2nd f32 pair
+ * re-mixes the seed (XOR golden ratio) so the two pairs do not share dither.
+ *
+ * Mirrors third_party/aiter/.../ck/utility/type_convert.hpp f4_convert_sr.
+ */
+#if defined(__gfx950__)
+typedef float fp32x2_t __attribute__((ext_vector_type(2)));
+#endif
+
+__device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(
+    float v0, float v1, float v2, float v3,
+    float scale
+) {
+#if defined(__gfx950__)
+    // Unique 1-D global thread id: blockIdx * blockDim + threadIdx (2-D grid,
+    // 1-D block). Used only to decorrelate the per-thread RNG seed.
+    uint32_t global_tid =
+        (blockIdx.x * gridDim.y + blockIdx.y) * blockDim.x + threadIdx.x;
+
+    // Seed = HW real-time clock * (tid + 1), then hash via the on-chip PRNG.
+    uint32_t seed =
+        (uint32_t)(__builtin_amdgcn_s_memrealtime() * (uint64_t)(global_tid + 1u));
+    uint32_t rng0 = __builtin_amdgcn_prng_b32(seed);
+    uint32_t rng1 = __builtin_amdgcn_prng_b32(seed ^ 0x9E3779B9u);  // decorrelate 2nd pair
+
+    fp32x2_t pair0 = {v0, v1};
+    fp32x2_t pair1 = {v2, v3};
+
+    // dst_sel = 0 -> result byte 0 holds the packed fp4x2 (matches the RNE path).
+    uint32_t lo = __builtin_amdgcn_cvt_scalef32_sr_pk_fp4_f32(0u, pair0, rng0, scale, 0);
+    uint32_t hi = __builtin_amdgcn_cvt_scalef32_sr_pk_fp4_f32(0u, pair1, rng1, scale, 0);
+
+    uint32_t result = (lo & 0xFFu) | ((hi & 0xFFu) << 8);
+    return (uint16_t)(result & 0xFFFF);
+#else
+    return 0;  // Fallback for non-gfx950 architectures
+#endif
+}
+
 // ============================================================================
 // MEMORY LAYOUT - Index Computation for Shuffled Layouts
 // ============================================================================
@@ -416,6 +470,9 @@ __device__ __forceinline__ int compute_shuffled_fp4_index_2bytes(
  *   USE_HADAMARD:        Apply Hadamard transform before quantization
  *   SHUFFLE_ROWWISE_FP4: Enable shuffled layout for rowwise FP4 data
  *   SHUFFLE_COLWISE_FP4: Enable shuffled layout for columnwise FP4 data
+ *   USE_SR:              Use stochastic rounding (unbiased) instead of RNE
+ *                        for the FP32->FP4 convert. Both paths are compiled;
+ *                        the launcher selects at runtime (default RNE).
  * 
  * Grid Structure:
  *   - Grid: (cdiv(M, 128), cdiv(N, 64))
@@ -439,7 +496,8 @@ template<
     bool SHUFFLE_SCALES,
     bool USE_HADAMARD,
     bool SHUFFLE_ROWWISE_FP4,
-    bool SHUFFLE_COLWISE_FP4
+    bool SHUFFLE_COLWISE_FP4,
+    bool USE_SR
 >
 __global__ __launch_bounds__(256, 8)
 void cast_transpose_mxfp4_shuffled(
@@ -571,8 +629,15 @@ void cast_transpose_mxfp4_shuffled(
                     float native_scale;
                     uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale);
 
-                    // Convert to FP4 using hardware instruction
-                    uint16_t fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
+                    // Convert to FP4 using hardware instruction (RNE or SR).
+                    // Both paths compiled; USE_SR is a compile-time template
+                    // param dispatched at runtime by the launcher.
+                    uint16_t fp4x4;
+                    if constexpr (USE_SR) {
+                        fp4x4 = cvt_f32x4_to_fp4x4_sr(v0, v1, v2, v3, native_scale);
+                    } else {
+                        fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
+                    }
 
                     int global_col_base = tile_n + col_base;
                     if (global_col_base < N) {
@@ -642,8 +707,13 @@ void cast_transpose_mxfp4_shuffled(
                     float native_scale;
                     uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale);
 
-                    // Convert to FP4
-                    uint16_t fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
+                    // Convert to FP4 (RNE or SR; both compiled, runtime-selected).
+                    uint16_t fp4x4;
+                    if constexpr (USE_SR) {
+                        fp4x4 = cvt_f32x4_to_fp4x4_sr(v0, v1, v2, v3, native_scale);
+                    } else {
+                        fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
+                    }
 
                     int global_row_base = tile_m + row_base;
                     if (global_row_base < M) {
@@ -712,6 +782,7 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     bool use_hadamard,
     bool shuffle_rowwise_fp4,
     bool shuffle_colwise_fp4,
+    bool use_sr,
     int rowwise_scale_stride,
     int colwise_scale_stride,
     int rowwise_scale_N,
@@ -728,8 +799,8 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     dim3 block(256);
 
     // Macro for cleaner kernel launch syntax
-    #define LAUNCH_KERNEL(ROW, COL, SHUF_SC, HAD, SHUF_ROW, SHUF_COL) \
-        mxfp4::cast_transpose_mxfp4_shuffled<ROW, COL, SHUF_SC, HAD, SHUF_ROW, SHUF_COL> \
+    #define LAUNCH_KERNEL(ROW, COL, SHUF_SC, HAD, SHUF_ROW, SHUF_COL, SR) \
+        mxfp4::cast_transpose_mxfp4_shuffled<ROW, COL, SHUF_SC, HAD, SHUF_ROW, SHUF_COL, SR> \
             <<<grid, block, 0, stream>>>( \
                 (const uint16_t*)input, \
                 (uint8_t*)rowwise_fp4, (uint8_t*)rowwise_scale, \
@@ -740,34 +811,41 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
                 colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad)
 
     // Dispatch helper: innermost level selects rowwise/colwise/fp4-shuffle combos
-    #define DISPATCH_INNER(SHUF_SC, HAD) \
+    #define DISPATCH_INNER(SHUF_SC, HAD, SR) \
         if (shuffle_rowwise_fp4 && shuffle_colwise_fp4) { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, true, true); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, true, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, true); \
+            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, true, true, SR); \
+            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, true, false, SR); \
+            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, true, SR); \
         } else if (shuffle_rowwise_fp4) { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, true, false); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, true, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, false); \
+            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, true, false, SR); \
+            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, true, false, SR); \
+            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, false, SR); \
         } else if (shuffle_colwise_fp4) { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, false, true); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, false, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, true); \
+            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, false, true, SR); \
+            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, false, false, SR); \
+            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, true, SR); \
         } else { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, false, false); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, false, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, false); \
+            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, false, false, SR); \
+            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, false, false, SR); \
+            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, false, SR); \
         }
 
-    // Dispatch: shuffle_scales x use_hadamard -> DISPATCH_INNER
+    // Dispatch: use_sr (outer) x shuffle_scales x use_hadamard -> DISPATCH_INNER.
+    // Both RNE and SR template instantiations are compiled; the runtime
+    // use_sr flag picks the path (default false => byte-identical RNE).
+    #define DISPATCH_SR(SHUF_SC, HAD) \
+        if (use_sr) { DISPATCH_INNER(SHUF_SC, HAD, true); } \
+        else        { DISPATCH_INNER(SHUF_SC, HAD, false); }
+
     if (shuffle_scales) {
-        if (use_hadamard) { DISPATCH_INNER(true, true); }
-        else               { DISPATCH_INNER(true, false); }
+        if (use_hadamard) { DISPATCH_SR(true, true); }
+        else               { DISPATCH_SR(true, false); }
     } else {
-        if (use_hadamard) { DISPATCH_INNER(false, true); }
-        else               { DISPATCH_INNER(false, false); }
+        if (use_hadamard) { DISPATCH_SR(false, true); }
+        else               { DISPATCH_SR(false, false); }
     }
 
+    #undef DISPATCH_SR
     #undef DISPATCH_INNER
     #undef LAUNCH_KERNEL
 }
