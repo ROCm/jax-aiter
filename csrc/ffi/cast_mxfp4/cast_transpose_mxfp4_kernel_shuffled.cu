@@ -334,8 +334,13 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4(
     // Combine into 16-bit result (4 FP4 values)
     result |= (tmp << 8);
     return (uint16_t)(result & 0xFFFF);
+#elif defined(__HIP_DEVICE_COMPILE__)
+    // #9: fail loudly if MXFP4 device code is ever built for a non-gfx950 arch
+    // (replaces the silent `return 0`). Guarded by __HIP_DEVICE_COMPILE__ so the
+    // HIP host-compilation pass (where __gfx950__ is undefined) still compiles.
+    #error "MXFP4 hardware conversion requires gfx950"
 #else
-    return 0;  // Fallback for non-gfx950 architectures
+    return 0;  // host-pass trampoline (never executed; device path needs gfx950)
 #endif
 }
 
@@ -388,8 +393,13 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(
 
     uint32_t result = (lo & 0xFFu) | ((hi & 0xFFu) << 8);
     return (uint16_t)(result & 0xFFFF);
+#elif defined(__HIP_DEVICE_COMPILE__)
+    // #9: fail loudly if MXFP4 device code is ever built for a non-gfx950 arch
+    // (replaces the silent `return 0`). Guarded by __HIP_DEVICE_COMPILE__ so the
+    // HIP host-compilation pass (where __gfx950__ is undefined) still compiles.
+    #error "MXFP4 hardware conversion requires gfx950"
 #else
-    return 0;  // Fallback for non-gfx950 architectures
+    return 0;  // host-pass trampoline (never executed; device path needs gfx950)
 #endif
 }
 

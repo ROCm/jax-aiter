@@ -69,6 +69,15 @@ ffi::Error CastMxfp4_Bridge(
 
   constexpr int BLOCK_SIZE = 32;
 
+  // #8: host-side shape/alignment guard (once per launch, no per-thread cost).
+  // The MXFP4 32-block layout requires both dims to be multiples of 32, and the
+  // vectorized bf16 loads require 8-byte input alignment. Fail before launch.
+  if (M % BLOCK_SIZE || K % BLOCK_SIZE ||
+      (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8)) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
+  }
+
   int scale_N = cdiv(K, BLOCK_SIZE);
   int scale_M_pad = cdiv(M, 256) * 256;
   int scale_N_pad = cdiv(scale_N, 8) * 8;
@@ -116,6 +125,15 @@ ffi::Error CastMxfp4Dual_Bridge(
   int K = static_cast<int>(dims[1]);
 
   constexpr int BLOCK_SIZE = 32;
+
+  // #8: host-side shape/alignment guard (once per launch, no per-thread cost).
+  // The MXFP4 32-block layout requires both dims to be multiples of 32, and the
+  // vectorized bf16 loads require 8-byte input alignment. Fail before launch.
+  if (M % BLOCK_SIZE || K % BLOCK_SIZE ||
+      (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8)) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
+  }
 
   int rowwise_scale_N = cdiv(K, BLOCK_SIZE);
   int rowwise_scale_M_pad = cdiv(M, 256) * 256;
