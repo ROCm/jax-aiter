@@ -90,6 +90,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp  # noqa: F401  # imported for downstream consumers
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -180,6 +181,39 @@ _HIGHP_DGRAD = "dgrad" in _HIGHP_PASSES
 # ---------------------------------------------------------------------------
 _DGRAD_PREC = os.environ.get("JA_FP4_DGRAD_PREC", "").strip().lower()
 _FP8_DGRAD = _DGRAD_PREC == "fp8"
+
+
+# ---------------------------------------------------------------------------
+# Remat residual-save tagging (advanced, opt-in via JA_FP4_REMAT_SAVE_COL).
+# Under MaxText layer-level remat (jax.checkpoint) the columnwise FP4 dual-cast
+# residuals that the custom_vjp fwd declares are RECOMPUTED in the backward
+# unless the remat policy is told to SAVE them. This flag tags those residual
+# outputs with jax.ad_checkpoint.checkpoint_name so a matching MaxText
+# save_only_these_names policy (e.g. remat_policy=minimal_flash_save_fp4col)
+# keeps them as residuals instead of re-firing CastMxfp4DualJA in backward.
+#
+# This is a graph-scheduling lever ONLY: checkpoint_name is an identity at
+# lowering (name_p -> x), so the saved FP4 residual is bit-identical to the
+# recomputed one and numerics are unchanged. The names below MUST match the
+# MaxText policy. Default unset => no name_p added => byte-identical graph to
+# the recompute path (and a no-op for any non-matching remat policy).
+#   unset / "0" / "none"  : tag nothing (default)
+#   "wt"                  : tag the weight-columnwise residual only
+#                           (~6 ms/step floor at 8B, lowest OOM risk)
+#   "act"                 : tag the activation-columnwise residual only
+#                           (~33 ms/step at 8B, the larger chunk)
+#   "both" / "1" / "all"  : tag both columnwise residuals
+# Read at import (parity with _HADAMARD_ALL / _HIGHP_*); the fwd looks the
+# module globals up at trace time so tests can monkeypatch them.
+# ---------------------------------------------------------------------------
+_REMAT_SAVE_COL = os.environ.get("JA_FP4_REMAT_SAVE_COL", "").strip().lower()
+_REMAT_SAVE_WT_COL = _REMAT_SAVE_COL in ("wt", "both", "all", "1")
+_REMAT_SAVE_ACT_COL = _REMAT_SAVE_COL in ("act", "both", "all", "1")
+
+# checkpoint_name tags for the columnwise FP4 residuals. MUST match the
+# MaxText remat save policy (decoders.py get_remat_policy).
+_MXFP4_ACT_COL_NAME = "mxfp4_act_col"
+_MXFP4_WT_COL_NAME = "mxfp4_wt_col"
 
 
 # ---------------------------------------------------------------------------
@@ -842,6 +876,18 @@ def _gemm_fp4_bf16_fwd(a, b):
     a_row, a_row_s, col_a_fp4, col_a_scale = _cast_act_dual(a)
     b_row, b_row_s, col_b_fp4, col_b_scale = _cast_wt_dual(b)
     out = _fp4_ffi_partitioned(a_row, b_row, a_row_s, b_row_s)
+    # Optionally tag the columnwise FP4 residuals so a MaxText remat policy can
+    # SAVE them instead of recomputing the dual-cast in backward (graph-
+    # scheduling only; checkpoint_name is identity => byte-identical numerics).
+    # BOTH the packed FP4 and its E8M0 scale must be tagged, else the cast
+    # kernel still re-fires to recompute the untagged half. Default off
+    # (_REMAT_SAVE_* both False) => no name_p added => unchanged graph.
+    if _REMAT_SAVE_ACT_COL:
+        col_a_fp4 = checkpoint_name(col_a_fp4, _MXFP4_ACT_COL_NAME)
+        col_a_scale = checkpoint_name(col_a_scale, _MXFP4_ACT_COL_NAME)
+    if _REMAT_SAVE_WT_COL:
+        col_b_fp4 = checkpoint_name(col_b_fp4, _MXFP4_WT_COL_NAME)
+        col_b_scale = checkpoint_name(col_b_scale, _MXFP4_WT_COL_NAME)
     residual = (col_a_fp4, col_a_scale, col_b_fp4, col_b_scale)
     if _HIGHP_WGRAD:
         residual = residual + (a,)  # RAW bf16 activation for the bf16 wgrad dB.
