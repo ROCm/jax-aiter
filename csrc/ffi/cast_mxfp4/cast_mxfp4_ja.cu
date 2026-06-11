@@ -42,6 +42,7 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int colwise_scale_N,
     int colwise_scale_M_pad,
     int colwise_scale_N_pad,
+    int scale_margin,
     hipStream_t stream
 );
 }
@@ -60,6 +61,7 @@ ffi::Error CastMxfp4_Bridge(
     bool shuffle_scales,
     bool use_hadamard,
     bool use_sr,
+    int scale_margin,
     ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> rowwise_scale_out
 ) {
@@ -98,6 +100,7 @@ ffi::Error CastMxfp4_Bridge(
       0,                         // colwise stride (unused)
       scale_N, scale_M_pad, scale_N_pad,
       0, 0, 0, 0,               // colwise params (unused)
+      scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
       stream);
 
   return ffi::Error::Success();
@@ -115,6 +118,7 @@ ffi::Error CastMxfp4Dual_Bridge(
     bool shuffle_colwise_fp4,
     bool use_hadamard,
     bool use_sr,
+    int scale_margin,
     ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> rowwise_scale_out,
     ffi::Result<ffi::AnyBuffer> colwise_fp4_out,
@@ -170,6 +174,7 @@ ffi::Error CastMxfp4Dual_Bridge(
       colwise_scale_N,
       colwise_scale_M_pad,
       colwise_scale_N_pad,
+      scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
       stream
   );
 
@@ -189,6 +194,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<bool>("shuffle_scales") // shuffle E8M0 scale layout
         .Attr<bool>("use_hadamard")   // apply Hadamard transform
         .Attr<bool>("use_sr")         // stochastic rounding (default false = RNE)
+        .Attr<int>("scale_margin")    // E8M0 under-flush headroom (default 0 = legacy exp-2)
         .Ret<ffi::AnyBuffer>()        // rowwise_fp4: [M, K/2] uint8
         .Ret<ffi::AnyBuffer>(),       // rowwise_scale: [M_pad, scale_N_pad] uint8
     {xla::ffi::Traits::kCmdBufferCompatible});
@@ -202,6 +208,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<bool>("shuffle_colwise_fp4")  // shuffle colwise FP4 data
         .Attr<bool>("use_hadamard")   // apply Hadamard transform
         .Attr<bool>("use_sr")         // stochastic rounding (default false = RNE)
+        .Attr<int>("scale_margin")    // E8M0 under-flush headroom (default 0 = legacy exp-2)
         .Ret<ffi::AnyBuffer>()        // rowwise_fp4:  [M, K/2] uint8
         .Ret<ffi::AnyBuffer>()        // rowwise_scale: [M_pad, rscale_N_pad] uint8
         .Ret<ffi::AnyBuffer>()        // colwise_fp4:  [K, M/2] uint8

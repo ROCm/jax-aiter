@@ -63,6 +63,29 @@ Env vars (advanced)
     The forward and wgrad stay FP4. N (contraction) is replicated under FSDP =>
     NO collective. **Unset (default) => byte-identical all-FP4 dgrad.**
     Reversible debug knob.
+``JA_FP4_SCALE_MARGIN=<int>``
+    E8M0 under-flush headroom for the DGRAD (gradient) cast (B2). The fused cast
+    kernel computes the per-32-block scale as ``2^(exp - 2 - scale_margin)``;
+    a positive margin SHRINKS the block scale so small gradient entries that
+    would flush to FP4 code +/-0 instead survive as ``+/-0.5*scale`` -- directly
+    targeting the §9 dgrad grad-operand under-flush (recovering the dgrad-bf16
+    accuracy win at full FP4 speed, no bf16/fp8 backward GEMM) at the cost of
+    clipping the few largest entries. Applied to the grad cast ONLY (fprop /
+    weight casts stay at margin 0). The resolved value is printed once at import.
+    **Unset / 0 (default) => byte-identical to the legacy ``exp-2`` cast.**
+    Reversible debug knob.
+``JA_FP4_SR_PASSES=<comma-list of {dgrad_grad,act,wt}>``
+    Per-ROLE stochastic rounding (B1). SR makes the FP32->FP4 cast UNBIASED
+    (``E[SR(x)] == x``) so small entries probabilistically round up instead of
+    flushing to FP4 code 0 -- NVIDIA's actual DGRAD under-flush mitigation
+    ("quantize WITH SR" on the dgrad gradient input). ``dgrad_grad`` scopes SR to
+    the grad cast (both backward grad operands); ``act`` / ``wt`` scope the
+    activation / weight casts. Reuses the per-call ``use_sr`` kernel attr
+    (FRONTEND-only, no kernel rebuild). Unlike a positive ``scale_margin`` it does
+    NOT shrink the block scale, so it fixes under-flush WITHOUT clipping the large
+    grad entries, and can STACK with ``JA_FP4_SCALE_MARGIN``. Differs from the
+    global ``AITER_FP4_SR=1`` (SR on every cast).
+    **Unset (default) => RNE everywhere (byte-identical).** Reversible.
 ``JA_CAPTURE_DIR=<dir>``
     Offline-probe capture hook (debug / analysis only). When set, the
     forward dumps the bf16 ``(a, b)`` operands and the backward dumps the
@@ -143,6 +166,37 @@ _SR_ALL = os.environ.get("AITER_FP4_SR", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
+# Per-ROLE stochastic rounding (B1, advanced, opt-in via JA_FP4_SR_PASSES).
+# Comma-list of {dgrad_grad, act, wt} selecting WHICH cast roles use SR, vs the
+# global AITER_FP4_SR (_SR_ALL) which forces SR on every cast. This is NVIDIA's
+# actual DGRAD under-flush mitigation: SR on the gradient cast makes the cast
+# UNBIASED (E[SR(x)] == x), so small grad entries probabilistically round UP to
+# +/-0.5 instead of deterministically flushing to FP4 code 0 -- the under-flush
+# is averaged out across steps WITHOUT shrinking the block scale (so, unlike a
+# positive scale-margin, it does NOT clip the large grad entries). NVIDIA's
+# nvfp4 recipe applies "quantize WITH SR" to the dgrad gradient input.
+#   * dgrad_grad (aliases: grad, dgrad) -> SR on the grad cast (_cast_grad_dual):
+#     its rowwise output is the dgrad A-operand (grad_out) and colwise is the
+#     wgrad grad-operand -- i.e. SR on BOTH backward grad operands, one launch.
+#   * act (aliases: fprop, fprop_act) -> SR on the activation casts.
+#   * wt  (alias: weight)            -> SR on the weight casts.
+# Reuses the per-call use_sr kernel attr (cast kernel compiles both RNE + SR
+# paths; runtime-selected) => FRONTEND-ONLY, NO kernel rebuild. Read at import
+# (parity with _SR_ALL); helpers look the globals up at trace time. Default
+# empty + AITER_FP4_SR unset => every role RNE (byte-identical). Reversible.
+# ---------------------------------------------------------------------------
+def _parse_sr_passes():
+    raw = os.environ.get("JA_FP4_SR_PASSES", "")
+    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+_SR_PASSES = _parse_sr_passes()
+_SR_GRAD = _SR_ALL or bool(_SR_PASSES & {"dgrad_grad", "grad", "dgrad"})
+_SR_ACT = _SR_ALL or bool(_SR_PASSES & {"act", "fprop", "fprop_act"})
+_SR_WT = _SR_ALL or bool(_SR_PASSES & {"wt", "weight"})
+
+
+# ---------------------------------------------------------------------------
 # Per-pass high-precision (bf16) fallback (advanced, opt-in via
 # JA_FP4_HIGHP_PASSES). Comma-list of {fprop,dgrad,wgrad}; each listed pass
 # runs its GEMM in bf16 instead of FP4. Default empty => every pass stays FP4
@@ -181,6 +235,47 @@ _HIGHP_DGRAD = "dgrad" in _HIGHP_PASSES
 # ---------------------------------------------------------------------------
 _DGRAD_PREC = os.environ.get("JA_FP4_DGRAD_PREC", "").strip().lower()
 _FP8_DGRAD = _DGRAD_PREC == "fp8"
+
+
+# ---------------------------------------------------------------------------
+# E8M0 scale-margin for the DGRAD (gradient) cast (B2, advanced, opt-in via
+# JA_FP4_SCALE_MARGIN=<int>). The fused cast kernel computes the per-32-block
+# E8M0 scale as 2^(exp - 2 - scale_margin). The hardcoded "-2" is the legacy
+# headroom below the FP4 max; scale_margin adds EXTRA headroom:
+#   * scale_margin > 0  -> SMALLER block scale -> small gradient entries that
+#     would flush to FP4 code +/-0 instead survive as +/-0.5*scale. Directly
+#     targets the §9 dgrad under-flush (grad-operand block-scale median ~2^-20,
+#     ~14.5% of grad entries flushed to 0) at the cost of clipping the few
+#     largest entries (a little more saturation). Recovers the dgrad-bf16
+#     accuracy win at full FP4 speed (no bf16/fp8 backward GEMM).
+#   * scale_margin < 0  -> larger block scale (more under-flush, less clip).
+#   * scale_margin == 0 -> byte-identical to the legacy exp-2 cast (DEFAULT).
+# Applied to the GRAD cast ONLY (_cast_grad_dual): its rowwise output is the
+# dgrad A-operand (dA = grad_out @ b) -- the §9 culprit -- and its colwise
+# output is the wgrad grad-operand (same gradient tensor). fprop activation +
+# weight casts stay at margin 0. Read at import (parity with _HADAMARD_ALL /
+# _SR_ALL); the grad cast helper looks the module global up at trace time so
+# tests can monkeypatch it. Reversible debug knob.
+# ---------------------------------------------------------------------------
+def _parse_scale_margin():
+    raw = os.environ.get("JA_FP4_SCALE_MARGIN", "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+_SCALE_MARGIN = _parse_scale_margin()
+
+# Policy log: emit the resolved DGRAD-cast scale margin once at import so each
+# training leg's log records exactly which margin its grad cast used.
+print("[ja-fp4] DGRAD cast scale_margin = %d "
+      "(E8M0 scale 2^(exp-2-margin); 0 = legacy/bit-identical) | "
+      "SR roles: grad=%s act=%s wt=%s"
+      % (_SCALE_MARGIN, _SR_GRAD, _SR_ACT, _SR_WT),
+      flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +348,7 @@ def _cast_act_raw(x):
     Used by the forward-only primal path (no autograd).
     """
     return _cast_mxfp4_op(x, shuffle_fp4=False, use_hadamard=_HADAMARD_ALL,
-                          use_sr=_SR_ALL)
+                          use_sr=_SR_ACT)
 
 
 def _cast_wt_raw(x):
@@ -262,7 +357,7 @@ def _cast_wt_raw(x):
     Used by the forward-only primal path (no autograd).
     """
     return _cast_mxfp4_op(x, shuffle_fp4=True, use_hadamard=_HADAMARD_ALL,
-                          use_sr=_SR_ALL)
+                          use_sr=_SR_WT)
 
 
 def _cast_act_dual_raw(x):
@@ -276,7 +371,7 @@ def _cast_act_dual_raw(x):
         shuffle_fp4=False,
         shuffle_colwise_fp4=True,
         use_hadamard=_HADAMARD_ALL,
-        use_sr=_SR_ALL,
+        use_sr=_SR_ACT,
     )
 
 
@@ -291,7 +386,7 @@ def _cast_wt_dual_raw(x):
         shuffle_fp4=True,
         shuffle_colwise_fp4=True,
         use_hadamard=_HADAMARD_ALL,
-        use_sr=_SR_ALL,
+        use_sr=_SR_WT,
     )
 
 
@@ -312,7 +407,8 @@ def _cast_grad_dual_raw(x):
         shuffle_fp4=False,
         shuffle_colwise_fp4=False,
         use_hadamard=not _HADAMARD_NONE,
-        use_sr=_SR_ALL,
+        use_sr=_SR_GRAD,
+        scale_margin=_SCALE_MARGIN,
     )
 
 

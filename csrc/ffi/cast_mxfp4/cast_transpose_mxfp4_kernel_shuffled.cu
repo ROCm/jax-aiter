@@ -269,15 +269,26 @@ __device__ __forceinline__ void hadamard16_inplace(
  * 
  * Algorithm:
  *   1. Round amax to nearest power of 2 (for robustness)
- *   2. Extract FP32 exponent and compute scale_unbiased = exp - 2
- *      (the -2 provides headroom for FP4 range)
+ *   2. Extract FP32 exponent and compute scale_unbiased = exp - 2 - scale_margin
+ *      (the -2 provides the legacy headroom for the FP4 range)
  *   3. Clamp scale_unbiased to [-127, 127]
  *   4. Return biased scale (scale_unbiased + 127) for E8M0 storage
  *   5. Build native_scale = 2^scale_unbiased for quantization
+ *
+ * scale_margin (B2, JA_FP4_SCALE_MARGIN) -- per-call E8M0 under-flush lever:
+ *   The block scale is the divisor applied before the FP32->FP4 convert, so a
+ *   value flushes to FP4 code +/-0 when |x| < 0.25 * native_scale. scale_margin
+ *   adds EXTRA headroom by shrinking native_scale (each +1 halves it):
+ *     * scale_margin > 0 -> SMALLER scale -> small entries that would flush to 0
+ *       instead survive as +/-0.5*scale (fixes §9 dgrad grad-operand under-flush)
+ *       at the cost of clipping the few largest entries (more saturation).
+ *     * scale_margin < 0 -> larger scale (more under-flush, less saturation).
+ *     * scale_margin == 0 -> EXACTLY the legacy exp-2 path (bit-identical).
  */
 __device__ __forceinline__ uint8_t compute_e8m0_scale(
     float amax,
-    float& native_scale
+    float& native_scale,
+    int scale_margin
 ) {
     if (amax == 0.0f) {
         native_scale = 1.0f;
@@ -290,7 +301,9 @@ __device__ __forceinline__ uint8_t compute_e8m0_scale(
 
     // Extract and adjust exponent
     int exp = ((amax_bits >> 23) & 0xFF) - 127;  // Unbias FP32 exponent
-    int scale_unbiased = exp - 2;                 // Reserve 2 bits headroom
+    // Reserve 2 bits headroom (legacy); scale_margin adds EXTRA headroom so
+    // small entries survive the FP4 cast. scale_margin == 0 => legacy exp-2.
+    int scale_unbiased = exp - 2 - scale_margin;
     scale_unbiased = max(-127, min(127, scale_unbiased));
 
     // Build native scale as FP32: 2^scale_unbiased
@@ -526,7 +539,8 @@ void cast_transpose_mxfp4_shuffled(
     const int colwise_scale_M,
     const int colwise_scale_N,
     const int colwise_scale_M_pad,
-    const int colwise_scale_N_pad
+    const int colwise_scale_N_pad,
+    const int scale_margin
 ) {
     // ========================================================================
     // Thread and Block Identification
@@ -637,7 +651,7 @@ void cast_transpose_mxfp4_shuffled(
 
                     // Compute E8M0 scale factor
                     float native_scale;
-                    uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale);
+                    uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale, scale_margin);
 
                     // Convert to FP4 using hardware instruction (RNE or SR).
                     // Both paths compiled; USE_SR is a compile-time template
@@ -715,7 +729,7 @@ void cast_transpose_mxfp4_shuffled(
 
                     // Compute E8M0 scale factor
                     float native_scale;
-                    uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale);
+                    uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale, scale_margin);
 
                     // Convert to FP4 (RNE or SR; both compiled, runtime-selected).
                     uint16_t fp4x4;
@@ -802,6 +816,7 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int colwise_scale_N,
     int colwise_scale_M_pad,
     int colwise_scale_N_pad,
+    int scale_margin,
     hipStream_t stream
 ) {
     // Grid configuration: tiles of 128x64
@@ -818,7 +833,8 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
                 M, N, \
                 rowwise_scale_stride, colwise_scale_stride, \
                 rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, \
-                colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad)
+                colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad, \
+                scale_margin)
 
     // Dispatch helper: innermost level selects rowwise/colwise/fp4-shuffle combos
     #define DISPATCH_INNER(SHUF_SC, HAD, SR) \
