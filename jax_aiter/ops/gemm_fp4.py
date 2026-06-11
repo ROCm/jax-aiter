@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ..ffi.registry import register_ffi_target
 
@@ -51,7 +52,7 @@ def gemm_fp4(a_packed, b_packed, a_scale, b_scale):
 
 
 def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
-               use_sr=False):
+               use_sr=False, scale_margin=0):
     """Fused BF16 -> MXFP4 quantization + shuffle via HIP kernel (single FFI call).
 
     Args:
@@ -62,6 +63,11 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
         use_hadamard: Apply Hadamard transform before quantization.
         use_sr: Use stochastic rounding (unbiased) instead of RNE for the
             FP32->FP4 convert. Default False => byte-identical RNE path.
+        scale_margin: Extra E8M0 headroom (int). The per-32-block scale is
+            ``2^(exp - 2 - scale_margin)``; ``>0`` shrinks the scale so small
+            entries survive the FP4 cast (fixes under-flush) at the cost of
+            clipping the largest entries. Default ``0`` => byte-identical to the
+            legacy ``exp-2`` cast.
 
     Returns:
         (fp4_packed, scales):
@@ -85,11 +91,12 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
     )
     return call(x, shuffle_fp4=shuffle_fp4,
                 shuffle_scales=shuffle_scales, use_hadamard=use_hadamard,
-                use_sr=use_sr)
+                use_sr=use_sr, scale_margin=np.int32(scale_margin))
 
 
 def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
-                     shuffle_scales=True, use_hadamard=False, use_sr=False):
+                     shuffle_scales=True, use_hadamard=False, use_sr=False,
+                     scale_margin=0):
     """Fused BF16 -> MXFP4 with BOTH rowwise and columnwise output in one kernel launch.
 
     Returns rowwise (for forward GEMM) + columnwise (for dA/dB backward GEMM).
@@ -105,6 +112,10 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
         use_hadamard: Apply Hadamard transform before quantization.
         use_sr: Use stochastic rounding (unbiased) instead of RNE for the
             FP32->FP4 convert. Default False => byte-identical RNE path.
+        scale_margin: Extra E8M0 headroom (int). The per-32-block scale is
+            ``2^(exp - 2 - scale_margin)``; ``>0`` shrinks the scale so small
+            entries survive the FP4 cast (fixes under-flush). Default ``0`` =>
+            byte-identical to the legacy ``exp-2`` cast.
 
     Returns:
         (row_fp4, row_scale, col_fp4, col_scale):
@@ -137,4 +148,5 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
     )
     return call(x, shuffle_fp4=shuffle_fp4,
                 shuffle_colwise_fp4=shuffle_colwise_fp4,
-                use_hadamard=use_hadamard, use_sr=use_sr)
+                use_hadamard=use_hadamard, use_sr=use_sr,
+                scale_margin=np.int32(scale_margin))
