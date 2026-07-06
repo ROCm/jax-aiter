@@ -29,10 +29,12 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     bool use_rowwise,
     bool use_colwise,
     bool shuffle_scales,
-    bool use_hadamard,
+    bool use_hadamard_row,
+    bool use_hadamard_col,
     bool shuffle_rowwise_fp4,
     bool shuffle_colwise_fp4,
-    bool use_sr,
+    bool use_sr_row,
+    bool use_sr_col,
     int rowwise_scale_stride,
     int colwise_scale_stride,
     int rowwise_scale_N,
@@ -43,6 +45,8 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int colwise_scale_M_pad,
     int colwise_scale_N_pad,
     int scale_margin,
+    int scale_mode,
+    bool use_2d_scale,
     hipStream_t stream
 );
 }
@@ -62,6 +66,8 @@ ffi::Error CastMxfp4_Bridge(
     bool use_hadamard,
     bool use_sr,
     int scale_margin,
+    int scale_mode,
+    bool use_2d_scale,
     ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> rowwise_scale_out
 ) {
@@ -92,15 +98,19 @@ ffi::Error CastMxfp4_Bridge(
       M, K,
       true, false,               // rowwise only
       shuffle_scales,
-      use_hadamard,
+      use_hadamard,              // rowwise Hadamard
+      false,                     // colwise Hadamard (unused; colwise off)
       shuffle_fp4,
       false,                     // no colwise shuffle
-      use_sr,                    // stochastic rounding (default false = RNE)
+      use_sr,                    // rowwise SR (default false = RNE)
+      false,                     // colwise SR (unused; colwise off)
       scale_N_pad,
       0,                         // colwise stride (unused)
       scale_N, scale_M_pad, scale_N_pad,
       0, 0, 0, 0,               // colwise params (unused)
       scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
+      scale_mode,                // 0 = round-nearest (legacy); 1 = OAS floor
+      use_2d_scale,              // ignored for rowwise-only (no colwise to share)
       stream);
 
   return ffi::Error::Success();
@@ -116,9 +126,13 @@ ffi::Error CastMxfp4Dual_Bridge(
     ffi::AnyBuffer input,
     bool shuffle_fp4,
     bool shuffle_colwise_fp4,
-    bool use_hadamard,
-    bool use_sr,
+    bool use_hadamard,        // rowwise-direction Hadamard
+    bool use_hadamard_col,    // colwise-direction Hadamard (independent)
+    bool use_sr,              // rowwise-direction SR
+    bool use_sr_col,          // colwise-direction SR (independent)
     int scale_margin,
+    int scale_mode,
+    bool use_2d_scale,
     ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> rowwise_scale_out,
     ffi::Result<ffi::AnyBuffer> colwise_fp4_out,
@@ -137,6 +151,24 @@ ffi::Error CastMxfp4Dual_Bridge(
       (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8)) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
         "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
+  }
+
+  // use_2d_scale shares ONE 32x32-tile E8M0 scale across the rowwise + colwise
+  // casts so both emit identical FP4 codes (W_fprop == W_dgrad). That guarantee
+  // holds ONLY under deterministic RNE on the raw values, so it is mutually
+  // exclusive with Hadamard and SR:
+  //   * Hadamard (#2): the 2D tile-amax is reduced from the RAW pre-Hadamard
+  //     values, but the quantized values are post-Hadamard. Hadamard preserves
+  //     L2 but not L-inf, so the shared scale mis-normalizes; and row/col
+  //     Hadamard are independent, so a shared scale cannot yield matching codes.
+  //   * SR (#3): stochastic rounding draws independent per-direction dither, so
+  //     rowwise and colwise diverge even with an identical scale and values.
+  // Reject the combos rather than silently emit a wrong / asymmetric cast.
+  if (use_2d_scale &&
+      (use_hadamard || use_hadamard_col || use_sr || use_sr_col)) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: use_2d_scale is incompatible with Hadamard or SR "
+        "(2D tile-amax is pre-Hadamard; SR breaks rowwise==colwise codes)");
   }
 
   int rowwise_scale_N = cdiv(K, BLOCK_SIZE);
@@ -161,10 +193,12 @@ ffi::Error CastMxfp4Dual_Bridge(
       true,              // use_rowwise
       true,              // use_colwise
       true,              // shuffle_scales
-      use_hadamard,
+      use_hadamard,          // rowwise Hadamard
+      use_hadamard_col,      // colwise Hadamard (independent of row)
       shuffle_fp4,           // shuffle_rowwise_fp4
       shuffle_colwise_fp4,   // shuffle_colwise_fp4
-      use_sr,                // stochastic rounding (default false = RNE)
+      use_sr,                // rowwise SR (default false = RNE)
+      use_sr_col,            // colwise SR (independent of row)
       rowwise_scale_stride,
       colwise_scale_stride,
       rowwise_scale_N,
@@ -175,6 +209,8 @@ ffi::Error CastMxfp4Dual_Bridge(
       colwise_scale_M_pad,
       colwise_scale_N_pad,
       scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
+      scale_mode,                // 0 = round-nearest (legacy); 1 = OAS floor
+      use_2d_scale,              // share one 32x32-tile scale across row+col
       stream
   );
 
@@ -195,6 +231,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<bool>("use_hadamard")   // apply Hadamard transform
         .Attr<bool>("use_sr")         // stochastic rounding (default false = RNE)
         .Attr<int>("scale_margin")    // E8M0 under-flush headroom (default 0 = legacy exp-2)
+        .Attr<int>("scale_mode")      // 0 = round-nearest (legacy); 1 = OAS floor
+        .Attr<bool>("use_2d_scale")   // share one 32x32-tile scale (no-op rowwise-only)
         .Ret<ffi::AnyBuffer>()        // rowwise_fp4: [M, K/2] uint8
         .Ret<ffi::AnyBuffer>(),       // rowwise_scale: [M_pad, scale_N_pad] uint8
     {xla::ffi::Traits::kCmdBufferCompatible});
@@ -206,9 +244,13 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()        // input: [M, K] bf16
         .Attr<bool>("shuffle_fp4")    // shuffle rowwise FP4 data
         .Attr<bool>("shuffle_colwise_fp4")  // shuffle colwise FP4 data
-        .Attr<bool>("use_hadamard")   // apply Hadamard transform
-        .Attr<bool>("use_sr")         // stochastic rounding (default false = RNE)
+        .Attr<bool>("use_hadamard")   // rowwise Hadamard
+        .Attr<bool>("use_hadamard_col")  // colwise Hadamard (independent of row)
+        .Attr<bool>("use_sr")         // rowwise SR (default false = RNE)
+        .Attr<bool>("use_sr_col")     // colwise SR (independent of row)
         .Attr<int>("scale_margin")    // E8M0 under-flush headroom (default 0 = legacy exp-2)
+        .Attr<int>("scale_mode")      // 0 = round-nearest (legacy); 1 = OAS floor
+        .Attr<bool>("use_2d_scale")   // share one 32x32-tile scale across row+col
         .Ret<ffi::AnyBuffer>()        // rowwise_fp4:  [M, K/2] uint8
         .Ret<ffi::AnyBuffer>()        // rowwise_scale: [M_pad, rscale_N_pad] uint8
         .Ret<ffi::AnyBuffer>()        // colwise_fp4:  [K, M/2] uint8

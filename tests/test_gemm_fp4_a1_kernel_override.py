@@ -1,51 +1,69 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Phase 3 A1: verify the FP4 GEMM FFI honors ``AITER_FORCE_KERNEL_NAME``.
+"""Verify the FP4 GEMM FFI selection: env plumbing + REAL rocprof dispatch.
 
-Background
-----------
-Phase B.0 sweep (``docs/runs/70b/maxtext/20260516_phaseB_A1_xval_097/results.md``)
-found that ``BpreShuffle_256x256`` with ``splitK=1`` is the universal-best
-FP4 GEMM variant across the 4 70B target shapes (top-2 at every shape,
-#1 at both wgrad shapes). The chosen Plan-3-A1 mitigation is **Pathway X**:
-expose an environment-variable hint that bypasses the default heuristic
-and pins a single kernel name for the whole run. The FFI handler at
-``csrc/ffi/gemm_fp4/gemm_fp4_ja.cu`` reads
-``AITER_FORCE_KERNEL_NAME`` (and optional ``AITER_FORCE_LOG2_K_SPLIT``)
-before each ``GemmFp4FwdJA`` invocation; when unset, the heuristic
-path is preserved unchanged (reversibility guarantee).
+Selection priority in csrc/ffi/gemm_fp4/gemm_fp4_ja.cu:
+  AITER_FP4_DISPATCH (per-shape oracle table, 20260615 study)
+    > AITER_FP4_KVWGRAD_128x512 (legacy band-aid)
+    > AITER_FORCE_KERNEL_NAME (blanket pin)
+    > select_fp4_kernel (occupancy heuristic).
 
-Scope of this test file
------------------------
-* Smoke-check the env-var plumbing (Python-side reachability + numerical
-  correctness when the override is set vs unset).
-* The *kernel-name dispatch* assertion (i.e. that the GPU actually ran
-  ``BpreShuffle_256x256``) requires rocprofv3 trace introspection on a
-  GPU host. That verification is performed by Phase B.2 (Task 7) of
-  Plan 3 (see
-  ``docs/superpowers/plans/2026-05-16-70b-fp4-fp8-gap-audit-phase3-ship.md``);
-  the corresponding tests here are marked ``pytest.skip`` so they document
-  intent without running on CPU-only CI.
+The 20260615 kernel-selection study
+(mxfp4_analysis/runs/20260615_8b_fp4_kernselect_097) showed the blanket
+256x256 FORCE pin is 3-9% slower than the per-shape oracle on the 8B
+attention shapes (and the occupancy heuristic is *worse* than forced on
+kv-wgrad). The validated winner is the per-shape dispatch table, gated by
+AITER_FP4_DISPATCH (default OFF => production byte-identical / reversible).
+
+Kernel choice is numerically NEUTRAL (fp32-accumulate; the study's
+parsed/neutrality.json shows splitK=1 tile variants are byte-identical and
+splitK>1 within 1 bf16 ULP), so dispatch changes wall-time only, never loss.
+
+This file:
+  * smoke-checks the env plumbing for both selectors (CPU-only safe);
+  * asserts the per-shape oracle dispatch table's expected (tile, splitK)
+    entries match the study (CPU-only, parses the handler source);
+  * runs a REAL rocprofv3 kernel-trace dispatch assertion when a GPU +
+    rocprofv3 are present (skips gracefully otherwise), replacing the old
+    pytest.skip-only placeholder.
 """
-
 from __future__ import annotations
 
 import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-EXPECTED_KERNEL = (
-    "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
-)
+EXPECTED_KERNEL = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
+DISPATCH_128x512 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
+
+REPO = Path("/ruvaidya/aiter_proj")
+HANDLER = REPO / "jax-aiter/csrc/ffi/gemm_fp4/gemm_fp4_ja.cu"
+VERIFY = REPO / "jax-aiter/scripts/verify_fp4_dispatch_rocprof.py"
+
+# Per-shape oracle expected by the 20260615 study (M,N,K) -> (tile, splitK).
+ORACLE_TABLE = {
+    (32768, 4096, 4096): ("128x512", 1),
+    (32768, 1024, 4096): ("128x512", 1),
+    (32768, 4096, 1024): ("128x512", 1),
+    (32768, 14336, 4096): ("128x512", 1),
+    (32768, 4096, 14336): ("128x512", 1),
+    (4096, 4096, 32768): ("128x512", 1),
+    (1024, 4096, 32768): ("128x512", 4),
+    (14336, 4096, 32768): ("256x256", 1),
+    (4096, 14336, 32768): ("256x256", 1),
+}
 
 
+# --------------------------------------------------------------------------
+# Env-plumbing (CPU-only safe).
+# --------------------------------------------------------------------------
 @pytest.fixture
 def force_kernel():
-    """Set ``AITER_FORCE_KERNEL_NAME``; restore on teardown.
-
-    Also pins ``AITER_FORCE_LOG2_K_SPLIT=0`` (splitK=1) which matches the
-    universal-best entry from the Phase B.0 sweep.
-    """
     prev_name = os.environ.get("AITER_FORCE_KERNEL_NAME")
     prev_split = os.environ.get("AITER_FORCE_LOG2_K_SPLIT")
     os.environ["AITER_FORCE_KERNEL_NAME"] = EXPECTED_KERNEL
@@ -53,75 +71,102 @@ def force_kernel():
     try:
         yield
     finally:
-        if prev_name is None:
-            os.environ.pop("AITER_FORCE_KERNEL_NAME", None)
-        else:
-            os.environ["AITER_FORCE_KERNEL_NAME"] = prev_name
-        if prev_split is None:
-            os.environ.pop("AITER_FORCE_LOG2_K_SPLIT", None)
-        else:
-            os.environ["AITER_FORCE_LOG2_K_SPLIT"] = prev_split
+        for k, v in (("AITER_FORCE_KERNEL_NAME", prev_name),
+                     ("AITER_FORCE_LOG2_K_SPLIT", prev_split)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def test_env_var_is_read_at_python_layer(force_kernel):
-    """The env-var must be visible to the FFI handler (read via getenv)."""
     assert os.environ.get("AITER_FORCE_KERNEL_NAME") == EXPECTED_KERNEL
     assert os.environ.get("AITER_FORCE_LOG2_K_SPLIT") == "0"
 
 
-def test_force_kernel_dispatches_bpreshuffle_256x256(force_kernel):
-    """Assert that ``AITER_FORCE_KERNEL_NAME`` actually selects the named kernel.
-
-    Verification strategy (Phase B.2): launch a 70B-shape FP4 GEMM with
-    rocprofv3 attached, then grep the trace CSV for the kernel name. This
-    cannot run on CPU-only CI, so the test is skipped here and re-enabled
-    in the Plan-3 B.2 4-leg verify Round.
-    """
-    pytest.skip(
-        "Requires GPU + rocprof for kernel-name introspection; covered by "
-        "Plan 3 Task 7 (B.2 4-leg verify), run-id "
-        "20260516_phaseB_A1_xval_097 4-leg follow-up."
-    )
-
-
-def test_force_kernel_numerical_smoke(force_kernel):
-    """Forcing ``BpreShuffle_256x256`` must produce finite, shape-correct output.
-
-    Compares the override path against the default-heuristic path at a
-    representative 70B target shape. The kernel must be present in the
-    pre-loaded ASM cache; if not, the FFI returns ``kInternal``.
-    """
-    pytest.skip(
-        "Requires GPU to execute the FP4 GEMM kernel; covered by "
-        "Plan 3 Task 7 (B.2 4-leg verify) and the existing CPU-only "
-        "tests in tests/test_gemm_fp4_ja.py once GPU is available."
-    )
+def test_dispatch_env_plumbing(monkeypatch):
+    monkeypatch.setenv("AITER_FP4_DISPATCH", "1")
+    assert os.environ["AITER_FP4_DISPATCH"] == "1"
+    monkeypatch.delenv("AITER_FP4_DISPATCH", raising=False)
+    assert "AITER_FP4_DISPATCH" not in os.environ
 
 
 def test_no_env_var_uses_default_heuristic(monkeypatch):
-    """Reversibility guarantee: unset env-var leaves behavior unchanged.
-
-    Removes the env-vars and asserts they are absent. The actual numerical
-    parity with the legacy heuristic path is a GPU test (deferred to B.2).
-    """
+    """Reversibility: with no selector env set, the handler uses the heuristic."""
+    monkeypatch.delenv("AITER_FP4_DISPATCH", raising=False)
     monkeypatch.delenv("AITER_FORCE_KERNEL_NAME", raising=False)
     monkeypatch.delenv("AITER_FORCE_LOG2_K_SPLIT", raising=False)
+    assert "AITER_FP4_DISPATCH" not in os.environ
     assert "AITER_FORCE_KERNEL_NAME" not in os.environ
-    assert "AITER_FORCE_LOG2_K_SPLIT" not in os.environ
+
+
+# --------------------------------------------------------------------------
+# Source-of-truth: the handler's dispatch table matches the study oracle.
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(not HANDLER.exists(), reason="handler source not present")
+def test_dispatch_table_matches_study_oracle():
+    """Parse lookup_fp4_dispatch() entries and assert they equal ORACLE_TABLE."""
+    text = HANDLER.read_text()
+    # entries look like: {32768, 4096, 4096,   &K128x512, 0},  // comment
+    entry_re = re.compile(
+        r"\{\s*(\d+),\s*(\d+),\s*(\d+),\s*&(K128x512|K256x256),\s*(\d+)\s*\}")
+    tile_of = {"K128x512": "128x512", "K256x256": "256x256"}
+    parsed = {}
+    for m in entry_re.finditer(text):
+        M, N, K = int(m[1]), int(m[2]), int(m[3])
+        tile = tile_of[m[4]]
+        splitk = 1 << int(m[5])
+        parsed[(M, N, K)] = (tile, splitk)
+    assert parsed == ORACLE_TABLE, (
+        f"handler dispatch table != study oracle.\n"
+        f"handler: {parsed}\noracle:  {ORACLE_TABLE}")
+
+
+# --------------------------------------------------------------------------
+# REAL rocprof-trace dispatch assertion (GPU + rocprofv3 required).
+# --------------------------------------------------------------------------
+def _gpu_available():
+    try:
+        import jax
+        devs = jax.devices()
+        # JAX reports platform="gpu" for ROCm RocmDevice(s).
+        return len(devs) > 0 and all(d.platform != "cpu" for d in devs)
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(shutil.which("rocprofv3") is None,
+                    reason="rocprofv3 not on PATH (GPU/rocprof host required)")
+@pytest.mark.skipif(not VERIFY.exists(), reason="verify script missing")
+def test_force_kernel_dispatches_via_rocprof_trace(tmp_path):
+    """Launch FP4 GEMMs under rocprofv3 --kernel-trace and assert the GPU ran
+    the per-shape oracle kernel under AITER_FP4_DISPATCH=1, and the 256x256 pin
+    under AITER_FORCE_KERNEL_NAME. This is the real GPU-side dispatch proof.
+    """
+    if not _gpu_available():
+        pytest.skip("no ROCm GPU visible to JAX")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO / "jax-aiter")
+    env.setdefault("HIP_VISIBLE_DEVICES", "0")
+    checks = [
+        "32768,4096,4096:dispatch:128x512:1",   # tall fprop/dgrad -> 128x512
+        "1024,4096,32768:dispatch:128x512:4",   # skinny kv-wgrad  -> 128x512/sK4
+        "32768,4096,4096:forced:256x256:1",     # FORCE pin -> 256x256
+    ]
+    cmd = [sys.executable, str(VERIFY), "--out-dir", str(tmp_path),
+           "--warmup", "2", "--iters", "8"]
+    for c in checks:
+        cmd += ["--check", c]
+    proc = subprocess.run(cmd, env=env, cwd=str(REPO / "jax-aiter"),
+                          capture_output=True, text=True, timeout=600)
+    print(proc.stdout)
+    print(proc.stderr, file=sys.stderr)
+    assert proc.returncode == 0, (
+        f"rocprof dispatch assertion failed (rc={proc.returncode}):\n"
+        f"{proc.stdout[-1500:]}\n{proc.stderr[-800:]}")
 
 
 def test_expected_kernel_name_is_pinned_canonical():
-    """Catch accidental edits to the recipe-level kernel-name string.
-
-    The mangled name is referenced from three places that must stay in
-    sync:
-      1. This test (``EXPECTED_KERNEL``).
-      2. ``scripts/run_fresh_maxtext_e2e.sh`` ``set_aiter_env()``.
-      3. ``docs/runs/70b/maxtext/20260516_phaseB_A1_xval_097/results.md``.
-    A drift here means the override no longer targets the variant the
-    B.0 sweep selected; if a different variant is intentionally chosen,
-    update all three locations together.
-    """
+    """Guard the legacy FORCE-pin kernel string (still a supported fallback)."""
     assert EXPECTED_KERNEL == (
-        "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
-    )
+        "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E")
