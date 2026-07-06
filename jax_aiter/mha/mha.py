@@ -17,6 +17,7 @@ are on different levels of the call stack.
 
 from __future__ import annotations
 import logging
+import os
 from typing import Tuple, Optional
 from functools import partial
 
@@ -76,7 +77,10 @@ def _mha_fwd_infer_sharding(config, mesh, arg_shapes, result_shapes):
     out_sharding = NamedSharding(mesh, P(*q_spec))
 
     if is_varlen:
-        lse_sh = NamedSharding(mesh, P(*((None,) * result_shapes[1].ndim)))
+        # lse is [hq, total_q]: shard the token dim (dim1) like q's token dim
+        # (q dim0) and the head dim (dim0) like q's head dim (q dim1), so the
+        # partitioner-declared lse shape matches the per-shard FFI output.
+        lse_sh = NamedSharding(mesh, P(q_spec[1], q_spec[0]))
     else:
         if result_shapes[1].ndim == 3:
             lse_sh = NamedSharding(mesh, P(q_spec[0], q_spec[2], q_spec[1]))
@@ -183,6 +187,9 @@ def _mha_bwd_infer_sharding(config, mesh, arg_shapes, result_shapes):
 
     if result_shapes[3].ndim == 3:
         sd_sh = NamedSharding(mesh, P(q_spec[0], q_spec[2], q_spec[1]))
+    elif result_shapes[3].ndim == 2:
+        # varlen softmax_d [hq, total_q]: shard token dim like q dim0, head like q dim1.
+        sd_sh = NamedSharding(mesh, P(q_spec[1], q_spec[0]))
     if result_shapes[4].ndim == 4:
         dbias_sh = NamedSharding(mesh, P(q_spec[0], q_spec[1], q_spec[2], None))
 
@@ -264,6 +271,12 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
 
     bf16_cvt = 0 if get_gfx() == "gfx950" else 1
 
+    # Forward uses the CK FA v3 ASM kernel by default (AITER falls back to v2 CK
+    # when use_asm_v3=False or the shape is unsupported). JA_MHA_FWD_USE_ASM_V3=0
+    # forces the v2 forward — used by the FAv3-vs-FAv2 forward numeric A/B
+    # (AIMA-164). Default 1 preserves existing behavior.
+    _fwd_use_asm_v3 = os.environ.get("JA_MHA_FWD_USE_ASM_V3", "1") != "0"
+
     config = MhaFwdConfig(
         dropout_p=float(dropout_p),
         softmax_scale=float(softmax_scale),
@@ -271,7 +284,7 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
         wl=int(wl), wr=int(wr),
         return_lse=return_lse,
         return_randval=bool(return_softmax and dropout_p > 0),
-        use_asm_v3=True,
+        use_asm_v3=_fwd_use_asm_v3,
         how_v3_bf16_cvt=int(bf16_cvt),
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_k=int(max_seqlen_k),
@@ -386,6 +399,11 @@ def _flash_attn_backward(dout, q, k, v, out, lse,
     bwd_det = False if is_950_1block else deterministic
     use_v3_bwd = False if is_950_1block else use_v3
     bwd_atomic = False if is_950_1block else use_v3_bwd
+    # JA_MHA_BWD_USE_ASM_V3=0 forces the v2/CK backward (FAv2 bwd) — used by the
+    # FAv3-vs-FAv2 BACKWARD numeric A/B (AIMA-164). Default keeps existing dispatch.
+    if os.environ.get("JA_MHA_BWD_USE_ASM_V3", "1") == "0":
+        use_v3_bwd = False
+        bwd_atomic = False
 
     results = mha_bwd_unified(
         dout, q, k, v, out, lse,
@@ -692,3 +710,68 @@ def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
 
 
 flash_attn_varlen.defvjp(_flash_attn_varlen_fwd, _flash_attn_varlen_bwd)
+
+
+# ---------------------------------------------------------------------------
+# Raw varlen (NO custom_partitioning) for use INSIDE shard_map.
+# custom_partitioning + shard_map (manual mode) conflict; under shard_map each
+# device already holds a fully-local shard, so we call the raw FFI ops directly
+# (ops.mha_fwd/mha_bwd = aiter::mha_fwd/bwd) with the device-LOCAL cu_seqlens.
+# Same kernel as flash_attn_varlen, just without the global partitioner.
+# ---------------------------------------------------------------------------
+
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10))
+def flash_attn_varlen_raw(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                          max_seqlen_q, max_seqlen_k,
+                          dropout_p, softmax_scale, causal, window_size):
+    out, _ = _favr_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                       max_seqlen_q, max_seqlen_k,
+                       dropout_p, softmax_scale, causal, window_size)
+    return out
+
+
+def _favr_fwd(q, k, v, cu_q, cu_k, max_sq, max_sk,
+              dropout_p, softmax_scale, causal, window_size):
+    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
+    wl, wr = window_size
+    cfg = MhaFwdConfig(
+        dropout_p=float(dropout_p), softmax_scale=float(softmax_scale),
+        is_causal=causal, wl=int(wl), wr=int(wr),
+        return_lse=True, return_randval=False,
+        use_asm_v3=True, how_v3_bf16_cvt=int(bf16_cvt),
+        max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk), min_seqlen_q=0,
+        logits_soft_cap=0.0, zero_tensors=False,
+        cp_axis=None, cp_size=1, cp_load_balanced=True)
+    out, lse, _p, rng = _mha_fwd_raw(
+        q, k, v, cu_q, cu_k, _empty(q.dtype), _empty(q.dtype),
+        _empty(jnp.float32), _empty(jnp.int64), cfg)
+    return out, (q, k, v, out, lse, rng, cu_q, cu_k)
+
+
+def _favr_bwd(max_sq, max_sk, dropout_p, softmax_scale, causal, window_size,
+              res, dout):
+    q, k, v, out, lse, rng, cu_q, cu_k = res
+    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
+    wl, wr = window_size
+    swa = (wl > 0) or (wr >= 0 and wr != -1)
+    use_v3 = True
+    if dropout_p > 0:
+        use_v3 = False
+    if swa:
+        use_v3 = False
+    if causal and get_gfx() == "gfx950" and int(max_sk) > 256:
+        use_v3 = False
+    cfg = MhaBwdConfig(
+        dropout_p=float(dropout_p), softmax_scale=float(softmax_scale),
+        is_causal=causal, wl=int(wl), wr=int(wr), deterministic=False,
+        use_asm_v3=use_v3, is_v3_atomic_fp32=use_v3, how_v3_bf16_cvt=int(bf16_cvt),
+        max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk), zero_tensors=False,
+        cp_axis=None, cp_size=1, cp_load_balanced=True)
+    dq, dk, dv, _sd, _db = _mha_bwd_raw(
+        dout, q, k, v, out, lse, cu_q, cu_k,
+        _empty(q.dtype), _empty(q.dtype), _empty(q.dtype),
+        _empty(q.dtype), _empty(jnp.float32), rng, _empty(jnp.int64), cfg)
+    return (dq, dk, dv, None, None)
+
+
+flash_attn_varlen_raw.defvjp(_favr_fwd, _favr_bwd)
