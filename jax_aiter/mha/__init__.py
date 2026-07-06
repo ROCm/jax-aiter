@@ -47,8 +47,10 @@ if not _mha_libs_present():
 from .mha import (
     flash_attn_func,
     flash_attn_varlen,
+    flash_attn_varlen_raw,
 )
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen",
+    "flash_attn_varlen_raw",
 ]

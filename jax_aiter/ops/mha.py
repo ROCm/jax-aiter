@@ -148,7 +148,12 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config):
         total_q, hq, dq = q.shape
         _, hk, dv = v.shape
         out_shape = (total_q, hq, dv)
-        lse_shape = (hq, config.max_seqlen_q) if config.return_lse else (0,)
+        # Varlen LSE spans ALL packed tokens per head: the FFI handler sets
+        # nhead_stride_lse = stride(lse_dims, 0), so the buffer must be
+        # (hq, total_q). Using max_seqlen_q here undersizes it whenever
+        # total_q > max_seqlen_q (multi-segment packing) -> OOB write -> GPU
+        # memory-access fault. (was: (hq, max_seqlen_q))
+        lse_shape = (hq, total_q) if config.return_lse else (0,)
         p_shape = (0,)
     else:
         b, sq, hq, dq = q.shape
@@ -202,7 +207,8 @@ def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
         dq_shape = (total_q, hq, dq_dim)
         dk_shape = (total_k, hk, dq_dim)
         dv_shape = (total_k, hk, dv_dim)
-        sd_shape = (hq, config.max_seqlen_q)
+        # softmax_d spans all packed tokens per head (matches LSE layout above).
+        sd_shape = (hq, total_q)
         dbias_shape = (0,)
     else:
         b, sq, hq, dq_dim = q.shape
