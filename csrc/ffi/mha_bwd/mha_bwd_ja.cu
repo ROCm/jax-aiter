@@ -10,6 +10,7 @@
 // kernels can be used on all devices concurrently.
 
 #include <hip/hip_runtime.h>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -54,57 +55,11 @@ struct WorkspacePool {
   }
 };
 
-static thread_local WorkspacePool s_dq_acc_pool;
+static thread_local WorkspacePool s_workspace_pool;
 static thread_local WorkspacePool s_dk_exp_pool;
 static thread_local WorkspacePool s_dv_exp_pool;
 static thread_local WorkspacePool s_dbias_pool;
 static thread_local WorkspacePool s_rng_pool;
-
-static size_t compute_dq_acc_size_unified(
-    bool is_varlen, int64_t batch_size, int64_t seqlen_q_or_total,
-    int64_t seqlen_k_or_max, int64_t num_heads, int64_t head_size,
-    bool deterministic, bool use_asm_v3, bool is_v3_atomic_fp32,
-    ffi::DataType q_dtype, std::vector<int64_t> &out_shape) {
-
-  size_t elem_sz = 4;
-
-  if (is_varlen) {
-    // Varlen: 4D layout [split, total_q, nheads, head_size]
-    if (!deterministic) {
-      out_shape = {1, seqlen_q_or_total, num_heads, head_size};
-    } else {
-      int64_t kN0 = head_size <= 128 ? 128 : 64;
-      int64_t nsplits = (seqlen_k_or_max + kN0 - 1) / kN0;
-      out_shape = {nsplits, seqlen_q_or_total, num_heads, head_size};
-    }
-  } else {
-    // Batch: 5D layout depends on path
-    if (!deterministic) {
-      if (use_asm_v3 && is_v3_atomic_fp32) {
-        out_shape = {1, batch_size, num_heads, seqlen_q_or_total, head_size};
-      } else if (use_asm_v3 && !is_v3_atomic_fp32) {
-        int64_t sq_pad = ((seqlen_q_or_total + 15) / 16) * 16;
-        int64_t pd = (head_size == 192) ? 192 : 128;
-        out_shape = {1, batch_size, num_heads, sq_pad, pd};
-        elem_sz = (q_dtype == ffi::DataType::F16 || q_dtype == ffi::DataType::BF16) ? 2 : 4;
-      } else {
-        out_shape = {1, batch_size, seqlen_q_or_total, num_heads, head_size};
-      }
-    } else {
-      int64_t kN0 = head_size <= 128 ? 128 : 64;
-      int64_t nsplits = (seqlen_k_or_max + kN0 - 1) / kN0;
-      if (use_asm_v3) {
-        out_shape = {nsplits, batch_size, num_heads, seqlen_q_or_total, head_size};
-      } else {
-        out_shape = {nsplits, batch_size, seqlen_q_or_total, num_heads, head_size};
-      }
-    }
-  }
-
-  size_t total = 1;
-  for (auto d : out_shape) total *= d;
-  return total * elem_sz;
-}
 
 ffi::Error MhaBwdUnified_Bridge(
     hipStream_t stream,
@@ -239,38 +194,15 @@ ffi::Error MhaBwdUnified_Bridge(
     seed_ptr = dummy_rng; offset_ptr = dummy_rng + 1;
   }
 
-  // dq_acc
-  std::vector<int64_t> dq_acc_shape;
-  size_t dq_acc_bytes = compute_dq_acc_size_unified(
-      is_varlen, batch_size, seqlen_q, is_varlen ? max_sk : seqlen_k,
-      num_heads, head_size_q, deterministic, use_asm_v3, is_v3_atomic_fp32,
-      q.element_type(), dq_acc_shape);
+  auto workspace_alloc = [stream](size_t bytes, bool zero_init) -> void* {
+    return s_workspace_pool.get(bytes, stream, zero_init);
+  };
 
-  void *dq_acc_ptr = s_dq_acc_pool.get(dq_acc_bytes, stream);
-
-  // dq_acc strides
-  ck_tile::index_t split_stride_dq_acc = 1, batch_stride_dq_acc = 0;
-  ck_tile::index_t nhead_stride_dq_acc = 1, stride_dq_acc = 1;
-
-  int rank = dq_acc_shape.size();
-  if (rank >= 4) {
-    std::vector<ck_tile::index_t> strides(rank);
-    strides[rank - 1] = 1;
-    for (int i = rank - 2; i >= 0; i--)
-      strides[i] = strides[i + 1] * dq_acc_shape[i + 1];
-
-    split_stride_dq_acc = strides[0];
-    if (is_varlen) {
-      // [split, total_q, nheads, head] → strides[1]=total_q stride, strides[2]=nhead stride
-      stride_dq_acc = strides[1];
-      nhead_stride_dq_acc = strides[2];
-    } else {
-      // [split, batch, ...] → batch at [1]
-      batch_stride_dq_acc = strides[1];
-      nhead_stride_dq_acc = strides[2];
-      stride_dq_acc = strides[3];
-    }
-  }
+  auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+    void *p = nullptr;
+    HIP_CHECK(hipHostMalloc(&p, bytes, hipHostMallocDefault));
+    return std::shared_ptr<void>(p, [](void *q) { HIP_CHECK(hipHostFree(q)); });
+  };
 
   // MQA/GQA expansion
   auto dq_dims = dq_ret->dimensions();
@@ -379,7 +311,7 @@ ffi::Error MhaBwdUnified_Bridge(
       .do_ptr = dout.untyped_data(), .d_ptr = softmax_d_ret->untyped_data(),
       .rand_val_ptr = nullptr,
       .dq_ptr = dq_ret->untyped_data(), .dk_ptr = dk_final, .dv_ptr = dv_final,
-      .dbias_ptr = dbias_expanded_ptr, .dq_acc_ptr = dq_acc_ptr,
+      .dbias_ptr = dbias_expanded_ptr,
       .seqstart_q_ptr = seqstart_q_ptr, .seqstart_k_ptr = seqstart_k_ptr,
       .seqlen_q = static_cast<int>(seqlen_q), .seqlen_k = static_cast<int>(seqlen_k),
       .batch = static_cast<int>(batch_size),
@@ -390,7 +322,6 @@ ffi::Error MhaBwdUnified_Bridge(
       .stride_v = static_cast<int>(stride_v), .stride_bias = static_cast<int>(stride_bias),
       .stride_o = static_cast<int>(stride_o), .stride_randval = 0,
       .stride_do = static_cast<int>(stride_do),
-      .stride_dq_acc = static_cast<int>(stride_dq_acc),
       .stride_dq = static_cast<int>(stride_dq), .stride_dk = static_cast<int>(stride_dk),
       .stride_dv = static_cast<int>(stride_dv), .stride_dbias = static_cast<int>(stride_dbias),
       .nhead_stride_q = static_cast<int>(nhs_q), .nhead_stride_k = static_cast<int>(nhs_k),
@@ -398,7 +329,6 @@ ffi::Error MhaBwdUnified_Bridge(
       .nhead_stride_o = static_cast<int>(nhs_o), .nhead_stride_randval = 0,
       .nhead_stride_do = static_cast<int>(nhs_do),
       .nhead_stride_lsed = static_cast<int>(nhs_lse),
-      .nhead_stride_dq_acc = static_cast<int64_t>(nhead_stride_dq_acc),
       .nhead_stride_dq = static_cast<int>(nhs_dq),
       .nhead_stride_dk = static_cast<int>(nhs_dk), .nhead_stride_dv = static_cast<int>(nhs_dv),
       .nhead_stride_dbias = static_cast<int>(nhead_stride_dbias),
@@ -407,15 +337,15 @@ ffi::Error MhaBwdUnified_Bridge(
       .batch_stride_o = static_cast<int>(bs_o), .batch_stride_randval = 0,
       .batch_stride_do = static_cast<int>(bs_do),
       .batch_stride_lsed = static_cast<int>(bs_lse),
-      .batch_stride_dq_acc = static_cast<int64_t>(batch_stride_dq_acc),
       .batch_stride_dq = static_cast<int>(bs_dq),
       .batch_stride_dk = static_cast<int>(bs_dk), .batch_stride_dv = static_cast<int>(bs_dv),
       .batch_stride_dbias = static_cast<int>(batch_stride_dbias),
-      .split_stride_dq_acc = static_cast<int>(split_stride_dq_acc),
       .window_size_left = static_cast<int>(mask.left),
       .window_size_right = static_cast<int>(mask.right),
       .p_drop = dropout_p, .p_undrop = p_undrop,
-      .drop_seed_offset = std::make_pair(seed_ptr, offset_ptr)
+      .drop_seed_offset = std::make_pair(seed_ptr, offset_ptr),
+      .workspace_alloc = workspace_alloc,
+      .pinned_host_alloc = pinned_host_alloc,
   };
 
   // Ensure HIP device context matches the data device.  XLA usually sets

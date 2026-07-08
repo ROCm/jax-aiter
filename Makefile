@@ -31,6 +31,7 @@ GPU_ARCHS_LIST := $(subst ;, ,$(GPU_ARCHS))
 AMDGPU_TARGET_FLAGS := $(foreach arch,$(GPU_ARCHS_LIST),--offload-arch=$(arch))
 
 JA_CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
+               -DENABLE_CK=1 \
                -fvisibility-inlines-hidden -fvisibility=hidden
 
 JA_INCLUDES := -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \

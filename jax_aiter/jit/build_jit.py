@@ -106,6 +106,9 @@ def patch_aiter_core(core_module, jax_aiter_root):
             "torch_exclude": True,
             "hip_clang_path": None,
             "blob_gen_cmd": "",
+            "third_party": [],
+            "hipify": True,
+            "flags_extra_hip_per_source": {},
         }
 
         # Convert string expressions to actual values using eval.
@@ -278,6 +281,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module,
             is_standalone,
             torch_exclude,
+            extra_cuda_cflags_per_source=None,
         ) -> None:
             """Wrapper to handle torch import when torch_exclude=True."""
             if torch_exclude:
@@ -303,6 +307,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                         is_python_module=is_python_module,
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
+                        extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
                     )
                 finally:
                     if 'torch' in sys.modules and sys.modules['torch'] is mock_torch:
@@ -320,6 +325,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                     is_python_module=is_python_module,
                     is_standalone=is_standalone,
                     torch_exclude=torch_exclude,
+                    extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
                 )
         
         cpp_extension._write_ninja_file_to_build_library = _write_ninja_file_to_build_library_ja_inner
@@ -337,6 +343,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module: bool,
             is_standalone: bool = False,
             torch_exclude: bool = False,
+            extra_cuda_cflags_per_source=None,
         ) -> None:
             cpp_extension.verify_ninja_availability()
 
@@ -372,6 +379,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
             )
 
             if verbose:
@@ -483,7 +491,11 @@ def build_module(core_module, module_name, verbose=False):
             is_python_module,
             build_args.get("is_standalone", False),
             build_args.get("torch_exclude", False),
-            build_args.get("hipify", True),
+            build_args.get("third_party", []),
+            hipify=build_args.get("hipify", True),
+            flags_extra_hip_per_source=build_args.get(
+                "flags_extra_hip_per_source", {}
+            ),
         )
         logger.info(f"Successfully built {module_name}")
 

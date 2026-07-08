@@ -39,6 +39,12 @@ def _empty(dtype):
     return jnp.zeros((0,), dtype=dtype)
 
 
+# Two uint64 values (seed, offset) packed into 4 int32 elements (16 bytes).
+# JAX default mode truncates int64 to int32, so we use int32 x 4 explicitly.
+_RNG_STATE_SHAPE = (4,)
+_RNG_STATE_DTYPE = jnp.int32
+
+
 def _sf(x) -> np.float32:
     return np.float32(x)
 
@@ -47,14 +53,14 @@ def _si(x) -> np.int32:
     return np.int32(x)
 
 
-def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, rng_shape, out_dtype):
+def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype):
     call = jax.ffi.ffi_call(
         "MhaFwdUnifiedJA",
         (
             jax.ShapeDtypeStruct(out_shape, out_dtype),
             jax.ShapeDtypeStruct(lse_shape, jnp.float32),
             jax.ShapeDtypeStruct(p_shape, jnp.uint8),
-            jax.ShapeDtypeStruct(rng_shape, jnp.int64),
+            jax.ShapeDtypeStruct(_RNG_STATE_SHAPE, _RNG_STATE_DTYPE),
         ),
         vmap_method="broadcast_all",
         input_layouts=[None] * 12,
@@ -169,15 +175,13 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config,
         out_shape = (b, sq, hq, dv)
         lse_shape = (b, hq, sq) if config.return_lse else (0,)
         p_shape = (b, hq, sq, sk) if config.return_randval else (0,)
-    rng_shape = (2,)
 
     empty_descale = _empty(jnp.float32)
     q_desc = q_descale if q_descale is not None else empty_descale
     k_desc = k_descale if k_descale is not None else empty_descale
     v_desc = v_descale if v_descale is not None else empty_descale
 
-    fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape,
-                                  rng_shape, out_dtype)
+    fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype)
     return fn(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
               q_desc, k_desc, v_desc,
               dropout_p=_sf(config.dropout_p),

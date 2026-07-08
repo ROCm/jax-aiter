@@ -281,6 +281,7 @@ def ja_compile_ops(
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
+                third_party = d_args.get("third_party", [])
                 hipify = d_args.get("hipify", True)
                 hip_clang_path = d_args.get("hip_clang_path", None)
 
@@ -303,7 +304,11 @@ def ja_compile_ops(
                     is_python_module,
                     is_standalone,
                     torch_exclude,
-                    hipify,
+                    third_party,
+                    hipify=hipify,
+                    flags_extra_hip_per_source=d_args.get(
+                        "flags_extra_hip_per_source", {}
+                    ),
                 )
 
                 # Restore HIP_CLANG_PATH
@@ -387,7 +392,11 @@ def ja_build_module_on_demand(module_name: str):
             build_args.get("is_python_module", True),
             build_args.get("is_standalone", False),
             build_args.get("torch_exclude", False),
-            build_args.get("hipify", True),
+            build_args.get("third_party", []),
+            hipify=build_args.get("hipify", True),
+            flags_extra_hip_per_source=build_args.get(
+                "flags_extra_hip_per_source", {}
+            ),
         )
 
         return True
