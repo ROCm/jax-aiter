@@ -371,3 +371,263 @@ class TestFp8Regressions:
 
         assert_close(out_batch, out_vl, jnp.bfloat16,
                      f"fp8_batch_vs_varlen_d{d}", bwd_factor=2)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark (run: python tests/test_mha_fp8_ja.py [options])
+# ---------------------------------------------------------------------------
+
+benchmark = {}
+
+_FP8_MAX = 448.0
+_BENCH_WARMUP = 2
+_BENCH_REPEAT = 101
+
+
+def per_tensor_quant(x, quant_dtype):
+    """Per-tensor FP8 quantisation with a single fp32 descale (aiter-compatible)."""
+    x32 = x.astype(jnp.float32)
+    scale = jnp.max(jnp.abs(x32)) / _FP8_MAX
+    scale = jnp.maximum(scale, jnp.float32(1e-8))
+    x_quant = (x32 / scale).astype(quant_dtype)
+    descale = scale.reshape(1).astype(jnp.float32)
+    return x_quant, descale
+
+
+def _make_jit_fwd(**run_kw):
+    """Return a jitted no-arg thunk so timing excludes Python/FFI dispatch."""
+    def _fwd():
+        return run_fwd(**run_kw)
+    return jax.jit(_fwd)
+
+
+def _run_fwd_perftest(fn, warmup=_BENCH_WARMUP, repeat=_BENCH_REPEAT):
+    """Time a jitted forward thunk; returns (median_us, output)."""
+    import time
+    import numpy as np
+
+    for _ in range(warmup):
+        jax.block_until_ready(fn())
+    times_us = []
+    out = None
+    for _ in range(repeat):
+        t0 = time.perf_counter()
+        out = fn()
+        jax.block_until_ready(out)
+        times_us.append((time.perf_counter() - t0) * 1e6)
+    return float(np.median(np.asarray(times_us, dtype=np.float64))), out
+
+
+def _calc_nrms(out, out_ref):
+    """Relative NRMS matching third_party/aiter/op_tests/test_mha_fp8.py."""
+    abs_diff = jnp.abs(out.astype(jnp.float32) - out_ref.astype(jnp.float32))
+    max_diff = float(jnp.max(abs_diff))
+    square_diff = (abs_diff / jnp.abs(out_ref.astype(jnp.float32))).astype(jnp.float32) ** 2
+    square_diff = jnp.where(out_ref == 0.0, 1.0, square_diff)
+    max_item = max(float(jnp.max(jnp.abs(out))), float(jnp.max(jnp.abs(out_ref))), 1e-7)
+    nrms = float(jnp.sqrt(jnp.sum(square_diff)) / (math.sqrt(out_ref.size) * max_item))
+    return nrms, max_diff
+
+
+def benchmark_flash_attn_output(
+    batch_size,
+    nheads,
+    nheads_k,
+    seqlen_q,
+    seqlen_k,
+    d,
+    d_v,
+    causal=False,
+    local=False,
+    validate=True,
+    warmup=_BENCH_WARMUP,
+    repeat=_BENCH_REPEAT,
+):
+    """Benchmark FP8 vs bf16 MHA forward and populate module-level ``benchmark`` dict."""
+    global benchmark
+    benchmark = {}
+
+    key = jax.random.PRNGKey(0)
+    k1, k2, k3 = jax.random.split(key, 3)
+    if local:
+        wl = int(jax.random.randint(k1, (), minval=0, maxval=seqlen_k))
+        wr = int(jax.random.randint(k2, (), minval=0, maxval=seqlen_k))
+        window_size = (wl, wr)
+    else:
+        window_size = (-1, -1)
+
+    dtype = jnp.bfloat16
+    quant_dtype = _fp8_dtype()
+
+    # Match aiter: torch.rand in [0, 1)
+    q = jax.random.uniform(k1, (batch_size, seqlen_q, nheads, d), dtype=jnp.float32,
+                           minval=0.0, maxval=1.0).astype(dtype)
+    k = jax.random.uniform(k2, (batch_size, seqlen_k, nheads_k, d), dtype=jnp.float32,
+                           minval=0.0, maxval=1.0).astype(dtype)
+    v = jax.random.uniform(k3, (batch_size, seqlen_k, nheads_k, d_v), dtype=jnp.float32,
+                           minval=0.0, maxval=1.0).astype(dtype)
+
+    q_quant, q_descale = per_tensor_quant(q, quant_dtype)
+    k_quant, k_descale = per_tensor_quant(k, quant_dtype)
+    v_quant, v_descale = per_tensor_quant(v, quant_dtype)
+
+    fp8_kw = dict(
+        q=q_quant, k=k_quant, v=v_quant, causal=causal, window_size=window_size,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+    )
+    bf16_kw = dict(q=q, k=k, v=v, causal=causal, window_size=window_size)
+
+    print(f"Benchmark: warmup={warmup}, iters={repeat} (median us)")
+
+    us_quant_fwd, out = _run_fwd_perftest(
+        _make_jit_fwd(**fp8_kw), warmup=warmup, repeat=repeat)
+    us_fwd, out_ref = _run_fwd_perftest(
+        _make_jit_fwd(**bf16_kw), warmup=warmup, repeat=repeat)
+
+    if validate:
+        nrms, max_diff = _calc_nrms(out, out_ref)
+        print(f"Output nrms: {nrms}")
+        print(f"Output max diff: {max_diff}")
+        if max_diff >= 0.055:
+            raise AssertionError(f"FP8 max diff {max_diff} >= 0.055")
+
+    fwd_flop = (
+        batch_size
+        * nheads
+        * (seqlen_q * seqlen_k * d * 2 + seqlen_q * seqlen_k * d_v * 2)
+    )
+    dtype_bytes = 2  # bf16
+    quant_dtype_bytes = 1  # fp8
+    fwd_num_bytes = (
+        batch_size
+        * nheads
+        * dtype_bytes
+        * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
+    )
+    quant_fwd_num_bytes = (
+        batch_size
+        * nheads
+        * quant_dtype_bytes
+        * (seqlen_q * d + seqlen_k * d + seqlen_k * d_v + seqlen_q * d_v)
+    )
+
+    benchmark["warmup"] = warmup
+    benchmark["iters"] = repeat
+    benchmark["fp8_us"] = us_quant_fwd
+    benchmark["fp8_tflops"] = fwd_flop / 1.0e6 / us_quant_fwd
+    benchmark["fp8_gb_per_sec"] = quant_fwd_num_bytes / 1.0e3 / us_quant_fwd
+    benchmark["bf16_us"] = us_fwd
+    benchmark["bf16_tflops"] = fwd_flop / 1.0e6 / us_fwd
+    benchmark["bf16_gb_per_sec"] = fwd_num_bytes / 1.0e3 / us_fwd
+    benchmark["fp8_speedup"] = us_fwd / us_quant_fwd
+    benchmark["batch_size"] = batch_size
+    benchmark["nheads"] = nheads
+    benchmark["nheads_k"] = nheads_k
+    benchmark["seqlen_q"] = seqlen_q
+    benchmark["seqlen_k"] = seqlen_k
+    benchmark["d"] = d
+    benchmark["d_v"] = d_v
+    benchmark["causal"] = causal
+    benchmark["local"] = local
+    return benchmark
+
+
+_SUMMARY_COLS = (
+    "batch_size", "nheads", "nheads_k", "seqlen_q", "seqlen_k", "d", "d_v",
+    "fp8_us", "fp8_tflops", "fp8_gb_per_sec",
+    "bf16_us", "bf16_tflops", "bf16_gb_per_sec",
+    "fp8_speedup",
+)
+
+
+def _print_benchmark_summary(rows):
+    display_rows = []
+    for row in rows:
+        display_rows.append({k: row[k] for k in _SUMMARY_COLS if k in row})
+    try:
+        import pandas as pd
+        df = pd.DataFrame(display_rows)
+        pd.set_option("display.width", 200)
+        pd.set_option("display.max_columns", None)
+        print(f"mha fp8 summary:\n{df.to_string(index=False)}")
+    except ImportError:
+        for row in display_rows:
+            print(row)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="FP8 MHA forward benchmark (jax-aiter)",
+    )
+    parser.add_argument(
+        "-b", "--batch_size", type=int, default=2,
+        help="Batch size. Default is 2.\n    e.g.: -b 16",
+    )
+    parser.add_argument(
+        "-n", "--nheads", type=int, default=5,
+        help="Number of query heads. Default is 5.\n    e.g.: -n 8",
+    )
+    parser.add_argument(
+        "-nk", "--nheads_k", type=int, default=-1,
+        help="Number of KV heads. -1 means equal to nheads.\n    e.g.: -nk 1",
+    )
+    parser.add_argument(
+        "-q", "--seqlen_q", type=int, default=512,
+        help="Sequence length for query. Default is 512.\n    e.g.: -q 1024",
+    )
+    parser.add_argument(
+        "-k", "--seqlen_k", type=int, default=-1,
+        help="Sequence length for key. -1 means equal to seqlen_q.\n    e.g.: -k 1024",
+    )
+    parser.add_argument(
+        "-d", "--d_qk", type=int, default=128,
+        help="Head dim for Q/K. Default is 128.\n    e.g.: -d 128",
+    )
+    parser.add_argument(
+        "-dv", "--d_v", type=int, default=-1,
+        help="Head dim for V. -1 means equal to d_qk.\n    e.g.: -dv 128",
+    )
+    parser.add_argument(
+        "-c", "--causal", action="store_true",
+        help="Causal attention. Default is False.\n    -c or --causal",
+    )
+    parser.add_argument(
+        "-l", "--local", action="store_true",
+        help="Random sliding-window attention. Default is False.\n    -l or --local",
+    )
+    parser.add_argument(
+        "--no-validate", action="store_true",
+        help="Skip FP8 vs bf16 accuracy check.",
+    )
+    parser.add_argument(
+        "-w", "--warmup", type=int, default=_BENCH_WARMUP,
+        help=f"Warmup iterations before timing. Default is {_BENCH_WARMUP}.\n    e.g.: -w 5",
+    )
+    parser.add_argument(
+        "-i", "--iters", type=int, default=_BENCH_REPEAT,
+        help=f"Timed iterations (median reported). Default is {_BENCH_REPEAT}.\n    e.g.: -i 200",
+    )
+    args = parser.parse_args()
+
+    nheads_k = args.nheads_k if args.nheads_k > 0 else args.nheads
+    seqlen_k = args.seqlen_k if args.seqlen_k > 0 else args.seqlen_q
+    d_v = args.d_v if args.d_v > 0 else args.d_qk
+
+    row = benchmark_flash_attn_output(
+        args.batch_size,
+        args.nheads,
+        nheads_k,
+        args.seqlen_q,
+        seqlen_k,
+        args.d_qk,
+        d_v,
+        causal=args.causal,
+        local=args.local,
+        validate=not args.no_validate,
+        warmup=args.warmup,
+        repeat=args.iters,
+    )
+    _print_benchmark_summary([row])
