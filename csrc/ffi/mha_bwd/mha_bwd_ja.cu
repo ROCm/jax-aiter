@@ -17,6 +17,7 @@
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
+#include "ck_tile/host/pinned_host_releaser.hpp"
 #include "hip_utils.h"
 #include "mha_bwd.h"
 #include "mha_common_utils.cu"
@@ -43,7 +44,12 @@ struct WorkspacePool {
       cap = bytes;
       dev = cur_dev;
     }
-    if (zero) hipMemsetAsync(ptr, 0, bytes, stream);
+    if (zero) {
+      // Zero the full pooled slab. Partial zero of `bytes` leaves stale data
+      // when a smaller request reuses a larger prior allocation (CK bwd then
+      // ASM v3 dq_acc on gfx950).
+      hipMemsetAsync(ptr, 0, cap, stream);
+    }
     return ptr;
   }
 
@@ -55,7 +61,8 @@ struct WorkspacePool {
   }
 };
 
-static thread_local WorkspacePool s_workspace_pool;
+static thread_local WorkspacePool s_ck_workspace_pool;
+static thread_local WorkspacePool s_asm_workspace_pool;
 static thread_local WorkspacePool s_dk_exp_pool;
 static thread_local WorkspacePool s_dv_exp_pool;
 static thread_local WorkspacePool s_dbias_pool;
@@ -194,14 +201,19 @@ ffi::Error MhaBwdUnified_Bridge(
     seed_ptr = dummy_rng; offset_ptr = dummy_rng + 1;
   }
 
-  auto workspace_alloc = [stream](size_t bytes, bool zero_init) -> void* {
-    return s_workspace_pool.get(bytes, stream, zero_init);
+  auto workspace_alloc = [use_asm_v3, stream](size_t bytes, bool zero_init) -> void* {
+    auto &pool = use_asm_v3 ? s_asm_workspace_pool : s_ck_workspace_pool;
+    return pool.get(bytes, stream, zero_init);
   };
 
+  // Deleter runs from hipLaunchHostFunc on the driver helper thread; calling
+  // hipHostFree there deadlocks against main-thread HIP calls. Defer release.
   auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
     void *p = nullptr;
     HIP_CHECK(hipHostMalloc(&p, bytes, hipHostMallocDefault));
-    return std::shared_ptr<void>(p, [](void *q) { HIP_CHECK(hipHostFree(q)); });
+    return std::shared_ptr<void>(p, [](void *q) {
+      ck_tile::pinned_host_releaser::instance().enqueue(q);
+    });
   };
 
   // MQA/GQA expansion

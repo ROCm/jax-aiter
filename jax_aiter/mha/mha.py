@@ -368,6 +368,32 @@ def mha_bwd_unified(dout, q, k, v, out, lse, dropout_p, softmax_scale,
 # Simplified forward/backward dispatch (no can_impl_* logic)
 # ---------------------------------------------------------------------------
 
+def _asm_v3_bwd_eligible(sq, sk, hq, hk, dq, dropout_p, causal, wl, wr,
+                         bias, alibi_slopes):
+    """True when gfx950 should use ASM v3 bwd (faster path for hd64/hd128)."""
+    if get_gfx() != "gfx950":
+        return False
+    if dq not in (64, 128) or dq % 8 != 0:
+        return False
+    if hq % hk != 0:
+        return False
+    if dropout_p > 0:
+        return False
+    if bias is not None and bias.size > 0:
+        return False
+    if alibi_slopes is not None and alibi_slopes.size > 0:
+        return False
+    swa = (wl > 0) or (wr >= 0 and wr != -1)
+    if swa:
+        return False
+    if causal and sq > sk:
+        return False
+    # ASM hd128 decode (sq=1, long KV) produces NaN dk after JAX gemm autotune.
+    if sq == 1 and sk > 256 and dq == 128:
+        return False
+    return True
+
+
 def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal,
                         wl, wr, bias, alibi_slopes,
                         return_lse, return_softmax,
@@ -407,14 +433,22 @@ def _flash_attn_backward(dout, q, k, v, out, lse,
     if causal and get_gfx() == "gfx950" and sq > sk:
         use_v3 = False
 
-    # gfx950 1-block override: sk<=256 with hd in (64,128]
+    # gfx950 1-block: sk<=256, hd in (64,128] → non-atomic ASM v3 bwd kernels.
     is_950_1block = (
         get_gfx() == "gfx950" and sk <= 256
         and dq > 64 and dq <= 128 and dq % 8 == 0
     )
-    bwd_det = False if is_950_1block else deterministic
-    use_v3_bwd = False if is_950_1block else use_v3
-    bwd_atomic = False if is_950_1block else use_v3_bwd
+    asm_bwd = _asm_v3_bwd_eligible(
+        sq, sk, hq, hk, dq, dropout_p, causal, wl, wr, bias, alibi_slopes)
+    if asm_bwd:
+        # ASM v3 bwd rejects is_deterministic.
+        bwd_det = False
+        use_v3_bwd = use_v3
+        bwd_atomic = False if is_950_1block else use_v3_bwd
+    else:
+        bwd_det = deterministic
+        use_v3_bwd = use_v3
+        bwd_atomic = use_v3_bwd
 
     results = mha_bwd_unified(
         dout, q, k, v, out, lse,
@@ -724,7 +758,19 @@ def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
     if causal and get_gfx() == "gfx950" and max_seqlen_k > 256:
         use_v3 = False
 
-    bwd_atomic = use_v3
+    dq_dim = q_p.shape[-1]
+    is_950_1block = (
+        get_gfx() == "gfx950" and max_seqlen_k <= 256
+        and dq_dim > 64 and dq_dim <= 128 and dq_dim % 8 == 0
+    )
+    asm_bwd = _asm_v3_bwd_eligible(
+        max_seqlen_q, max_seqlen_k, hq, hk, dq_dim, res_dp, res_causal,
+        res_ws[0], res_ws[1], None, None)
+    if asm_bwd:
+        res_det = False
+        bwd_atomic = False if is_950_1block else use_v3
+    else:
+        bwd_atomic = use_v3
 
     results = mha_bwd_unified(
         dout, q_p, k_p, v_p, out_p, lse,

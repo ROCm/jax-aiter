@@ -16,6 +16,54 @@ import jax.numpy as jnp
 import numpy as np
 
 from jax_aiter.mha import flash_attn_func, flash_attn_varlen
+from jax_aiter.ja_compat.chip_info import get_gfx
+
+
+# gfx950 ASM v3 backward kernels cover hd64/hd128 (not hd32/d40/etc.).
+# ASM-eligible bwd tests use deterministic=False (ASM v3 rejects det=True).
+_ASM_BWD_HEAD_DIMS = frozenset({64, 128})
+
+
+def _asm_bwd_eligible(*, d, sq, sk, hq, hk, causal=False, dropout_p=0.0,
+                      has_bias=False, has_alibi=False, window_size=(-1, -1)):
+    """True when gfx950 should use ASM v3 bwd (hd64/hd128, no dropout/bias/etc.)."""
+    if get_gfx() != "gfx950":
+        return False
+    if d not in _ASM_BWD_HEAD_DIMS or d % 8 != 0:
+        return False
+    if hq % hk != 0:
+        return False
+    if dropout_p > 0 or has_bias or has_alibi:
+        return False
+    wl, wr = window_size
+    if wl > 0 or (wr >= 0 and wr != -1):
+        return False
+    if causal and sq > sk:
+        return False
+    if sq == 1 and sk > 256 and d == 128:
+        return False
+    return True
+
+
+def _bwd_kwargs_for_config(*, d, sq, sk, hq, hk, **kw):
+    """Apply deterministic=False when gfx950 ASM v3 bwd is used."""
+    eligible = _asm_bwd_eligible(
+        d=d, sq=sq, sk=sk, hq=hq, hk=hk,
+        causal=kw.get("causal", False),
+        dropout_p=kw.get("dropout_p", 0.0),
+        has_bias=kw.get("bias") is not None,
+        has_alibi=kw.get("alibi_slopes") is not None,
+        window_size=kw.get("window_size", (-1, -1)),
+    )
+    if eligible:
+        return {**kw, "deterministic": False}
+    return kw
+
+
+def _bwd_kwargs_from_qkv(q, k, v, **kw):
+    return _bwd_kwargs_for_config(
+        d=q.shape[-1], sq=q.shape[1], sk=v.shape[1],
+        hq=q.shape[2], hk=k.shape[2], **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +153,7 @@ def run_fwd(q, k, v, **kw):
 
 
 def run_bwd(q, k, v, **kw):
+    kw = _bwd_kwargs_from_qkv(q, k, v, **kw)
     def loss(q, k, v):
         return jnp.sum(run_fwd(q, k, v, **kw))
     return jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
@@ -117,6 +166,9 @@ def run_varlen_fwd(q, k, v, cu_sq, cu_sk, msq, msk, **kw):
 
 
 def run_varlen_bwd(q, k, v, cu_sq, cu_sk, msq, msk, **kw):
+    kw = _bwd_kwargs_for_config(
+        d=q.shape[-1], sq=msq, sk=msk,
+        hq=q.shape[1], hk=k.shape[1], **kw)
     def loss(q, k, v):
         return jnp.sum(run_varlen_fwd(q, k, v, cu_sq, cu_sk, msq, msk, **kw))
     return jax.grad(loss, argnums=(0, 1, 2))(q, k, v)
@@ -238,9 +290,11 @@ def test_batch_bwd_accuracy(b, sq, sk, hq, hk, d, dtype):
         pytest.xfail(f"Known backward accuracy issue for d={d} on gfx950")
     q, k_t, v = make_qkv(b, sq, sk, hq, hk, d, dtype, seed=2)
     scale = d ** (-0.5)
+    bwd_kw = _bwd_kwargs_for_config(
+        d=d, sq=sq, sk=sk, hq=hq, hk=hk)
 
     def aiter_loss(q, k, v):
-        return jnp.sum(run_fwd(q, k, v, softmax_scale=scale))
+        return jnp.sum(run_fwd(q, k, v, softmax_scale=scale, **bwd_kw))
     def ref_loss(q, k, v):
         return jnp.sum(attention_ref(q, k, v, scale=scale).astype(dtype))
 
