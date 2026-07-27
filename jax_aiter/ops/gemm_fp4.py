@@ -52,7 +52,8 @@ def gemm_fp4(a_packed, b_packed, a_scale, b_scale):
 
 
 def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
-               use_sr=False, scale_margin=0, scale_mode=0, use_2d_scale=False):
+               use_sr=False, scale_margin=0, scale_mode=0, use_2d_scale=False,
+               offset_mode=0):
     """Fused BF16 -> MXFP4 quantization + shuffle via HIP kernel (single FFI call).
 
     Args:
@@ -68,6 +69,8 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
             entries survive the FP4 cast (fixes under-flush) at the cost of
             clipping the largest entries. Default ``0`` => byte-identical to the
             legacy ``exp-2`` cast.
+        offset_mode: Stable backend offset selector encoded as an integer
+            (0=off, 1=auto, 2=force64). Generic callers default to off.
 
     Returns:
         (fp4_packed, scales):
@@ -92,13 +95,14 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
     return call(x, shuffle_fp4=shuffle_fp4,
                 shuffle_scales=shuffle_scales, use_hadamard=use_hadamard,
                 use_sr=use_sr, scale_margin=np.int32(scale_margin),
-                scale_mode=np.int32(scale_mode), use_2d_scale=use_2d_scale)
+                scale_mode=np.int32(scale_mode), use_2d_scale=use_2d_scale,
+                offset_mode=np.int32(offset_mode))
 
 
 def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
                      shuffle_scales=True, use_hadamard=False, use_sr=False,
                      scale_margin=0, use_hadamard_col=None, use_sr_col=None,
-                     scale_mode=0, use_2d_scale=False):
+                     scale_mode=0, use_2d_scale=False, offset_mode=0):
     """Fused BF16 -> MXFP4 with BOTH rowwise and columnwise output in one kernel launch.
 
     Returns rowwise (for forward GEMM) + columnwise (for dA/dB backward GEMM).
@@ -124,6 +128,8 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
             dual launch emit asymmetric row/col Hadamard (no frontend split cast).
         use_sr_col: Stochastic rounding for the COLWISE output, independent of
             ``use_sr``. ``None`` (default) => same as ``use_sr``.
+        offset_mode: Stable backend offset selector encoded as an integer
+            (0=off, 1=auto, 2=force64). Generic callers default to off.
 
     Returns:
         (row_fp4, row_scale, col_fp4, col_scale):
@@ -160,7 +166,9 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
     )
     return call(x, shuffle_fp4=shuffle_fp4,
                 shuffle_colwise_fp4=shuffle_colwise_fp4,
+                shuffle_scales=shuffle_scales,
                 use_hadamard=use_hadamard, use_hadamard_col=use_hadamard_col,
                 use_sr=use_sr, use_sr_col=use_sr_col,
                 scale_margin=np.int32(scale_margin),
-                scale_mode=np.int32(scale_mode), use_2d_scale=use_2d_scale)
+                scale_mode=np.int32(scale_mode), use_2d_scale=use_2d_scale,
+                offset_mode=np.int32(offset_mode))
