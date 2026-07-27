@@ -1,0 +1,48 @@
+diff --git a/xla/stream_executor/rocm/rocm_command_buffer.cc b/xla/stream_executor/rocm/rocm_command_buffer.cc
+index 54984a85a4..5e88d4e17e 100644
+--- a/xla/stream_executor/rocm/rocm_command_buffer.cc
++++ b/xla/stream_executor/rocm/rocm_command_buffer.cc
+@@ -493,6 +493,20 @@ RocmCommandBuffer::~RocmCommandBuffer() {
+         !status.ok()) {
+       LOG(ERROR) << status.message();
+     }
++    // ROCm does not return HIP graph memory-pool reservations to the OS on
++    // hipGraphExecDestroy. Without an explicit trim, executable graphs
++    // instantiated under NEVER_UPDATE (which keeps stable command-buffer-visible
++    // addresses, so buffers captured at record time stay resident) accumulate
++    // graph-pool memory that is never reclaimed -- a large VRAM leak that
++    // survives process teardown and even GPU reset on ROCm 7.14. Trim the
++    // device graph mem pool after destroying the exec so its backing memory is
++    // returned. `hipDeviceGraphMemTrim` takes a device ordinal (no need to set
++    // the current device) and is a no-op when the pool is already empty.
++    if (auto status = ToStatus(hipDeviceGraphMemTrim(device_ordinal_),
++                               "Failed to trim HIP device graph memory pool");
++        !status.ok()) {
++      LOG(ERROR) << status.message();
++    }
+   }
+   if (graph_ != nullptr && is_owned_graph_) {
+     if (auto status =
+diff --git a/xla/stream_executor/rocm/rocm_command_buffer.h b/xla/stream_executor/rocm/rocm_command_buffer.h
+index 49f0a2b2ab..8c9787376c 100644
+--- a/xla/stream_executor/rocm/rocm_command_buffer.h
++++ b/xla/stream_executor/rocm/rocm_command_buffer.h
+@@ -54,6 +54,7 @@ class RocmCommandBuffer : public GpuCommandBuffer {
+   RocmCommandBuffer(Mode mode, StreamExecutor* executor, hipGraph_t graph,
+                     bool is_owned_graph)
+       : GpuCommandBuffer(mode, executor),
++        device_ordinal_(executor->device_ordinal()),
+         graph_(graph),
+         is_owned_graph_(is_owned_graph) {}
+ 
+@@ -176,6 +177,10 @@ class RocmCommandBuffer : public GpuCommandBuffer {
+ 
+   RocmCommandBuffer* parent_ = nullptr;
+ 
++  // Device ordinal captured at construction (GpuCommandBuffer::executor_ is
++  // private); used to trim the HIP graph memory pool on destruction.
++  int device_ordinal_ = 0;
++
+   hipGraph_t graph_ = nullptr;
+   bool is_owned_graph_ = true;
+   hipGraphExec_t exec_ = nullptr;

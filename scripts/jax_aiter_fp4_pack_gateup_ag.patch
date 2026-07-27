@@ -1,0 +1,388 @@
+--- a/jax_aiter/gemm_fp4/gemm_fp4.py
++++ b/jax_aiter/gemm_fp4/gemm_fp4.py
+@@ -86,6 +86,25 @@
+     grad entries, and can STACK with ``JA_FP4_SCALE_MARGIN``. Differs from the
+     global ``AITER_FP4_SR=1`` (SR on every cast).
+     **Unset (default) => RNE everywhere (byte-identical).** Reversible.
++``JA_FP4_PACK_GATEUP_AG=1``
++    Quantize the MLP gate/up weight ALL-GATHER (Lever B, advanced, opt-in).
++    Under pure FSDP the gate/up DenseGeneral weight shards its contraction-K
++    (``embed``) axis, so the rowwise MXFP4 weight cast (which declares its output
++    K-replicated) forces XLA to all-gather the FULL weight in **bf16** before the
++    cast. This flag makes the weight cast run LOCALLY on each K-shard (emitting
++    packed FP4 + scales sharded on K, rowwise UNSHUFFLED) and gathers the **packed
++    u8** operand along the FSDP axis INSIDE the fwd GEMM partition, where it is
++    re-assembled with ``shuffle_weight`` / ``e8m0_shuffle`` before the ASM kernel.
++    Cuts the gate/up weight all-gather from bf16 -> packed-FP4 (~3.76x less
++    volume, ~-5.5 GB/step) with NO numeric change: MXFP4 block=32 along K and the
++    per-shard K = embed/fsdp = 16*32 so blocks never cross a shard boundary
++    (Hadamard is within-block) -- the per-shard cast is byte-identical to the
++    full-K cast, and the gather/shuffle reconstruction is exact (verified). The
++    colwise (dgrad) weight cast becomes K-sharded on its OUTPUT axis, which the
++    existing GEMM partition gathers as packed u8 too (shuffle-compatible along the
++    output axis). **Unset / 0 (default) => byte-identical to the legacy bf16
++    weight all-gather (the cast forces K-replication as before).** Reversible:
++    flag-gated registration, no kernel rebuild.
+ ``JA_CAPTURE_DIR=<dir>``
+     Offline-probe capture hook (debug / analysis only). When set, the
+     forward dumps the bf16 ``(a, b)`` operands and the backward dumps the
+@@ -329,14 +348,25 @@
+ # ---------------------------------------------------------------------------
+ _WT2D = os.environ.get("JA_FP4_WT2D", "0") == "1"
+ 
++
++# ---------------------------------------------------------------------------
++# Lever B -- quantized gate/up weight all-gather (opt-in via
++# JA_FP4_PACK_GATEUP_AG=1). See the module docstring. Default OFF =>
++# byte-identical bf16 weight all-gather (rowwise/dual weight casts force
++# K-replication, exactly as before).
++# ---------------------------------------------------------------------------
++_PACK_GATEUP_AG = os.environ.get("JA_FP4_PACK_GATEUP_AG", "0") == "1"
++
+ # Policy log: emit the resolved DGRAD-cast scale margin once at import so each
+ # training leg's log records exactly which margin its grad cast used.
+ print("[ja-fp4] DGRAD cast scale_margin = %d "
+       "(E8M0 scale 2^(exp-2-margin); 0 = legacy/bit-identical) | "
+       "OAS scale_mode = %d (1 = floor/overflow-aware) | WT2D = %s "
+-      "(2D 32x32 weight scale) | "
++      "(2D 32x32 weight scale) | pack_gateup_ag = %s "
++      "(Lever B: quantized gate/up weight all-gather) | "
+       "SR roles: grad=%s dgrad_row=%s wgrad_col=%s act=%s wt=%s | hadamard_passes=%s"
+-      % (_SCALE_MARGIN, _OAS_MODE, _WT2D, _SR_GRAD, _SR_DGRAD_ROW, _SR_WGRAD_COL,
++      % (_SCALE_MARGIN, _OAS_MODE, _WT2D, _PACK_GATEUP_AG,
++         _SR_GRAD, _SR_DGRAD_ROW, _SR_WGRAD_COL,
+          _SR_ACT, _SR_WT,
+          "legacy_grad" if _HADAMARD_LEGACY_GRAD else ",".join(sorted(_HADAMARD_PASSES))),
+       flush=True)
+@@ -512,6 +542,52 @@
+     )
+ 
+ 
++# ----- Lever B: K-sharded weight cast helpers (JA_FP4_PACK_GATEUP_AG) -----
++# When the weight's contraction-K axis is FSDP-sharded (gate/up), the rowwise
++# weight cast runs LOCALLY on each K-shard and emits the FP4 data + scales
++# UNSHUFFLED (shuffle_fp4=False, shuffle_scales=False). Unshuffled packed bytes
++# and linear scales concatenate cleanly along K, so the fwd GEMM partition can
++# all-gather the packed u8 along the FSDP axis and re-assemble the kernel layout
++# with shuffle_weight / e8m0_shuffle. (Shuffled rowwise output would entangle
++# K-blocks into the row axis and could NOT be gathered along K.)
++
++def _cast_wt_row_unshuf_raw(x):
++    """Rowwise weight cast, UNSHUFFLED (Lever B K-sharded path).
++
++    Emits packed FP4 + LINEAR E8M0 scales (no B-preshuffle, no scale shuffle) so
++    the per-K-shard outputs concatenate cleanly along K. The fwd GEMM partition
++    shuffles the gathered full-K operand before the ASM kernel.
++    """
++    return _cast_mxfp4_op(x, shuffle_fp4=False, shuffle_scales=False,
++                          use_hadamard=_h_wt_row(), use_sr=_SR_WT,
++                          scale_mode=_OAS_MODE)
++
++
++def _cast_wt_dual_ksharded_raw(x):
++    """Weight dual-cast for a K-sharded weight (Lever B).
++
++    Rowwise output is UNSHUFFLED (gathered + shuffled later in the fwd GEMM);
++    colwise output is SHUFFLED as usual (its gather, along the OUTPUT axis, is
++    shuffle-compatible). Two launches because the rowwise needs unshuffled scales
++    while the colwise needs shuffled scales (the dual kernel shares one
++    shuffle_scales flag). Byte-identical VALUES to ``_cast_wt_dual_raw`` -- only
++    the rowwise shuffle/scale-shuffle layout differs (re-applied after gather).
++    """
++    r_packed, r_scale = _cast_wt_row_unshuf_raw(x)
++    _, _, c_packed, c_scale = _cast_mxfp4_dual_op(
++        x,
++        shuffle_fp4=True,
++        shuffle_colwise_fp4=True,
++        use_hadamard=_h_wt_row(),
++        use_hadamard_col=_h_wt_col(),
++        use_sr=_SR_WT,
++        use_sr_col=_SR_WT,
++        scale_mode=_OAS_MODE,
++        use_2d_scale=_WT2D,
++    )
++    return r_packed, r_scale, c_packed, c_scale
++
++
+ def _cast_grad_dual_raw(x):
+     """Grad dual-cast: rowwise unshuffled + columnwise unshuffled, Hadamard ON.
+ 
+@@ -548,6 +624,35 @@
+     return info.sharding.spec
+ 
+ 
++# ----- Lever B: K-shard padding-alignment guard (JA_FP4_PACK_GATEUP_AG) -------
++# The fused MXFP4 cast pads its E8M0 scale column count to a multiple of 8 and
++# its row/col extents to a multiple of 256. A per-K-shard cast therefore tiles
++# cleanly under the declared K-sharding ONLY when each shard's K is a multiple of
++# 256 (=> scale columns K_shard/32 is a multiple of 8 and the 256-pad is a no-op).
++# Canonical 8B: embed=4096 / fsdp=8 = 512 (aligned). When NOT aligned the
++# packed-AG path falls back to the legacy bf16 weight all-gather (still correct).
++
++def _mesh_axis_size(mesh, axis):
++    if axis is None:
++        return 1
++    if isinstance(axis, tuple):
++        s = 1
++        for ax in axis:
++            s *= mesh.shape[ax]
++        return s
++    return mesh.shape[axis]
++
++
++def _kshard_packed_ag_ok(mesh, k_axis, k_global):
++    """True iff a K-sharded weight can use the packed-FP4 all-gather path."""
++    if k_axis is None:
++        return False
++    n = _mesh_axis_size(mesh, k_axis)
++    if n <= 1 or (k_global % n) != 0:
++        return False
++    return (k_global // n) % 256 == 0
++
++
+ # ----- rowwise-only casts (act / wt) for the forward-only primal -----
+ 
+ @custom_partitioning
+@@ -583,18 +688,63 @@
+     return _partition
+ 
+ 
++# ----- Lever B: K-sharded-aware rowwise weight cast (JA_FP4_PACK_GATEUP_AG) ---
++# Allows the weight's contraction-K axis to stay FSDP-sharded: the cast runs
++# locally on the K-shard and emits UNSHUFFLED packed FP4 + linear scales sharded
++# on K (gathered + shuffled later in the fwd GEMM). When K is NOT sharded (down
++# proj, or unsharded) it behaves exactly like the legacy rowwise weight cast.
++
++def _cast_wt_rowwise_infer_ag(mesh, arg_shapes, result_shape):
++    x_spec = _get_spec(arg_shapes[0])
++    m_axis = x_spec[0]
++    k_axis = x_spec[1] if len(x_spec) > 1 else None
++    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
++        return (NamedSharding(mesh, P(m_axis, k_axis)),
++                NamedSharding(mesh, P(m_axis, k_axis)))
++    return _cast_rowwise_infer_sharding(mesh, arg_shapes, result_shape)
++
++
++def _cast_wt_rowwise_partition_ag(mesh, arg_shapes, result_shape):
++    x_spec = _get_spec(arg_shapes[0])
++    m_axis = x_spec[0]
++    k_axis = x_spec[1] if len(x_spec) > 1 else None
++    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
++        in_spec = P(m_axis, k_axis)
++        out_spec = P(m_axis, k_axis)
++        raw_fn = _cast_wt_row_unshuf_raw
++    else:
++        in_spec = P(m_axis, None)
++        out_spec = P(m_axis, None)
++        raw_fn = _cast_wt_raw
++
++    def _lowered(x):
++        return raw_fn(x)
++
++    return (mesh, _lowered,
++            (NamedSharding(mesh, out_spec), NamedSharding(mesh, out_spec)),
++            (NamedSharding(mesh, in_spec),))
++
++
+ _cast_act.def_partition(
+     _make_rowwise_cast_partition(_cast_act_raw),
+     infer_sharding_from_operands=_cast_rowwise_infer_sharding,
+     sharding_rule="m k -> m kp, m sp",
+     need_replication_factors=("k", "kp", "sp"),
+ )
+-_cast_wt.def_partition(
+-    _make_rowwise_cast_partition(_cast_wt_raw),
+-    infer_sharding_from_operands=_cast_rowwise_infer_sharding,
+-    sharding_rule="m k -> m kp, m sp",
+-    need_replication_factors=("k", "kp", "sp"),
+-)
++if _PACK_GATEUP_AG:
++    _cast_wt.def_partition(
++        _cast_wt_rowwise_partition_ag,
++        infer_sharding_from_operands=_cast_wt_rowwise_infer_ag,
++        sharding_rule="m k -> m kp, m sp",
++        need_replication_factors=(),
++    )
++else:
++    _cast_wt.def_partition(
++        _make_rowwise_cast_partition(_cast_wt_raw),
++        infer_sharding_from_operands=_cast_rowwise_infer_sharding,
++        sharding_rule="m k -> m kp, m sp",
++        need_replication_factors=("k", "kp", "sp"),
++    )
+ 
+ 
+ # ----- dual casts (rowwise + columnwise) for fwd-with-residuals + bwd -----
+@@ -643,11 +793,61 @@
+     return _partition
+ 
+ 
+-for _wrapped, _raw in (
++# ----- Lever B: K-sharded-aware weight dual cast (JA_FP4_PACK_GATEUP_AG) ------
++# For a K-sharded weight (gate/up) the dual cast runs locally on the K-shard:
++#   * rowwise output  -> UNSHUFFLED, sharded on K (axis1) -> fprop B (gathered +
++#     shuffled in the fwd GEMM).
++#   * colwise output  -> SHUFFLED, sharded on K (axis0 = the dgrad OUTPUT axis)
++#     -> dgrad B (gathered as packed u8 by the existing GEMM partition; the
++#     colwise B-preshuffle is shuffle-compatible with a gather along its output
++#     axis, verified).
++# When K is NOT sharded (down proj) it behaves exactly like the legacy weight
++# dual cast (single fused launch, shuffled rowwise).
++
++def _cast_wt_dual_infer_ag(mesh, arg_shapes, result_shape):
++    x_spec = _get_spec(arg_shapes[0])
++    m_axis = x_spec[0]
++    k_axis = x_spec[1] if len(x_spec) > 1 else None
++    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
++        return (NamedSharding(mesh, P(m_axis, k_axis)),
++                NamedSharding(mesh, P(m_axis, k_axis)),
++                NamedSharding(mesh, P(k_axis, None)),
++                NamedSharding(mesh, P(k_axis, None)))
++    return _cast_dual_infer_sharding(mesh, arg_shapes, result_shape)
++
++
++def _cast_wt_dual_partition_ag(mesh, arg_shapes, result_shape):
++    x_spec = _get_spec(arg_shapes[0])
++    m_axis = x_spec[0]
++    k_axis = x_spec[1] if len(x_spec) > 1 else None
++    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
++        in_spec = P(m_axis, k_axis)
++        row_spec = P(m_axis, k_axis)
++        col_spec = P(k_axis, None)
++        raw_fn = _cast_wt_dual_ksharded_raw
++    else:
++        in_spec = P(m_axis, None)
++        row_spec = P(m_axis, None)
++        col_spec = P(None, m_axis)
++        raw_fn = _cast_wt_dual_raw
++
++    def _lowered(x):
++        return raw_fn(x)
++
++    return (mesh, _lowered,
++            (NamedSharding(mesh, row_spec), NamedSharding(mesh, row_spec),
++             NamedSharding(mesh, col_spec), NamedSharding(mesh, col_spec)),
++            (NamedSharding(mesh, in_spec),))
++
++
++_dual_cast_registrations = [
+     (_cast_act_dual,  _cast_act_dual_raw),
+-    (_cast_wt_dual,   _cast_wt_dual_raw),
+     (_cast_grad_dual, _cast_grad_dual_raw),
+-):
++]
++if not _PACK_GATEUP_AG:
++    _dual_cast_registrations.append((_cast_wt_dual, _cast_wt_dual_raw))
++
++for _wrapped, _raw in _dual_cast_registrations:
+     _wrapped.def_partition(
+         _make_dual_cast_partition(_raw),
+         infer_sharding_from_operands=_cast_dual_infer_sharding,
+@@ -655,6 +855,14 @@
+         need_replication_factors=("k", "rkp", "rsp", "cmp", "csp"),
+     )
+ 
++if _PACK_GATEUP_AG:
++    _cast_wt_dual.def_partition(
++        _cast_wt_dual_partition_ag,
++        infer_sharding_from_operands=_cast_wt_dual_infer_ag,
++        sharding_rule="m k -> m rkp, m rsp, k cmp, k csp",
++        need_replication_factors=(),
++    )
++
+ 
+ # ---------------------------------------------------------------------------
+ # FP4 GEMM forward / dgrad (NN layout, K is contraction).
+@@ -718,12 +926,86 @@
+              NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec)))
+ 
+ 
+-_fp4_ffi_partitioned.def_partition(
+-    _fp4_partition,
+-    infer_sharding_from_operands=_fp4_infer_sharding,
+-    sharding_rule="m kp, n kp, m ks, n ks -> m n",
+-    need_replication_factors=("kp", "ks"),
+-)
++# ----- Lever B: K-sharded-b fwd GEMM with packed all-gather (PACK_GATEUP_AG) --
++# For gate/up the rowwise weight B arrives K-sharded (axis1 = contraction) and
++# UNSHUFFLED (from the Lever-B weight cast), while A (activation) has full K
++# (sharded on M). The partition all-gathers the packed u8 B + its linear scales
++# along the FSDP axis, re-assembles the ASM layout (shuffle_weight / e8m0_shuffle)
++# and runs the GEMM -- replacing the legacy bf16 weight all-gather with a
++# ~3.76x-smaller packed-FP4 all-gather. When B's K axis is NOT sharded (down,
++# dgrad, attention, replicated) it defers to the legacy ``_fp4_partition``.
++
++def _fp4_b_k_axis(mesh, arg_shapes):
++    """Return b's K (axis1, contraction) mesh axis iff it is sharded AND the
++    packed all-gather path is padding-aligned; else None (legacy)."""
++    b_spec = _get_spec(arg_shapes[1])
++    b_k = b_spec[1] if b_spec is not None and len(b_spec) > 1 else None
++    # arg_shapes[1] is the PACKED weight [N, K/2]; K_global = (K/2)*2.
++    k_global = arg_shapes[1].shape[1] * 2
++    return b_k if _kshard_packed_ag_ok(mesh, b_k, k_global) else None
++
++
++def _fp4_infer_ag(mesh, arg_shapes, result_shape):
++    b_k = _fp4_b_k_axis(mesh, arg_shapes)
++    if b_k is not None:
++        a_spec = _get_spec(arg_shapes[0])
++        b_spec = _get_spec(arg_shapes[1])
++        a_m = a_spec[0]
++        b_n = b_spec[0]
++        if b_n == a_m:
++            b_n = None
++        return NamedSharding(mesh, P(a_m, b_n))
++    return _fp4_infer_sharding(mesh, arg_shapes, result_shape)
++
++
++def _fp4_partition_ag(mesh, arg_shapes, result_shape):
++    a_spec = _get_spec(arg_shapes[0])
++    b_spec = _get_spec(arg_shapes[1])
++    b_k = _fp4_b_k_axis(mesh, arg_shapes)
++
++    if b_k is None:
++        # No K-sharded B operand -> legacy behavior (down / dgrad / replicated).
++        return _fp4_partition(mesh, arg_shapes, result_shape)
++
++    a_m = a_spec[0]
++    b_n = b_spec[0]
++    out_n = None if b_n == a_m else b_n
++    ag_axis = b_k
++
++    a_pspec = P(a_m, None)        # activation: M-sharded, full K
++    b_pspec = P(b_n, b_k)         # weight: K-sharded (axis1), unshuffled
++    out_pspec = P(a_m, out_n)
++
++    def _lowered(a_packed, b_packed, a_scale, b_scale):
++        # Gather the packed u8 weight + linear scales to full K, then re-assemble
++        # the ASM (B-preshuffle) layout. Concatenation along K is exact for the
++        # unshuffled cast (MXFP4 block=32 never crosses the K-shard boundary).
++        b_full = jax.lax.all_gather(b_packed, ag_axis, axis=1, tiled=True)
++        bs_full = jax.lax.all_gather(b_scale, ag_axis, axis=1, tiled=True)
++        b_sh = shuffle_weight(b_full)
++        bs_sh = e8m0_shuffle(bs_full)
++        return _gemm_fp4_ffi(a_packed, b_sh, a_scale, bs_sh)
++
++    return (mesh, _lowered,
++            NamedSharding(mesh, out_pspec),
++            (NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec),
++             NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec)))
++
++
++if _PACK_GATEUP_AG:
++    _fp4_ffi_partitioned.def_partition(
++        _fp4_partition_ag,
++        infer_sharding_from_operands=_fp4_infer_ag,
++        sharding_rule="m kp, n kp, m ks, n ks -> m n",
++        need_replication_factors=(),
++    )
++else:
++    _fp4_ffi_partitioned.def_partition(
++        _fp4_partition,
++        infer_sharding_from_operands=_fp4_infer_sharding,
++        sharding_rule="m kp, n kp, m ks, n ks -> m n",
++        need_replication_factors=("kp", "ks"),
++    )
+ 
+ 
+ # ---------------------------------------------------------------------------

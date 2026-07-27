@@ -1,0 +1,53 @@
+diff --git a/csrc/ffi/gemm_fwd/gemm_fwd_ja.cu b/csrc/ffi/gemm_fwd/gemm_fwd_ja.cu
+index 580f280..d344bdc 100644
+--- a/csrc/ffi/gemm_fwd/gemm_fwd_ja.cu
++++ b/csrc/ffi/gemm_fwd/gemm_fwd_ja.cu
+@@ -9,6 +9,7 @@
+ // GemmFwd_Bridge is fully command-buffer-compatible: only hipMemsetAsync +
+ // hipModuleLaunchKernel are called during execution.
+ 
++#include <cstdlib>
+ #include <cstring>
+ #include <hip/hip_runtime.h>
+ #include <mutex>
+@@ -239,7 +240,39 @@ GemmFwd_Bridge(
+ 
+   CFG* config_map = &cfg_bf16gemm_fp32bf16;
+ 
+-  auto [name, split] = select_kernel(M, N, K, dev_id, config_map);
++  // -----------------------------------------------------------------------
++  // Default-OFF force hook (kernel-selection sweep, run 20260615). When
++  // AITER_BF16_FORCE_KERNEL is set (non-empty) it bypasses the occupancy
++  // heuristic and forces that cataloged kernel (the mangled _ZN... knl_name,
++  // which is also the cfg map key), with an optional AITER_BF16_FORCE_SPLITK
++  // (gdz). The forced kernel must be present in the pre-loaded cache or the
++  // lookup below fails. Env unset/empty => select_kernel (production behavior
++  // byte-identical / reversible). NOTE: forcing a bPreshuffle!=0 kernel
++  // without a preshuffled B yields WRONG numerics -- the sweep harness gates
++  // every forced cell on a cos-vs-fp32 check, so incorrect cells are detected
++  // and discarded rather than shipped.
++  // -----------------------------------------------------------------------
++  std::string name;
++  int split = 1;
++  const char* force_name = std::getenv("AITER_BF16_FORCE_KERNEL");
++  if (force_name && force_name[0] != '\0') {
++    // cfg_bf16gemm_fp32bf16 keys are arch-prefixed (ADD_CFG concatenates the
++    // adjacent string literals `arch knl_name`), so the caller passes the bare
++    // mangled knl_name (`_ZN5aiter...E`) and we prepend the arch id to form the
++    // map key that select_kernel / lookup_kernel use.
++    name = get_device_info(dev_id).arch_id + std::string(force_name);
++    const char* force_split = std::getenv("AITER_BF16_FORCE_SPLITK");
++    if (force_split && force_split[0] != '\0') {
++      split = std::atoi(force_split);
++      if (split < 1) split = 1;
++    }
++    static std::once_flag bf16_force_log_flag;
++    std::call_once(bf16_force_log_flag, [&name]() {
++      AITER_LOG_INFO("AITER_BF16_FORCE_KERNEL active: forcing kernel " << name);
++    });
++  } else {
++    std::tie(name, split) = select_kernel(M, N, K, dev_id, config_map);
++  }
+   if (name.empty()) {
+     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                       "No suitable GEMM kernel found for these dimensions"
