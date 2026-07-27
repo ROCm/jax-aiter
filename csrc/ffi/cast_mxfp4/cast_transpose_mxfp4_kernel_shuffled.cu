@@ -27,8 +27,6 @@
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
-#include "cast_mxfp4_offset_guard.h"
-
 namespace mxfp4 {
 
 // ============================================================================
@@ -551,7 +549,7 @@ __device__ __forceinline__ int compute_shuffled_fp4_index_2bytes(
  *   3. COLWISE: Each thread group processes one column (via transpose)
  *   4. Store quantized FP4 data and E8M0 scales to global memory
  */
-template<typename OffsetT,
+template<
     bool USE_ROWWISE,
     bool USE_COLWISE,
     bool SHUFFLE_SCALES,
@@ -645,8 +643,7 @@ void cast_transpose_mxfp4_shuffled(
                 const int gcol = tile_n + load_col;
 
                 if (load_row < 32) {
-                    OffsetT in_idx =
-                        (OffsetT)grow * (OffsetT)N + (OffsetT)gcol;
+                    int64_t in_idx = (int64_t)grow * N + gcol;
                     if (grow < M && gcol + 3 < N) {
                         uint64_t packed = *reinterpret_cast<const uint64_t*>(
                             &input[in_idx]
@@ -787,9 +784,7 @@ void cast_transpose_mxfp4_shuffled(
                             *reinterpret_cast<uint16_t*>(rowwise_fp4 + shuffled_idx) = fp4x4;
                         } else {
                             *reinterpret_cast<uint16_t*>(
-                                rowwise_fp4 + (OffsetT)global_row *
-                                (OffsetT)K_packed +
-                                (OffsetT)(global_col_base / 2)
+                                rowwise_fp4 + (int64_t)global_row * K_packed + global_col_base / 2
                             ) = fp4x4;
                         }
                     }
@@ -806,10 +801,7 @@ void cast_transpose_mxfp4_shuffled(
                                     rowwise_scale[idx] = e8m0_scale;
                                 }
                             } else {
-                                rowwise_scale[
-                                    (OffsetT)global_row *
-                                    (OffsetT)rowwise_scale_stride +
-                                    (OffsetT)scale_col] =
+                                rowwise_scale[(int64_t)global_row * rowwise_scale_stride + scale_col] =
                                     e8m0_scale;
                             }
                         }
@@ -884,9 +876,7 @@ void cast_transpose_mxfp4_shuffled(
                             *reinterpret_cast<uint16_t*>(colwise_fp4 + shuffled_idx) = fp4x4;
                         } else {
                             *reinterpret_cast<uint16_t*>(
-                                colwise_fp4 + (OffsetT)global_col *
-                                (OffsetT)M_packed +
-                                (OffsetT)(global_row_base / 2)
+                                colwise_fp4 + (int64_t)global_col * M_packed + global_row_base / 2
                             ) = fp4x4;
                         }
                     }
@@ -903,10 +893,7 @@ void cast_transpose_mxfp4_shuffled(
                                     colwise_scale[idx] = e8m0_scale;
                                 }
                             } else {
-                                colwise_scale[
-                                    (OffsetT)global_col *
-                                    (OffsetT)colwise_scale_stride +
-                                    (OffsetT)scale_col] =
+                                colwise_scale[(int64_t)global_col * colwise_scale_stride + scale_col] =
                                     e8m0_scale;
                             }
                         }
@@ -961,7 +948,6 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int scale_margin,
     int scale_mode,
     bool use_2d_scale,
-    mxfp4::offset_guard::OffsetType offset_type,
     hipStream_t stream
 ) {
     // Grid configuration: tiles of 128x64
@@ -971,8 +957,8 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     // Macro for cleaner kernel launch syntax. Hadamard + SR are now PER-DIRECTION
     // (HAD_R/HAD_C, SR_R/SR_C) so one dual launch can emit asymmetric row/col
     // settings -- removing the frontend split-cast for selective placements.
-    #define LAUNCH_TYPED_KERNEL(OFFSET_T, ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C) \
-        mxfp4::cast_transpose_mxfp4_shuffled<OFFSET_T, ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C> \
+    #define LAUNCH_KERNEL(ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C) \
+        mxfp4::cast_transpose_mxfp4_shuffled<ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C> \
             <<<grid, block, 0, stream>>>( \
                 (const uint16_t*)input, \
                 (uint8_t*)rowwise_fp4, (uint8_t*)rowwise_scale, \
@@ -982,29 +968,6 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
                 rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, \
                 colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad, \
                 scale_margin, scale_mode, use_2d_scale)
-
-    // Keep the generic dispatch on the original int64_t body. Exactly two
-    // production templates have a uint32_t instantiation, avoiding expansion
-    // of the full runtime-template matrix.
-    if (offset_type == mxfp4::offset_guard::OffsetType::kU32) {
-        if (use_rowwise && use_colwise && shuffle_scales &&
-            use_hadamard_row && use_hadamard_col &&
-            !shuffle_rowwise_fp4 && shuffle_colwise_fp4 &&
-            !use_sr_row && !use_sr_col) {
-            LAUNCH_TYPED_KERNEL(uint32_t, true, true, true, true, true, false, true, false, false);
-            return;
-        }
-        if (use_rowwise && use_colwise && shuffle_scales &&
-            use_hadamard_row && use_hadamard_col &&
-            !shuffle_rowwise_fp4 && !shuffle_colwise_fp4 &&
-            !use_sr_row && !use_sr_col) {
-            LAUNCH_TYPED_KERNEL(uint32_t, true, true, true, true, true, false, false, false, false);
-            return;
-        }
-    }
-
-    #define LAUNCH_KERNEL(ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C) \
-        LAUNCH_TYPED_KERNEL(int64_t, ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C)
 
     // Innermost level: select rowwise/colwise enable + fp4-shuffle combos, with
     // the row/col Hadamard + SR template bools already resolved by DISP_HAD/DISP_SR.
@@ -1063,5 +1026,4 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     #undef DISP_SR
     #undef DISP_RC
     #undef LAUNCH_KERNEL
-    #undef LAUNCH_TYPED_KERNEL
 }

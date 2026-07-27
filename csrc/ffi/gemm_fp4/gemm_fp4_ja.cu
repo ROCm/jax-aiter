@@ -260,38 +260,7 @@ GemmFp4Fwd_Bridge(
     }
   }
 
-  // ---------------------------------------------------------------------
-  // Default-OFF shape-selective override (Sub-project B kv-wgrad ablation).
-  // When AITER_FP4_KVWGRAD_128x512 is set (non-empty, not "0") AND the GEMM
-  // (M,N,K) matches the 8B attn k/v-projection wgrad shape, dispatch
-  // BpreShuffle_128x512 with log2_split=1 (= splitK=2) instead of the
-  // production-forced 256x256/splitK=1. This is checked BEFORE the FORCE env
-  // so it takes precedence over AITER_FORCE_KERNEL_NAME, letting a controlled
-  // A/B retarget ONLY the kv-wgrad GEMM while every other GEMM stays on the
-  // FORCE pin. Default (env unset / empty / "0") => production behavior is
-  // byte-identical (no-op). Shape convention here matches this handler's own
-  // decode above: M = A.dim0, N = B.dim0, K = A.dim1*2. Microbench
-  // (mxfp4_analysis/runs/20260606_8b_fp4_kernsweep_097): kv-wgrad
-  // 128x512/sK2 = 0.164 ms vs forced 256x256/sK1 = 0.212 ms.
-  // ---------------------------------------------------------------------
-  bool kvwgrad_override = false;
-  const char* kvwgrad_env = std::getenv("AITER_FP4_KVWGRAD_128x512");
-  if (!dispatch_override && kvwgrad_env && kvwgrad_env[0] != '\0' && kvwgrad_env[0] != '0') {
-    if (M == 1024 && N == 4096 && K == 32768) {
-      knl_name = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E";
-      log2_split = 1;
-      kvwgrad_override = true;
-      static std::once_flag kvwgrad_log_flag;
-      std::call_once(kvwgrad_log_flag, [M, N, K]() {
-        fprintf(stderr,
-                "[ja-kvwgrad-override] AITER_FP4_KVWGRAD_128x512 active: "
-                "M=%d N=%d K=%d -> BpreShuffle_128x512 log2_split=1 (splitK=2)\n",
-                M, N, K);
-      });
-    }
-  }
-
-  if (!dispatch_override && !kvwgrad_override) {
+  if (!dispatch_override) {
     const char* force_name = std::getenv("AITER_FORCE_KERNEL_NAME");
     if (force_name && force_name[0] != '\0') {
       knl_name = force_name;

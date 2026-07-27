@@ -98,12 +98,6 @@ Env vars (advanced)
     weight is no longer stashed. **Unset / 0 (default) => the packed dgrad
     re-casts (byte-identical legacy behavior).** Reversible: frontend-only,
     trace-time flag, no kernel rebuild.
-``JA_MXFP4_OFFSET_MODE=off|auto|force64``
-    Offset-width selector for production activation and gradient dual casts
-    only. ``off`` (default) and ``force64`` use the unchanged 64-bit kernel.
-    ``auto`` may use the guarded 32-bit specialization; failed guards and
-    non-production templates use that same 64-bit kernel. Weight casts and
-    generic quantizer calls stay ``off``.
 ``JA_FP4_SCALE_MARGIN=<int>``
     E8M0 under-flush headroom for the DGRAD (gradient) cast (B2). The fused cast
     kernel computes the per-32-block scale as ``2^(exp - 2 - scale_margin)``;
@@ -201,28 +195,6 @@ except Exception as exc:  # pragma: no cover -- build-time error path
         "Build the AITER FFI modules with 'make ja_mods' before importing "
         "jax_aiter.gemm_fp4.".format(exc)
     ) from exc
-
-
-# ---------------------------------------------------------------------------
-# Guarded MXFP4 offset-width prototype. This is the sole user control; its
-# stable integer is forwarded into the FFI backend config so HLO records it.
-# Unknown values fail closed during import.
-# ---------------------------------------------------------------------------
-_MXFP4_OFFSET_MODE_VALUES = {"off": 0, "auto": 1, "force64": 2}
-
-
-def _parse_mxfp4_offset_mode(raw=None):
-    if raw is None:
-        raw = os.environ.get("JA_MXFP4_OFFSET_MODE", "off")
-    if raw not in _MXFP4_OFFSET_MODE_VALUES:
-        allowed = "|".join(_MXFP4_OFFSET_MODE_VALUES)
-        raise ValueError(
-            f"JA_MXFP4_OFFSET_MODE must be {allowed}; got {raw!r}"
-        )
-    return _MXFP4_OFFSET_MODE_VALUES[raw]
-
-
-_MXFP4_OFFSET_MODE = _parse_mxfp4_offset_mode()
 
 
 # Hadamard "force-on for ALL casts" override. Default is grad-only.
@@ -641,8 +613,7 @@ def _h_grad_col():
 
 def _cast_dual_selective(x, *, shuffle_fp4, shuffle_colwise_fp4,
                          row_hadamard, col_hadamard, row_sr, col_sr,
-                         scale_margin=0, scale_mode=0, use_2d_scale=False,
-                         offset_mode=0):
+                         scale_margin=0, scale_mode=0, use_2d_scale=False):
     """Dual-cast with independent row/col Hadamard/SR in ONE fused launch.
 
     The fused dual-cast kernel takes PER-DIRECTION Hadamard + SR flags
@@ -664,7 +635,6 @@ def _cast_dual_selective(x, *, shuffle_fp4, shuffle_colwise_fp4,
         scale_margin=scale_margin,
         scale_mode=scale_mode,
         use_2d_scale=use_2d_scale,
-        offset_mode=offset_mode,
     )
 
 
@@ -674,7 +644,7 @@ def _cast_act_raw(x):
     Used by the forward-only primal path (no autograd).
     """
     return _cast_mxfp4_op(x, shuffle_fp4=False, use_hadamard=_h_act_row(),
-                          use_sr=_SR_ACT, scale_mode=_OAS_MODE, offset_mode=0)
+                          use_sr=_SR_ACT, scale_mode=_OAS_MODE)
 
 
 def _cast_wt_raw(x):
@@ -683,7 +653,7 @@ def _cast_wt_raw(x):
     Used by the forward-only primal path (no autograd).
     """
     return _cast_mxfp4_op(x, shuffle_fp4=True, use_hadamard=_h_wt_row(),
-                          use_sr=_SR_WT, scale_mode=_OAS_MODE, offset_mode=0)
+                          use_sr=_SR_WT, scale_mode=_OAS_MODE)
 
 
 def _cast_act_dual_raw(x):
@@ -701,7 +671,6 @@ def _cast_act_dual_raw(x):
         row_sr=_SR_ACT,
         col_sr=_SR_ACT,
         scale_mode=_OAS_MODE,
-        offset_mode=_MXFP4_OFFSET_MODE,
     )
 
 
@@ -742,7 +711,7 @@ def _cast_wt_row_unshuf_raw(x):
     """
     return _cast_mxfp4_op(x, shuffle_fp4=False, shuffle_scales=False,
                           use_hadamard=_h_wt_row(), use_sr=_SR_WT,
-                          scale_mode=_OAS_MODE, offset_mode=0)
+                          scale_mode=_OAS_MODE)
 
 
 def _cast_wt_dual_ksharded_raw(x):
@@ -766,7 +735,6 @@ def _cast_wt_dual_ksharded_raw(x):
         use_sr_col=_SR_WT,
         scale_mode=_OAS_MODE,
         use_2d_scale=_WT2D,
-        offset_mode=0,
     )
     return r_packed, r_scale, c_packed, c_scale
 
@@ -793,7 +761,6 @@ def _cast_grad_dual_raw(x):
         col_sr=_SR_WGRAD_COL,
         scale_margin=_SCALE_MARGIN,
         scale_mode=_OAS_MODE,
-        offset_mode=_MXFP4_OFFSET_MODE,
     )
 
 
@@ -1353,7 +1320,6 @@ def _cast_wt_colwise_unshuf_raw(x):
         use_sr_col=_SR_WT,
         scale_mode=_OAS_MODE,
         use_2d_scale=_WT2D,
-        offset_mode=0,
     )
     return c_packed, c_scale
 
