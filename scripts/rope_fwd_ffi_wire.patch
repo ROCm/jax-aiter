@@ -1,0 +1,356 @@
+diff --git a/Makefile b/Makefile
+index db4fc17..2298364 100644
+--- a/Makefile
++++ b/Makefile
+@@ -52,7 +52,8 @@ JA_CORE_MODULES := $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
+                    $(JA_BUILD_DIR)/silu_and_mul_ja.so \
+                    $(JA_BUILD_DIR)/gemm_fwd_ja.so \
+                    $(JA_BUILD_DIR)/gemm_fp4_ja.so \
+-                   $(JA_BUILD_DIR)/cast_mxfp4_ja.so
++                   $(JA_BUILD_DIR)/cast_mxfp4_ja.so \
++                   $(JA_BUILD_DIR)/rope_fwd_ja.so
+ 
+ # MHA FFI shims: full wheel only (the heavy libmha_*.so JIT libs back these).
+ JA_MHA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
+@@ -110,6 +111,14 @@ $(JA_BUILD_DIR)/cast_mxfp4_ja.so: $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) | $(JA_
+ 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) \
+ 		-Icsrc/ffi/cast_mxfp4 $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) -o $@
+ 
++# Self-contained NEOX RoPE forward (torch-free; AITER's rope_common.h is
++# ATen-coupled, so we ship our own kernel here following the cast_mxfp4 pattern).
++ROPE_SRC := csrc/ffi/rope/rope_fwd_ja.cu
++ROPE_KERNEL := csrc/ffi/rope/rope_kernel.cu
++$(JA_BUILD_DIR)/rope_fwd_ja.so: $(ROPE_SRC) $(ROPE_KERNEL) | $(JA_BUILD_DIR)/
++	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) \
++		-Icsrc/ffi/rope $(ROPE_SRC) $(ROPE_KERNEL) -o $@
++
+ # Stage-only clean: wipes the wheel staging dirs (pure copies of the
+ # source-of-truth libs/kernels) plus the stale moe_fwd_ja.so that has no
+ # source. Safe to run during release work -- it NEVER touches
+diff --git a/csrc/ffi/rope/rope_fwd_ja.cu b/csrc/ffi/rope/rope_fwd_ja.cu
+new file mode 100644
+index 0000000..30d839a
+--- /dev/null
++++ b/csrc/ffi/rope/rope_fwd_ja.cu
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: MIT
++// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
++//
++// NEOX RoPE forward FFI handler (self-contained, torch-free).
++// Computes out = x * cos + rotate_half(x) * sin, matching MaxText's
++// RotaryEmbedding.apply_rotary. Uses rope_kernel.cu's launcher.
++//
++// Inputs:
++//   x:   [B, S, N, D] bf16  (BSHD; query or key after projection)
++//   cos: [B, S, D]    bf16  (full-width, shared across the N heads)
++//   sin: [B, S, D]    bf16
++// Output:
++//   out: [B, S, N, D] bf16
++//
++// Command-buffer compatible: only hipModuleLaunch via the kernel launch.
++
++#include <hip/hip_runtime.h>
++#include <cstdint>
++
++#include "xla/ffi/api/c_api.h"
++#include "xla/ffi/api/ffi.h"
++
++namespace ffi = xla::ffi;
++
++namespace ja_rope {
++extern "C" void launch_rope_neox_fwd_bf16(
++    const void* x, const void* cos, const void* sin, void* out,
++    int64_t n_rows, int n_heads, int D, hipStream_t stream);
++}
++
++namespace jax_aiter {
++
++ffi::Error
++RopeFwd_Bridge(
++    hipStream_t stream,
++    ffi::AnyBuffer x,
++    ffi::AnyBuffer cos,
++    ffi::AnyBuffer sin,
++    ffi::Result<ffi::AnyBuffer> out) {
++
++  if (!x.untyped_data() || !cos.untyped_data() || !sin.untyped_data()) {
++    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
++                      "RoPE: required input buffer (x/cos/sin) is null");
++  }
++
++  auto xd = x.dimensions();
++  if (xd.size() != 4) {
++    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
++                      "RoPE expects x of rank 4 [B, S, N, D]");
++  }
++  if (x.element_type() != ffi::DataType::BF16 ||
++      cos.element_type() != ffi::DataType::BF16 ||
++      sin.element_type() != ffi::DataType::BF16) {
++    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
++                      "RoPE only supports bf16 x/cos/sin");
++  }
++
++  int64_t B = xd[0], S = xd[1], N = xd[2], D = xd[3];
++  if ((D & 1) != 0) {
++    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
++                      "RoPE head_dim D must be even");
++  }
++
++  // cos/sin must be [B, S, D] (full-width, shared across heads).
++  auto cd = cos.dimensions();
++  if (cd.size() != 3 || cd[0] != B || cd[1] != S || cd[2] != D) {
++    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
++                      "RoPE cos must be [B, S, D] matching x");
++  }
++  auto sd = sin.dimensions();
++  if (sd.size() != 3 || sd[0] != B || sd[1] != S || sd[2] != D) {
++    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
++                      "RoPE sin must be [B, S, D] matching x");
++  }
++
++  int64_t n_rows = B * S * N;
++  ja_rope::launch_rope_neox_fwd_bf16(
++      x.untyped_data(), cos.untyped_data(), sin.untyped_data(),
++      out->untyped_data(), n_rows, static_cast<int>(N),
++      static_cast<int>(D), stream);
++
++  return ffi::Error::Success();
++}
++
++}  // namespace jax_aiter
++
++#pragma GCC visibility push(default)
++
++XLA_FFI_DEFINE_HANDLER_SYMBOL(
++    RopeFwdJA, jax_aiter::RopeFwd_Bridge,
++    ffi::Ffi::Bind()
++        .Ctx<ffi::PlatformStream<hipStream_t>>()
++        .Arg<ffi::AnyBuffer>()   // x:   [B, S, N, D] bf16
++        .Arg<ffi::AnyBuffer>()   // cos: [B, S, D] bf16
++        .Arg<ffi::AnyBuffer>()   // sin: [B, S, D] bf16
++        .Ret<ffi::AnyBuffer>(),  // out: [B, S, N, D] bf16
++    {xla::ffi::Traits::kCmdBufferCompatible});
++
++#pragma GCC visibility pop
+diff --git a/csrc/ffi/rope/rope_kernel.cu b/csrc/ffi/rope/rope_kernel.cu
+new file mode 100644
+index 0000000..ec4503c
+--- /dev/null
++++ b/csrc/ffi/rope/rope_kernel.cu
+@@ -0,0 +1,88 @@
++/*
++ * NEOX-style RoPE forward kernel (self-contained, torch-free).
++ * =============================================================
++ *
++ * Matches MaxText's RotaryEmbedding.apply_rotary
++ * (maxtext/src/maxtext/layers/embeddings.py):
++ *
++ *     rotate_half(x): (x1, x2) -> (-x2, x1)   split on last dim
++ *     out = x * cos + rotate_half(x) * sin
++ *
++ * where cos/sin are FULL-WIDTH [.., D] (MaxText builds them as
++ * concat([cos_half, cos_half], -1)), broadcast over the head axis.
++ *
++ * Layout: x, out are [B, S, N, D] contiguous (BSHD); cos, sin are
++ * [B, S, D] (shared across the N heads). Compute in fp32, store bf16.
++ *
++ * This follows the cast_mxfp4 precedent: a self-contained HIP kernel with
++ * an extern "C" launcher, called by the JAX FFI shim. No torch / no ATen
++ * (AITER's own rope_common.h is ATen-coupled, so it is not reused here).
++ */
++
++#include <hip/hip_runtime.h>
++#include <hip/hip_bf16.h>
++#include <cstdint>
++
++namespace ja_rope {
++
++// One thread per (row, j) PAIR with j in [0, half): handles the two coupled
++// elements d=j and d=j+half, reading each x element ONCE.
++//   out[j]      = x[j]*cos[j]      - x[j+half]*sin[j]
++//   out[j+half] = x[j+half]*cos[j] + x[j]*sin[j]      (cos/sin full-width => cos[j+half]==cos[j])
++//   row = pair_row index -> (b*S + s) * N + n ; bs = row / n_heads
++//   cos/sin offset = bs * D + j   (only the front half of cos/sin is read)
++__global__ void rope_neox_fwd_bf16_kernel(
++    const __hip_bfloat16* __restrict__ x,
++    const __hip_bfloat16* __restrict__ cos,
++    const __hip_bfloat16* __restrict__ sin,
++    __hip_bfloat16* __restrict__ out,
++    int64_t n_rows,
++    int n_heads,
++    int D) {
++  const int half = D >> 1;
++  const int64_t n_pairs = n_rows * static_cast<int64_t>(half);
++  for (int64_t p = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
++       p < n_pairs;
++       p += static_cast<int64_t>(gridDim.x) * blockDim.x) {
++    const int j = static_cast<int>(p % half);
++    const int64_t row = p / half;
++    const int64_t base = row * D;            // start of this row's D elements
++    const int64_t bs = row / n_heads;
++    const int64_t cs = bs * D + j;           // front-half cos/sin index
++
++    float x0 = __bfloat162float(x[base + j]);
++    float x1 = __bfloat162float(x[base + j + half]);
++    float c = __bfloat162float(cos[cs]);
++    float s = __bfloat162float(sin[cs]);
++
++    out[base + j]        = __float2bfloat16(x0 * c - x1 * s);
++    out[base + j + half] = __float2bfloat16(x1 * c + x0 * s);
++  }
++}
++
++extern "C" void launch_rope_neox_fwd_bf16(
++    const void* x,
++    const void* cos,
++    const void* sin,
++    void* out,
++    int64_t n_rows,
++    int n_heads,
++    int D,
++    hipStream_t stream) {
++  if (n_rows <= 0 || D <= 0) return;
++  const int threads = 256;
++  const int64_t total = n_rows * static_cast<int64_t>(D >> 1);  // one thread per pair
++  int64_t blocks64 = (total + threads - 1) / threads;
++  // Cap grid; the grid-stride loop covers the remainder.
++  const int max_blocks = 65535 * 8;
++  int blocks = static_cast<int>(blocks64 > max_blocks ? max_blocks : blocks64);
++  if (blocks < 1) blocks = 1;
++  rope_neox_fwd_bf16_kernel<<<blocks, threads, 0, stream>>>(
++      reinterpret_cast<const __hip_bfloat16*>(x),
++      reinterpret_cast<const __hip_bfloat16*>(cos),
++      reinterpret_cast<const __hip_bfloat16*>(sin),
++      reinterpret_cast<__hip_bfloat16*>(out),
++      n_rows, n_heads, D);
++}
++
++}  // namespace ja_rope
+diff --git a/jax_aiter/ffi/registry.py b/jax_aiter/ffi/registry.py
+index 50aafb8..9a07de0 100644
+--- a/jax_aiter/ffi/registry.py
++++ b/jax_aiter/ffi/registry.py
+@@ -40,6 +40,7 @@ SYMBOL_TO_MODULE_MAP = {
+     "GemmFp4FwdJA": "gemm_fp4_ja.so",
+     "CastMxfp4JA": "cast_mxfp4_ja.so",
+     "CastMxfp4DualJA": "cast_mxfp4_ja.so",
++    "RopeFwdJA": "rope_fwd_ja.so",
+ }
+ 
+ 
+diff --git a/jax_aiter/ops/rope.py b/jax_aiter/ops/rope.py
+new file mode 100644
+index 0000000..90b3719
+--- /dev/null
++++ b/jax_aiter/ops/rope.py
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
++"""Raw NEOX RoPE forward FFI wrapper (self-contained HIP kernel).
++
++Single-kernel op with no custom_vjp -- use jax_aiter.rope.rope for training.
++Matches MaxText RotaryEmbedding.apply_rotary:
++    out = x * cos + rotate_half(x) * sin
++with full-width cos/sin (concat of the half-width cos/sin).
++"""
++
++from __future__ import annotations
++
++import jax
++import jax.numpy as jnp
++
++from ..ffi.registry import register_ffi_target
++
++
++def _ensure_registered():
++    register_ffi_target("RopeFwdJA", "ROCM")
++
++
++def _rope_fwd_call(out_shape, dtype):
++    call = jax.ffi.ffi_call(
++        "RopeFwdJA",
++        jax.ShapeDtypeStruct(out_shape, dtype),
++        vmap_method="broadcast_all",
++    )
++
++    def _invoke(x, cos, sin):
++        return call(x, cos, sin)
++
++    return jax.jit(_invoke)
++
++
++def rope_fwd(x, cos, sin):
++    """NEOX RoPE forward via the self-contained AITER-style HIP kernel.
++
++    Args:
++        x:   [B, S, N, D] bf16 (query/key after projection, BSHD).
++        cos: [B, S, D] bf16 (full-width, shared across the N heads).
++        sin: [B, S, D] bf16.
++
++    Returns:
++        out: [B, S, N, D] bf16.
++    """
++    _ensure_registered()
++    if x.ndim != 4:
++        raise ValueError(f"rope_fwd expects x rank 4 [B,S,N,D], got {x.shape}")
++    if cos.ndim != 3 or sin.ndim != 3:
++        raise ValueError("rope_fwd expects cos/sin [B,S,D]")
++    fn = _rope_fwd_call(x.shape, x.dtype)
++    return fn(x, cos.astype(x.dtype), sin.astype(x.dtype))
+diff --git a/jax_aiter/rope/__init__.py b/jax_aiter/rope/__init__.py
+new file mode 100644
+index 0000000..45ec248
+--- /dev/null
++++ b/jax_aiter/rope/__init__.py
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
++"""NEOX RoPE via a self-contained AITER-style HIP kernel (custom_vjp)."""
++
++from .rope import rope
++
++__all__ = ["rope"]
+diff --git a/jax_aiter/rope/rope.py b/jax_aiter/rope/rope.py
+new file mode 100644
+index 0000000..feac30d
+--- /dev/null
++++ b/jax_aiter/rope/rope.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: MIT
++# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
++"""NEOX RoPE with custom_vjp via the self-contained RopeFwdJA HIP kernel.
++
++Forward:  out = x*cos + rotate_half(x)*sin (matches MaxText apply_rotary).
++Backward: RoPE is a per-(j, j+half) orthogonal 2x2 rotation [[c,-s],[s,c]];
++          its adjoint is [[c, s],[-s, c]] = the SAME forward kernel with sin
++          negated. So grad_x = rope_fwd(grad_out, cos, -sin). cos/sin are
++          constants (built from positions) -> nondiff.
++"""
++
++from __future__ import annotations
++from functools import partial
++
++import jax
++
++from ..ops.rope import rope_fwd as _rope_fwd_op
++
++
++@partial(jax.custom_vjp, nondiff_argnums=())
++def rope(x, cos, sin):
++    """NEOX RoPE. x:[B,S,N,D] bf16, cos/sin:[B,S,D] bf16 full-width."""
++    return _rope_fwd_op(x, cos, sin)
++
++
++def _rope_fwd(x, cos, sin):
++    return _rope_fwd_op(x, cos, sin), (cos, sin)
++
++
++def _rope_bwd(residuals, grad_out):
++    cos, sin = residuals
++    # Adjoint of the rotation = forward with sin negated.
++    grad_x = _rope_fwd_op(grad_out, cos, (-sin).astype(sin.dtype))
++    # cos/sin are positional constants; pass zero cotangents.
++    return grad_x, jax.numpy.zeros_like(cos), jax.numpy.zeros_like(sin)
++
++
++rope.defvjp(_rope_fwd, _rope_bwd)
