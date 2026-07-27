@@ -5,14 +5,15 @@
 // Uses cast_transpose_mxfp4_kernel_shuffled.cu for JAX FFI.
 //
 // CastMxfp4JA:     Rowwise-only output (activation + weight quantization).
-//                   Single kernel launch for any M.  The kernel uses int64
-//                   addressing to handle M*N > INT32_MAX (e.g. 70B batch=10).
-// CastMxfp4DualJA: Rowwise + columnwise output in one launch (weight dual quant).
-//                   Weights are FSDP-sharded so M is always small; no int64 concern.
+//                   Generic calls retain the baseline int64 addressing.
+// CastMxfp4DualJA: Rowwise + columnwise activation/weight/gradient output.
+//                   Auto may select guarded uint32 only for the two approved
+//                   production templates; every fallback retains baseline int64.
 
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
+#include "cast_mxfp4_offset_guard.h"
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
@@ -47,13 +48,12 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int scale_margin,
     int scale_mode,
     bool use_2d_scale,
+    offset_guard::OffsetType offset_type,
     hipStream_t stream
 );
 }
 
 namespace jax_aiter {
-
-static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 // ---------------------------------------------------------------------------
 // CastMxfp4JA: Rowwise output (single kernel launch for any M)
@@ -68,27 +68,50 @@ ffi::Error CastMxfp4_Bridge(
     int scale_margin,
     int scale_mode,
     bool use_2d_scale,
+    int offset_mode,
     ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> rowwise_scale_out
 ) {
   auto dims = input.dimensions();
-  int M = static_cast<int>(dims[0]);
-  int K = static_cast<int>(dims[1]);
-
-  constexpr int BLOCK_SIZE = 32;
-
-  // #8: host-side shape/alignment guard (once per launch, no per-thread cost).
-  // The MXFP4 32-block layout requires both dims to be multiples of 32, and the
-  // vectorized bf16 loads require 8-byte input alignment. Fail before launch.
-  if (M % BLOCK_SIZE || K % BLOCK_SIZE ||
-      (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8)) {
+  if (dims.size() != 2) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: input must be rank 2");
+  }
+  const int64_t M_wide = dims[0];
+  const int64_t K_wide = dims[1];
+  const mxfp4::offset_guard::LayoutFlags layout{
+      true, false, shuffle_scales, shuffle_fp4, false};
+  const auto guard =
+      mxfp4::offset_guard::evaluate_offset_guard(M_wide, K_wide, layout);
+  if (guard.status == mxfp4::offset_guard::GuardStatus::kDimensionMisaligned) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
         "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
   }
+  if (guard.status != mxfp4::offset_guard::GuardStatus::kOk) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: dimensions and derived strides must fit the positive "
+        "int kernel contract without arithmetic overflow");
+  }
+  if (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
+  }
+  const auto selection = mxfp4::offset_guard::select_offset_type(
+      offset_mode, guard.u32_safe, false);
+  if (!selection.valid_mode) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: offset_mode must be 0 (off), 1 (auto), or 2 "
+        "(force64)");
+  }
 
-  int scale_N = cdiv(K, BLOCK_SIZE);
-  int scale_M_pad = cdiv(M, 256) * 256;
-  int scale_N_pad = cdiv(scale_N, 8) * 8;
+  const int M = static_cast<int>(M_wide);
+  const int K = static_cast<int>(K_wide);
+  const int scale_N = static_cast<int>(guard.row_scale_n);
+  const int scale_M_pad = static_cast<int>(guard.m_pad);
+  const int scale_N_pad = static_cast<int>(guard.row_scale_n_pad);
 
   mxfp4::launch_cast_transpose_mxfp4_shuffled(
       input.untyped_data(),
@@ -111,6 +134,7 @@ ffi::Error CastMxfp4_Bridge(
       scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
       scale_mode,                // 0 = round-nearest (legacy); 1 = OAS floor
       use_2d_scale,              // ignored for rowwise-only (no colwise to share)
+      selection.type,            // rowwise/generic calls have no u32 specialization
       stream);
 
   return ffi::Error::Success();
@@ -126,6 +150,7 @@ ffi::Error CastMxfp4Dual_Bridge(
     ffi::AnyBuffer input,
     bool shuffle_fp4,
     bool shuffle_colwise_fp4,
+    bool shuffle_scales,      // shuffle E8M0 scale layout (both directions)
     bool use_hadamard,        // rowwise-direction Hadamard
     bool use_hadamard_col,    // colwise-direction Hadamard (independent)
     bool use_sr,              // rowwise-direction SR
@@ -133,22 +158,35 @@ ffi::Error CastMxfp4Dual_Bridge(
     int scale_margin,
     int scale_mode,
     bool use_2d_scale,
+    int offset_mode,
     ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> rowwise_scale_out,
     ffi::Result<ffi::AnyBuffer> colwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> colwise_scale_out
 ) {
   auto dims = input.dimensions();
-  int M = static_cast<int>(dims[0]);
-  int K = static_cast<int>(dims[1]);
-
-  constexpr int BLOCK_SIZE = 32;
-
-  // #8: host-side shape/alignment guard (once per launch, no per-thread cost).
-  // The MXFP4 32-block layout requires both dims to be multiples of 32, and the
-  // vectorized bf16 loads require 8-byte input alignment. Fail before launch.
-  if (M % BLOCK_SIZE || K % BLOCK_SIZE ||
-      (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8)) {
+  if (dims.size() != 2) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: input must be rank 2");
+  }
+  const int64_t M_wide = dims[0];
+  const int64_t K_wide = dims[1];
+  const mxfp4::offset_guard::LayoutFlags layout{
+      true, true, shuffle_scales, shuffle_fp4, shuffle_colwise_fp4};
+  const auto guard =
+      mxfp4::offset_guard::evaluate_offset_guard(M_wide, K_wide, layout);
+  if (guard.status == mxfp4::offset_guard::GuardStatus::kDimensionMisaligned) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
+  }
+  if (guard.status != mxfp4::offset_guard::GuardStatus::kOk) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: dimensions and derived strides must fit the positive "
+        "int kernel contract without arithmetic overflow");
+  }
+  if (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
         "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
   }
@@ -171,17 +209,32 @@ ffi::Error CastMxfp4Dual_Bridge(
         "(2D tile-amax is pre-Hadamard; SR breaks rowwise==colwise codes)");
   }
 
-  int rowwise_scale_N = cdiv(K, BLOCK_SIZE);
-  int rowwise_scale_M_pad = cdiv(M, 256) * 256;
-  int rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
+  const mxfp4::offset_guard::TemplateFlags template_flags{
+      true, true, shuffle_scales, use_hadamard, use_hadamard_col,
+      shuffle_fp4, shuffle_colwise_fp4, use_sr, use_sr_col};
+  const auto selection = mxfp4::offset_guard::select_offset_type(
+      offset_mode, guard.u32_safe,
+      mxfp4::offset_guard::is_u32_specialized_template(template_flags));
+  if (!selection.valid_mode) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: offset_mode must be 0 (off), 1 (auto), or 2 "
+        "(force64)");
+  }
 
-  int colwise_scale_M = K;
-  int colwise_scale_N = cdiv(M, BLOCK_SIZE);
-  int colwise_scale_M_pad = cdiv(K, 256) * 256;
-  int colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
-
-  int rowwise_scale_stride = rowwise_scale_N_pad;
-  int colwise_scale_stride = colwise_scale_N_pad;
+  const int M = static_cast<int>(M_wide);
+  const int K = static_cast<int>(K_wide);
+  const int rowwise_scale_N = static_cast<int>(guard.row_scale_n);
+  const int rowwise_scale_M_pad = static_cast<int>(guard.m_pad);
+  const int rowwise_scale_N_pad =
+      static_cast<int>(guard.row_scale_n_pad);
+  const int colwise_scale_M = K;
+  const int colwise_scale_N = static_cast<int>(guard.col_scale_n);
+  const int colwise_scale_M_pad = static_cast<int>(guard.k_pad);
+  const int colwise_scale_N_pad =
+      static_cast<int>(guard.col_scale_n_pad);
+  const int rowwise_scale_stride = rowwise_scale_N_pad;
+  const int colwise_scale_stride = colwise_scale_N_pad;
 
   mxfp4::launch_cast_transpose_mxfp4_shuffled(
       input.untyped_data(),
@@ -192,7 +245,11 @@ ffi::Error CastMxfp4Dual_Bridge(
       M, K,
       true,              // use_rowwise
       true,              // use_colwise
-      true,              // shuffle_scales
+      shuffle_scales,    // shuffle_scales (plumbed; was hardcoded true). Passing
+                         // false emits LINEAR scales for BOTH directions so a
+                         // per-shard colwise scale concatenates cleanly for the
+                         // packed dgrad all-gather (Fix 2). Default true keeps
+                         // every existing caller byte-identical.
       use_hadamard,          // rowwise Hadamard
       use_hadamard_col,      // colwise Hadamard (independent of row)
       shuffle_fp4,           // shuffle_rowwise_fp4
@@ -211,6 +268,7 @@ ffi::Error CastMxfp4Dual_Bridge(
       scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
       scale_mode,                // 0 = round-nearest (legacy); 1 = OAS floor
       use_2d_scale,              // share one 32x32-tile scale across row+col
+      selection.type,
       stream
   );
 
@@ -233,6 +291,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("scale_margin")    // E8M0 under-flush headroom (default 0 = legacy exp-2)
         .Attr<int>("scale_mode")      // 0 = round-nearest (legacy); 1 = OAS floor
         .Attr<bool>("use_2d_scale")   // share one 32x32-tile scale (no-op rowwise-only)
+        .Attr<int>("offset_mode")     // 0=off, 1=auto, 2=force64
         .Ret<ffi::AnyBuffer>()        // rowwise_fp4: [M, K/2] uint8
         .Ret<ffi::AnyBuffer>(),       // rowwise_scale: [M_pad, scale_N_pad] uint8
     {xla::ffi::Traits::kCmdBufferCompatible});
@@ -244,6 +303,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()        // input: [M, K] bf16
         .Attr<bool>("shuffle_fp4")    // shuffle rowwise FP4 data
         .Attr<bool>("shuffle_colwise_fp4")  // shuffle colwise FP4 data
+        .Attr<bool>("shuffle_scales") // shuffle E8M0 scale layout (both directions)
         .Attr<bool>("use_hadamard")   // rowwise Hadamard
         .Attr<bool>("use_hadamard_col")  // colwise Hadamard (independent of row)
         .Attr<bool>("use_sr")         // rowwise SR (default false = RNE)
@@ -251,6 +311,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("scale_margin")    // E8M0 under-flush headroom (default 0 = legacy exp-2)
         .Attr<int>("scale_mode")      // 0 = round-nearest (legacy); 1 = OAS floor
         .Attr<bool>("use_2d_scale")   // share one 32x32-tile scale across row+col
+        .Attr<int>("offset_mode")     // 0=off, 1=auto, 2=force64
         .Ret<ffi::AnyBuffer>()        // rowwise_fp4:  [M, K/2] uint8
         .Ret<ffi::AnyBuffer>()        // rowwise_scale: [M_pad, rscale_N_pad] uint8
         .Ret<ffi::AnyBuffer>()        // colwise_fp4:  [K, M/2] uint8

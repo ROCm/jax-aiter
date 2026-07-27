@@ -106,7 +106,8 @@ $(JA_BUILD_DIR)/gemm_fp4_ja.so: csrc/ffi/gemm_fp4/gemm_fp4_ja.cu $(GEMM_FP4_CFG)
 
 CAST_MXFP4_SRC := csrc/ffi/cast_mxfp4/cast_mxfp4_ja.cu
 CAST_MXFP4_KERNEL := csrc/ffi/cast_mxfp4/cast_transpose_mxfp4_kernel_shuffled.cu
-$(JA_BUILD_DIR)/cast_mxfp4_ja.so: $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) | $(JA_BUILD_DIR)/
+CAST_MXFP4_GUARD := csrc/ffi/cast_mxfp4/cast_mxfp4_offset_guard.h
+$(JA_BUILD_DIR)/cast_mxfp4_ja.so: $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) $(CAST_MXFP4_GUARD) | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) \
 		-Icsrc/ffi/cast_mxfp4 $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) -o $@
 
