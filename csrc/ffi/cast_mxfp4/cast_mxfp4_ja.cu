@@ -128,6 +128,7 @@ ffi::Error CastMxfp4Dual_Bridge(
     ffi::AnyBuffer input,
     bool shuffle_fp4,
     bool shuffle_colwise_fp4,
+    bool shuffle_scales,      // shuffle E8M0 scale layout (both directions)
     bool use_hadamard,        // rowwise-direction Hadamard
     bool use_hadamard_col,    // colwise-direction Hadamard (independent)
     bool use_sr,              // rowwise-direction SR
@@ -194,7 +195,7 @@ ffi::Error CastMxfp4Dual_Bridge(
       M, K,
       true,              // use_rowwise
       true,              // use_colwise
-      true,              // shuffle_scales
+      shuffle_scales,
       use_hadamard,          // rowwise Hadamard
       use_hadamard_col,      // colwise Hadamard (independent of row)
       shuffle_fp4,           // shuffle_rowwise_fp4
@@ -246,6 +247,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()        // input: [M, K] bf16
         .Attr<bool>("shuffle_fp4")    // shuffle rowwise FP4 data
         .Attr<bool>("shuffle_colwise_fp4")  // shuffle colwise FP4 data
+        .Attr<bool>("shuffle_scales") // shuffle E8M0 scale layout (both directions)
         .Attr<bool>("use_hadamard")   // rowwise Hadamard
         .Attr<bool>("use_hadamard_col")  // colwise Hadamard (independent of row)
         .Attr<bool>("use_sr")         // rowwise SR (default false = RNE)

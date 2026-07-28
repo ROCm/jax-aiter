@@ -278,6 +278,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module,
             is_standalone,
             torch_exclude,
+            extra_cuda_cflags_per_source=None,
         ) -> None:
             """Wrapper to handle torch import when torch_exclude=True."""
             if torch_exclude:
@@ -303,6 +304,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                         is_python_module=is_python_module,
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
+                        extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
                     )
                 finally:
                     if 'torch' in sys.modules and sys.modules['torch'] is mock_torch:
@@ -320,6 +322,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                     is_python_module=is_python_module,
                     is_standalone=is_standalone,
                     torch_exclude=torch_exclude,
+                    extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
                 )
         
         cpp_extension._write_ninja_file_to_build_library = _write_ninja_file_to_build_library_ja_inner
@@ -337,6 +340,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module: bool,
             is_standalone: bool = False,
             torch_exclude: bool = False,
+            extra_cuda_cflags_per_source=None,
         ) -> None:
             cpp_extension.verify_ninja_availability()
 
@@ -372,6 +376,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
             )
 
             if verbose:
