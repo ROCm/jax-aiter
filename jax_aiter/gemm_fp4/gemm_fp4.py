@@ -32,37 +32,6 @@ Env vars (advanced)
 ``AITER_FUSED_QUANT_HADAMARD=1``
     Apply Hadamard to ALL casts (act / weight / grad). Debug / ablation
     knob. Default applies Hadamard ONLY to the grad cast.
-``AITER_KERNEL_SEL=1``
-    Use AITER's per-shape tuned-kernel CSV instead of the default static
-    heuristic. Opt-in.
-``JA_FP4_HIGHP_PASSES=<comma-list of {fprop,dgrad,wgrad}>``
-    Per-pass high-precision (bf16) fallback (debug / ablation). Each listed
-    pass runs its GEMM in bf16 instead of FP4. ``wgrad`` and ``dgrad`` are
-    wired (``fprop`` is not):
-      * ``wgrad`` -- backward computes ``dB = grad_out^T @ a`` from the RAW
-        bf16 grad + RAW bf16 activation (stashed by the fwd), reduced across
-        the FSDP mesh with the SAME ``psum`` as the FP4 wgrad (M/batch axis is
-        FSDP-sharded).
-      * ``dgrad`` -- backward computes ``dA = grad_out @ b`` from the RAW bf16
-        grad + RAW bf16 weight (stashed by the fwd). The contraction axis N
-        (output features) is REPLICATED under FSDP, so this is a plain bf16
-        ``dot_general`` -- NO collective.
-    ``dgrad,wgrad`` => the entire backward runs bf16 (dA + dB) while the
-    forward stays FP4, isolating forward-FP4 vs backward-FP4 error. **Unset
-    (default) => byte-identical all-FP4 backward** (4-tuple residual, FP4
-    dA + dB). Reversible debug knob.
-``JA_FP4_DGRAD_PREC=fp8``
-    FP8-precision dgrad (advanced, opt-in; independent of
-    ``JA_FP4_HIGHP_PASSES``). When ``fp8``, the dgrad GEMM ``dA = grad_out @ b``
-    runs in fp8 (``float8_e4m3fn``, the OCP fp8 native to gfx950) instead of
-    FP4 -- a candidate mixed FP4-fwd / FP8-dgrad recipe and a probe of how much
-    precision the dgrad needs. The fwd stashes the RAW bf16 weight (same
-    residual as the bf16 dgrad); the bwd casts ``grad_out`` + weight to fp8 and
-    ``dot_general``s them. XLA-ROCm lowers this to a REAL fp8 cublasLt matmul
-    (``__cublas$...$f8``; ~1.45-1.8x faster than the bf16 dgrad dot on gfx950).
-    The forward and wgrad stay FP4. N (contraction) is replicated under FSDP =>
-    NO collective. **Unset (default) => byte-identical all-FP4 dgrad.**
-    Reversible debug knob.
 ``JA_FP4_DGRAD_PARTITION=gather``
     FSDP/Shardy-correct FP4 dgrad (advanced, opt-in). The legacy dgrad reuses the
     fprop partition on the packed + colwise-SHUFFLED weight ``col_b``; under FSDP
@@ -303,63 +272,6 @@ def _normalize_sr_key(sr_key):
 
 
 # ---------------------------------------------------------------------------
-# Per-pass high-precision (bf16) fallback (advanced, opt-in via
-# JA_FP4_HIGHP_PASSES). Comma-list of {fprop,dgrad,wgrad}; each listed pass
-# runs its GEMM in bf16 instead of FP4. Default empty => every pass stays FP4
-# (production recipe unchanged). Read at import (parity with _HADAMARD_ALL);
-# the fwd/bwd look the module global up at trace time so tests can monkeypatch
-# it. Reversible debug knob: unset => byte-identical all-FP4 behavior.
-#
-# "wgrad" and "dgrad" are wired (set BOTH => the whole backward runs bf16
-# while the forward stays FP4, isolating forward-FP4 vs backward-FP4 error):
-#   * wgrad -- dB = grad_out^T @ a (contraction over the FSDP-sharded M/batch
-#     axis; needs an all-reduce). The FP4 pass most exposed to gradient
-#     under-flush: token/M-axis blocks dominated by outlier tokens set the
-#     shared E8M0 scale, flushing small entries to FP4 code 0; feeds the
-#     optimizer weight update directly.
-#   * dgrad -- dA = grad_out @ b (contraction over the output-feature axis N,
-#     which is REPLICATED under FSDP, so a plain local dot -- NO collective).
-# ---------------------------------------------------------------------------
-def _parse_highp_passes():
-    raw = os.environ.get("JA_FP4_HIGHP_PASSES", "")
-    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
-
-
-_HIGHP_PASSES = _parse_highp_passes()
-_HIGHP_WGRAD = "wgrad" in _HIGHP_PASSES
-_HIGHP_DGRAD = "dgrad" in _HIGHP_PASSES
-
-
-# ---------------------------------------------------------------------------
-# FP8-precision dgrad (advanced, opt-in via JA_FP4_DGRAD_PREC=fp8). Independent
-# of JA_FP4_HIGHP_PASSES (which selects the bf16 fallback). When "fp8" the dgrad
-# GEMM dA = grad_out @ b runs in fp8 (float8_e4m3fn) instead of FP4 -- a
-# candidate mixed FP4-fwd / FP8-dgrad recipe and a probe of how much precision
-# the dgrad needs. fwd + wgrad stay FP4. Read at import (parity with
-# _HIGHP_*); the fwd/bwd look the module global up at trace time so tests can
-# monkeypatch it. Default empty => dgrad stays FP4 (byte-identical).
-# ---------------------------------------------------------------------------
-_DGRAD_PREC = os.environ.get("JA_FP4_DGRAD_PREC", "").strip().lower()
-_FP8_DGRAD = _DGRAD_PREC == "fp8"
-
-
-# ---------------------------------------------------------------------------
-# Per-OPERAND dgrad precision split (diagnostic, opt-in via JA_FP4_DGRAD_SPLIT).
-# Isolates whether the FP4-dgrad damage is the gradient (dY) quantization, the
-# weight (W) quantization, or the FP4xFP4 interaction. The a4w4 kernel needs
-# BOTH operands FP4, so this uses a pure-JAX MXFP4 FAKE-QUANT (quant->dequant,
-# Hadamard OFF) on the selected operand(s) and a bf16 dot_general for dA:
-#   dy   -> dY FP4-fakequant, W bf16
-#   w    -> dY bf16,          W FP4-fakequant
-#   both -> both fake-quant  (cross-check vs the real FP4 dgrad, nohad)
-# Default "" => unchanged (byte-identical). Diagnostic only; not a recipe.
-# ---------------------------------------------------------------------------
-_DGRAD_SPLIT = os.environ.get("JA_FP4_DGRAD_SPLIT", "").strip().lower()
-if _DGRAD_SPLIT not in ("", "dy", "w", "both"):
-    _DGRAD_SPLIT = ""
-
-
-# ---------------------------------------------------------------------------
 # FSDP/Shardy dgrad partition mode (opt-in via JA_FP4_DGRAD_PARTITION).
 #
 # The default (legacy) FP4 dgrad reuses the fprop custom_partitioning on the
@@ -417,42 +329,6 @@ _DGRAD_PACKED = _DGRAD_PARTITION == "gather_packed"
 # monkeypatch. Default off => byte-identical legacy recast behavior.
 # ---------------------------------------------------------------------------
 _DGRAD_REUSE_FWD_COL = os.environ.get("JA_FP4_DGRAD_REUSE_FWD_COL", "0") == "1"
-
-# E2M1 grid (magnitudes) + round-to-nearest midpoints, for the fake-quant.
-_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-_E2M1_MIDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-
-
-def _fake_quant_mxfp4(x, axis):
-    """Pure-JAX MXFP4 fake-quant (quant->dequant) over 32-blocks along ``axis``.
-
-    Reproduces the kernel's 1x32 scheme (Hadamard OFF): per-block amax -> E8M0
-    round-nearest-pow2 scale with the legacy ``exp-2`` headroom -> E2M1 (RNE)
-    -> dequant. Diagnostic only (JA_FP4_DGRAD_SPLIT); not on any default path.
-    """
-    import jax.numpy as _jnp
-    xf = x.astype(_jnp.float32)
-    xm = _jnp.moveaxis(xf, axis, -1)
-    shp = xm.shape
-    nblk = shp[-1] // 32
-    xb = xm.reshape(shp[:-1] + (nblk, 32))
-    amax = _jnp.max(_jnp.abs(xb), axis=-1, keepdims=True)          # [..., nblk, 1]
-    # E8M0 round-to-nearest power-of-two (mantissa-MSB carry), then exp-2 headroom.
-    bits = jax.lax.bitcast_convert_type(amax, _jnp.uint32)
-    bits = (bits + _jnp.uint32(0x200000)) & _jnp.uint32(0xFF800000)
-    exp = ((bits >> 23) & _jnp.uint32(0xFF)).astype(_jnp.int32) - 127
-    scale_exp = _jnp.where(amax > 0.0, exp - 2, 0)
-    native = _jnp.exp2(scale_exp.astype(_jnp.float32))            # [..., nblk, 1]
-    q = xb / native
-    s = _jnp.sign(q)
-    aq = _jnp.abs(q)
-    mids = _jnp.asarray(_E2M1_MIDS, dtype=_jnp.float32)
-    grid = _jnp.asarray(_E2M1_GRID, dtype=_jnp.float32)
-    idx = _jnp.searchsorted(mids, aq)                            # 0..7 (RN on the grid)
-    deq = (s * grid[idx]) * native
-    deq = deq.reshape(shp)
-    return _jnp.moveaxis(deq, -1, axis).astype(x.dtype)
-
 
 # ---------------------------------------------------------------------------
 # E8M0 scale-margin for the DGRAD (gradient) cast (B2, advanced, opt-in via
@@ -566,8 +442,8 @@ print("[ja-fp4] DGRAD cast scale_margin = %d "
 #   "act"                 : tag the activation-columnwise residual only
 #                           (~33 ms/step at 8B, the larger chunk)
 #   "both" / "1" / "all"  : tag both columnwise residuals
-# Read at import (parity with _HADAMARD_ALL / _HIGHP_*); the fwd looks the
-# module globals up at trace time so tests can monkeypatch them.
+# Read at import (parity with _HADAMARD_ALL); the fwd looks the module globals
+# up at trace time so tests can monkeypatch them.
 # ---------------------------------------------------------------------------
 _REMAT_SAVE_COL = os.environ.get("JA_FP4_REMAT_SAVE_COL", "").strip().lower()
 _REMAT_SAVE_WT_COL = _REMAT_SAVE_COL in ("wt", "both", "all", "1")
@@ -577,33 +453,6 @@ _REMAT_SAVE_ACT_COL = _REMAT_SAVE_COL in ("act", "both", "all", "1")
 # MaxText remat save policy (decoders.py get_remat_policy).
 _MXFP4_ACT_COL_NAME = "mxfp4_act_col"
 _MXFP4_WT_COL_NAME = "mxfp4_wt_col"
-
-
-# ---------------------------------------------------------------------------
-# Per-shape kernel selection (advanced, opt-in via AITER_KERNEL_SEL=1).
-# ---------------------------------------------------------------------------
-_KERNEL_SEL_CACHE = None
-
-
-def _use_kernel_selection():
-    global _KERNEL_SEL_CACHE
-    if _KERNEL_SEL_CACHE is None:
-        _KERNEL_SEL_CACHE = os.environ.get("AITER_KERNEL_SEL", "0") == "1"
-    return _KERNEL_SEL_CACHE
-
-
-def _get_kernel_name(M, N, K):
-    if not _use_kernel_selection():
-        return ""
-    try:
-        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
-
-        cfg = get_GEMM_config(M, N, K)
-        if cfg is not None:
-            return cfg["kernelName"]
-    except Exception:
-        pass
-    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1629,118 +1478,6 @@ _fp4_ffi_partitioned_wgrad.def_partition(
 
 
 # ---------------------------------------------------------------------------
-# BF16 GEMM wgrad high-precision fallback (opt-in via JA_FP4_HIGHP_PASSES=wgrad).
-#
-#   grad_out [M, N]  (raw bf16 cotangent)
-#   a        [M, K]  (raw bf16 activation, stashed by the fwd)
-#   OUT = dB [N, K] = grad_out^T @ a   (contraction over M -- FSDP-sharded)
-#
-# bf16 twin of _fp4_ffi_partitioned_wgrad. The contraction axis M is the
-# FSDP-sharded batch/token axis, so the per-shard partial products MUST be
-# reduced across the FSDP mesh -- the role the FP4 wgrad's explicit
-# jax.lax.psum plays. Here dB is declared REPLICATED (P(None, None), matching
-# the FP4 wgrad's replicated output) via dot_general's ``out_sharding``, so
-# XLA GSPMD inserts the all-reduce over the sharded contraction automatically:
-# the equivalent, verified reduction (2-device check: cos 1.0, norm-ratio 1.0;
-# a MISSING reduction would give ~0.5 norm-ratio). A plain unconstrained
-# dot_general is rejected by JAX 0.9 sharding-in-types ("Contracting
-# dimensions are sharded ... specify the output sharding via out_sharding").
-# On a single device (no sharded axis) out_sharding is None => plain local
-# dot. bf16 in, fp32 accumulate, bf16 out (matching the FP4 wgrad dB dtype so
-# the custom_vjp cotangent types agree).
-# ---------------------------------------------------------------------------
-
-def _replicated_out_sharding(x):
-    """If ``x`` carries a non-trivial mesh sharding (some dim mapped to a mesh
-    axis), return a replicated NamedSharding on that mesh -- this forces GSPMD
-    to all-reduce a sharded contraction. Else None (single-device / unsharded
-    => plain local dot)."""
-    sh = getattr(getattr(x, "aval", None), "sharding", None)
-    mesh = getattr(sh, "mesh", None)
-    spec = getattr(sh, "spec", None)
-    if mesh is not None and spec is not None and any(s is not None for s in spec):
-        return NamedSharding(mesh, P(None, None))
-    return None
-
-
-def _bf16_wgrad(grad_out, a):
-    """dB = grad_out^T @ a, contracting the M/batch axis (axis 0 of both),
-    reduced across the FSDP mesh via a replicated-output GSPMD all-reduce."""
-    db = jax.lax.dot_general(
-        grad_out, a,
-        dimension_numbers=(((0,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-        out_sharding=_replicated_out_sharding(grad_out),
-    )
-    return db.astype(grad_out.dtype)
-
-
-# ---------------------------------------------------------------------------
-# BF16 GEMM dgrad high-precision fallback (opt-in via JA_FP4_HIGHP_PASSES=dgrad).
-#
-#   grad_out [M, N]  (raw bf16 cotangent)
-#   b        [N, K]  (raw bf16 weight, stashed by the fwd)
-#   OUT = dA [M, K] = grad_out @ b   (contraction over N -- the output-feature
-#                                     axis, REPLICATED under FSDP)
-#
-# bf16 twin of the FP4 dgrad (_fp4_ffi_partitioned over go_row + col_b). Unlike
-# the wgrad, whose M contraction is FSDP-sharded and needs an all-reduce, the
-# dgrad contraction axis N is REPLICATED under FSDP (the FP4 dgrad declares the
-# contraction in need_replication_factors, i.e. each device holds the full N),
-# so NO collective is required: dA[M, K] inherits grad_out's M sharding and the
-# weight's K, the SAME output sharding as the FP4 dgrad. GSPMD therefore
-# propagates the output sharding from the operands and a plain dot_general is
-# accepted (the "Contracting dimensions are sharded" sharding-in-types error
-# only fires for a SHARDED contraction -- not this one), so no out_sharding
-# hint is needed. bf16 in, fp32 accumulate, bf16 out (matching the FP4 dgrad dA
-# dtype so the custom_vjp cotangent types agree).
-# ---------------------------------------------------------------------------
-
-def _bf16_dgrad(grad_out, b):
-    """dA = grad_out @ b, contracting the N/output-feature axis (axis 1 of
-    grad_out, axis 0 of the weight b). N is replicated under FSDP => plain
-    local dot, no collective."""
-    da = jax.lax.dot_general(
-        grad_out, b,
-        dimension_numbers=(((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
-    return da.astype(grad_out.dtype)
-
-
-# ---------------------------------------------------------------------------
-# FP8-precision GEMM dgrad (opt-in via JA_FP4_DGRAD_PREC=fp8).
-#
-#   grad_out [M, N]  (raw bf16 cotangent)
-#   b        [N, K]  (raw bf16 weight, stashed by the fwd)
-#   OUT = dA [M, K] = grad_out @ b   (contraction over N -- REPLICATED under FSDP)
-#
-# fp8 twin of _bf16_dgrad: cast BOTH operands to float8_e4m3fn (the OCP fp8
-# format native to gfx950 / MI350) then dot_general. XLA-ROCm rewrites the
-# convert(fp8) -> dot pattern into a REAL fp8 cublasLt/hipBLASLt matmul
-# (__cublas$...$f8 in the HLO; ~1.45-1.8x faster than the bf16 dgrad dot on
-# gfx950 -- verified by the Step-0 probe). Like the bf16 dgrad, the N
-# contraction is replicated under FSDP => plain local matmul, NO collective and
-# NO out_sharding hint (the casts are elementwise, so GSPMD propagates the same
-# operand sharding as the bf16/FP4 dgrad). fp8 in, fp32 accumulate, bf16 out
-# (matching the FP4 dgrad dA dtype so the custom_vjp cotangent types agree). dB
-# (wgrad) stays FP4.
-# ---------------------------------------------------------------------------
-
-def _fp8_dgrad(grad_out, b):
-    """dA = grad_out @ b in fp8 (e4m3), contracting the N/output-feature axis
-    (axis 1 of grad_out, axis 0 of the weight b). N is replicated under FSDP =>
-    plain local fp8 matmul, no collective."""
-    da = jax.lax.dot_general(
-        grad_out.astype(jnp.float8_e4m3fn),
-        b.astype(jnp.float8_e4m3fn),
-        dimension_numbers=(((1,), (0,)), ((), ())),
-        preferred_element_type=jnp.float32,
-    )
-    return da.astype(grad_out.dtype)
-
-
-# ---------------------------------------------------------------------------
 # FSDP/Shardy-correct FP4 dgrad via LOGICAL-weight gather (JA_FP4_DGRAD_PARTITION
 # = gather). See the _DGRAD_GATHER flag block for the full rationale.
 #
@@ -1976,12 +1713,9 @@ def _gemm_fp4_bf16_unkeyed(a, b):
 def _gemm_fp4_bf16_fwd(a, b):
     """Forward-with-residuals: dual-cast keeps columnwise FP4 for backward.
 
-    When ``JA_FP4_HIGHP_PASSES`` selects ``wgrad`` / ``dgrad`` the RAW bf16
-    activation ``a`` / weight ``b`` is also stashed so the backward can run
-    that GEMM in bf16 instead of FP4. The extra residuals are appended in a
-    FIXED order -- ``a`` for wgrad, then ``b`` for dgrad -- so the backward
-    recovers them from the SAME module flags. Default (both unset) keeps the
-    original 4-tuple residual => byte-identical all-FP4 backward.
+    The gather and packed-gather dgrad modes re-cast the weight in backward, so
+    those stash the RAW bf16 ``b`` as a fifth residual; the Experiment-B reuse
+    path consumes the saved colwise residual instead and keeps the 4-tuple.
     """
     _capture_fwd(a, b)  # env-gated offline-probe hook (no-op unless JA_CAPTURE_DIR set).
     a_row, a_row_s, col_a_fp4, col_a_scale = _cast_act_dual(a)
@@ -2013,48 +1747,33 @@ def _gemm_fp4_bf16_fwd(a, b):
         col_b_fp4 = checkpoint_name(col_b_fp4, _MXFP4_WT_COL_NAME)
         col_b_scale = checkpoint_name(col_b_scale, _MXFP4_WT_COL_NAME)
     residual = (col_a_fp4, col_a_scale, col_b_fp4, col_b_scale)
-    if _HIGHP_WGRAD:
-        residual = residual + (a,)  # RAW bf16 activation for the bf16 wgrad dB.
     # RAW bf16 weight is only needed when the dgrad RE-CASTS it in backward. The
     # Experiment-B reuse path consumes the saved colwise residual instead, so it
     # skips stashing b (one fewer residual + no backward recast).
-    _dgrad_recasts_b = (_HIGHP_DGRAD or _FP8_DGRAD or _DGRAD_SPLIT or _DGRAD_GATHER
-                        or (_DGRAD_PACKED and not _reuse_fwd_col))
+    _dgrad_recasts_b = _DGRAD_GATHER or (_DGRAD_PACKED and not _reuse_fwd_col)
     if _dgrad_recasts_b:
-        residual = residual + (b,)  # RAW bf16 weight for the bf16/fp8/split/gather/packed dgrad dA.
+        residual = residual + (b,)  # RAW bf16 weight for the gather/packed dgrad dA.
     return out, residual
 
 
 def _gemm_fp4_bf16_bwd(residuals, grad_out, sr_key=None):
-    """Backward: FP4 (default) or bf16 dA / dB per ``JA_FP4_HIGHP_PASSES``.
+    """Backward: FP4 dA and dB.
 
     dA is the input-gradient (dgrad) GEMM ``grad_out @ B``, contracting the
     output-feature axis N (REPLICATED under FSDP). dB is the weight-gradient
     (wgrad) GEMM ``grad_out^T @ A``, contracting the FSDP-sharded M/batch axis.
-    When ``dgrad`` / ``wgrad`` is selected for high precision, that GEMM becomes
-    a bf16 dot of the RAW ``grad_out`` and the RAW bf16 weight / activation
-    (stashed in fwd) -- see ``_bf16_dgrad`` / ``_bf16_wgrad``. Selecting BOTH
-    => the whole backward is bf16 while the forward stays FP4. Alternatively
-    ``JA_FP4_DGRAD_PREC=fp8`` runs ONLY the dgrad in fp8 (e4m3) via
-    ``_fp8_dgrad`` (candidate mixed FP4-fwd / FP8-dgrad recipe), leaving wgrad
-    FP4. Whatever stays FP4 still consumes the Hadamard-transformed grad
-    dual-cast.
+    Both consume the Hadamard-transformed grad dual-cast.
     """
     col_a_fp4, col_a_scale, col_b_fp4, col_b_scale = residuals[:4]
     idx = 4
-    a_bf16 = b_bf16 = None
-    _dgrad_highp = _HIGHP_DGRAD or _FP8_DGRAD  # dgrad runs bf16 OR fp8 (not FP4)
+    b_bf16 = None
     # Experiment B: reuse the forward's saved UNSHUFFLED colwise weight instead of
     # re-casting from the raw bf16 weight (only under the default packed dgrad).
     _reuse_fwd_col = _DGRAD_REUSE_FWD_COL and _DGRAD_PACKED
-    # split + gather + packed-gather also need the RAW bf16 weight (cast locally),
-    # EXCEPT the Experiment-B reuse path which consumes the saved colwise residual.
-    _dgrad_needs_raw_b = (_dgrad_highp or bool(_DGRAD_SPLIT)
-                          or _DGRAD_GATHER
+    # gather + packed-gather need the RAW bf16 weight (cast locally), EXCEPT the
+    # Experiment-B reuse path which consumes the saved colwise residual.
+    _dgrad_needs_raw_b = (_DGRAD_GATHER
                           or (_DGRAD_PACKED and not _reuse_fwd_col))
-    if _HIGHP_WGRAD:
-        a_bf16 = residuals[idx]
-        idx += 1
     if _dgrad_needs_raw_b:
         b_bf16 = residuals[idx]
         idx += 1
@@ -2063,43 +1782,20 @@ def _gemm_fp4_bf16_bwd(residuals, grad_out, sr_key=None):
     # contraction dim, recovered from a saved columnwise residual ([K, .../2]).
     _capture_bwd(grad_out, col_b_fp4.shape[0])
 
-    # Hadamard ON: applied inside the fused cast kernel for grad only. Skip the
-    # cast only when NEITHER backward GEMM is FP4 (no FP4 grad operand is
-    # consumed) so the high-precision throughput cost stays honest. dgrad is
-    # high-precision when bf16 OR fp8.
-    go_row = go_row_s = go_col_fp4 = go_col_scale = None
-    if (not _dgrad_highp) or (not _HIGHP_WGRAD):
-        if _SR_DGRAD_ROW or _SR_WGRAD_COL:
-            if sr_key is None:
-                raise ValueError(
-                    "gradient stochastic rounding requires a runtime sr_key"
-                )
-            go_row, go_row_s, go_col_fp4, go_col_scale = (
-                _cast_grad_dual_keyed(grad_out, sr_key)
+    # Hadamard ON: applied inside the fused cast kernel for grad only.
+    if _SR_DGRAD_ROW or _SR_WGRAD_COL:
+        if sr_key is None:
+            raise ValueError(
+                "gradient stochastic rounding requires a runtime sr_key"
             )
-        else:
-            go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
+        go_row, go_row_s, go_col_fp4, go_col_scale = (
+            _cast_grad_dual_keyed(grad_out, sr_key)
+        )
+    else:
+        go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
 
     # dA = grad_out @ B -- NN layout, contraction over N (replicated under FSDP).
-    if _DGRAD_SPLIT:
-        # Diagnostic per-operand split: fake-quant the selected operand(s) to
-        # MXFP4 (Hadamard OFF) and bf16 dot. Contraction axis N (replicated =>
-        # no collective, same as _bf16_dgrad). grad_out [M,N] axis1=N; b [N,K] axis0=N.
-        gq = _fake_quant_mxfp4(grad_out, 1) if _DGRAD_SPLIT in ("dy", "both") else grad_out
-        wq = _fake_quant_mxfp4(b_bf16, 0) if _DGRAD_SPLIT in ("w", "both") else b_bf16
-        da = jax.lax.dot_general(
-            gq, wq, dimension_numbers=(((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32).astype(grad_out.dtype)
-    elif _FP8_DGRAD:
-        # FP8-precision dA from RAW grad_out + RAW weight cast to e4m3 (real fp8
-        # cublasLt matmul; no FP4 quant, no Hadamard). N replicated => no
-        # collective. dB (wgrad) stays FP4 -- candidate mixed FP4-fwd/FP8-dgrad.
-        da = _fp8_dgrad(grad_out, b_bf16)
-    elif _HIGHP_DGRAD:
-        # High-precision bf16 dA from RAW grad_out + RAW weight (no FP4 quant,
-        # no Hadamard). N is replicated => plain local dot, no collective.
-        da = _bf16_dgrad(grad_out, b_bf16)
-    elif _DGRAD_GATHER:
+    if _DGRAD_GATHER:
         # FSDP/Shardy-correct FP4 dgrad: gather the LOGICAL bf16 weight over N
         # (concat-safe), THEN colwise cast/pack/shuffle LOCALLY, THEN FP4 GEMM.
         # Fixes the corrupt-dA-under-FSDP bug (legacy gathers the SHUFFLED weight).
@@ -2122,12 +1818,7 @@ def _gemm_fp4_bf16_bwd(residuals, grad_out, sr_key=None):
         da = _fp4_ffi_partitioned(go_row, col_b_fp4, go_row_s, col_b_scale)
     # dB = grad_out^T @ A -- NT layout, M_batch is the contraction (FSDP-
     # sharded). The partition callback emits psum across the FSDP mesh.
-    if _HIGHP_WGRAD:
-        # High-precision bf16 dB from RAW grad_out + RAW activation (no FP4
-        # quant, no Hadamard); same net FSDP reduction as the FP4 wgrad.
-        db = _bf16_wgrad(grad_out, a_bf16)
-    else:
-        db = _fp4_ffi_partitioned_wgrad(go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
+    db = _fp4_ffi_partitioned_wgrad(go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
     return da, db
 
 
