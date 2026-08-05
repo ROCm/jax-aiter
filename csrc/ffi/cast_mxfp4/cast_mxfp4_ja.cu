@@ -7,8 +7,9 @@
 // CastMxfp4JA:     Rowwise-only output (activation + weight quantization).
 //                   Single kernel launch for any M.  The kernel uses int64
 //                   addressing to handle M*N > INT32_MAX (e.g. 70B batch=10).
-// CastMxfp4DualJA: Rowwise + columnwise output in one launch (weight dual quant).
-//                   Weights are FSDP-sharded so M is always small; no int64 concern.
+// CastMxfp4DualJA: Rowwise + columnwise output in one launch. Used by the
+//                   weight, activation AND gradient dual casts, so M is the
+//                   token count for the latter two and int64 addressing applies.
 
 #include <hip/hip_runtime.h>
 #include <cstdint>
@@ -21,6 +22,7 @@ namespace ffi = xla::ffi;
 namespace mxfp4 {
 extern "C" void launch_cast_transpose_mxfp4_shuffled(
     const void* input,
+    const void* sr_key,
     void* rowwise_fp4,
     void* rowwise_scale,
     void* colwise_fp4,
@@ -47,6 +49,7 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int scale_margin,
     int scale_mode,
     bool use_2d_scale,
+    int sr_role,
     hipStream_t stream
 );
 }
@@ -54,6 +57,12 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
 namespace jax_aiter {
 
 static inline int cdiv(int a, int b) { return (a + b - 1) / b; }
+
+static bool IsValidSrKey(const ffi::AnyBuffer& sr_key) {
+  auto dims = sr_key.dimensions();
+  return sr_key.element_type() == ffi::DataType::U32 &&
+         dims.size() == 1 && dims[0] == 4;
+}
 
 // ---------------------------------------------------------------------------
 // CastMxfp4JA: Rowwise output (single kernel launch for any M)
@@ -71,6 +80,11 @@ ffi::Error CastMxfp4_Bridge(
     ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> rowwise_scale_out
 ) {
+  if (use_sr) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: clock-seeded SR is disabled; use CastMxfp4KeyedSrJA");
+  }
   auto dims = input.dimensions();
   int M = static_cast<int>(dims[0]);
   int K = static_cast<int>(dims[1]);
@@ -92,6 +106,7 @@ ffi::Error CastMxfp4_Bridge(
 
   mxfp4::launch_cast_transpose_mxfp4_shuffled(
       input.untyped_data(),
+      nullptr,                    // no SR key on the deterministic RNE path
       rowwise_fp4_out->untyped_data(),
       rowwise_scale_out->untyped_data(),
       nullptr, nullptr,          // no colwise
@@ -111,21 +126,77 @@ ffi::Error CastMxfp4_Bridge(
       scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
       scale_mode,                // 0 = round-nearest (legacy); 1 = OAS floor
       use_2d_scale,              // ignored for rowwise-only (no colwise to share)
+      0,                         // SR role unused
       stream);
 
   return ffi::Error::Success();
 }
 
+ffi::Error CastMxfp4KeyedSr_Bridge(
+    hipStream_t stream,
+    ffi::AnyBuffer input,
+    ffi::AnyBuffer sr_key,
+    bool shuffle_fp4,
+    bool shuffle_scales,
+    bool use_hadamard,
+    bool use_sr,
+    int scale_margin,
+    int scale_mode,
+    bool use_2d_scale,
+    int sr_role,
+    ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
+    ffi::Result<ffi::AnyBuffer> rowwise_scale_out
+) {
+  if (!use_sr) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: keyed SR target requires use_sr=true");
+  }
+  if (!IsValidSrKey(sr_key)) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: deterministic SR key must have dtype uint32 and shape [4]");
+  }
+  if (sr_role < 0 || sr_role > 2) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: sr_role must be 0 (activation), 1 (weight), or 2 (gradient)");
+  }
+  auto dims = input.dimensions();
+  int M = static_cast<int>(dims[0]);
+  int K = static_cast<int>(dims[1]);
+  constexpr int BLOCK_SIZE = 32;
+  if (M % BLOCK_SIZE || K % BLOCK_SIZE ||
+      (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8)) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
+  }
+  int scale_N = cdiv(K, BLOCK_SIZE);
+  int scale_M_pad = cdiv(M, 256) * 256;
+  int scale_N_pad = cdiv(scale_N, 8) * 8;
+  mxfp4::launch_cast_transpose_mxfp4_shuffled(
+      input.untyped_data(), sr_key.untyped_data(),
+      rowwise_fp4_out->untyped_data(), rowwise_scale_out->untyped_data(),
+      nullptr, nullptr, M, K, true, false, shuffle_scales,
+      use_hadamard, false, shuffle_fp4, false, true, false,
+      scale_N_pad, 0, scale_N, scale_M_pad, scale_N_pad,
+      0, 0, 0, 0, scale_margin, scale_mode, use_2d_scale, sr_role, stream);
+  return ffi::Error::Success();
+}
+
 // ---------------------------------------------------------------------------
-// CastMxfp4DualJA: Rowwise + columnwise output (weight dual quant).
-// Only used for weight quantization where M = N_weight (FSDP-sharded).
-// With 8-way FSDP, max M = 28672/8 = 3584.  No int64 addressing needed.
+// CastMxfp4DualJA: Rowwise + columnwise output.
+// Serves three callers, not just weights: the weight dual cast (M = N_weight,
+// FSDP-sharded, so max M = 28672/8 = 3584), plus the activation and gradient
+// dual casts where M is the local token count (32768 at the 8B matched recipe).
 // ---------------------------------------------------------------------------
 ffi::Error CastMxfp4Dual_Bridge(
     hipStream_t stream,
     ffi::AnyBuffer input,
     bool shuffle_fp4,
     bool shuffle_colwise_fp4,
+    bool shuffle_scales,      // shuffle E8M0 scale layout (both directions)
     bool use_hadamard,        // rowwise-direction Hadamard
     bool use_hadamard_col,    // colwise-direction Hadamard (independent)
     bool use_sr,              // rowwise-direction SR
@@ -138,6 +209,11 @@ ffi::Error CastMxfp4Dual_Bridge(
     ffi::Result<ffi::AnyBuffer> colwise_fp4_out,
     ffi::Result<ffi::AnyBuffer> colwise_scale_out
 ) {
+  if (use_sr || use_sr_col) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: clock-seeded SR is disabled; use CastMxfp4DualKeyedSrJA");
+  }
   auto dims = input.dimensions();
   int M = static_cast<int>(dims[0]);
   int K = static_cast<int>(dims[1]);
@@ -185,6 +261,7 @@ ffi::Error CastMxfp4Dual_Bridge(
 
   mxfp4::launch_cast_transpose_mxfp4_shuffled(
       input.untyped_data(),
+      nullptr,                    // no SR key on the deterministic RNE path
       rowwise_fp4_out->untyped_data(),
       rowwise_scale_out->untyped_data(),
       colwise_fp4_out->untyped_data(),
@@ -192,7 +269,7 @@ ffi::Error CastMxfp4Dual_Bridge(
       M, K,
       true,              // use_rowwise
       true,              // use_colwise
-      true,              // shuffle_scales
+      shuffle_scales,
       use_hadamard,          // rowwise Hadamard
       use_hadamard_col,      // colwise Hadamard (independent of row)
       shuffle_fp4,           // shuffle_rowwise_fp4
@@ -211,9 +288,80 @@ ffi::Error CastMxfp4Dual_Bridge(
       scale_margin,              // E8M0 under-flush headroom (default 0 = legacy)
       scale_mode,                // 0 = round-nearest (legacy); 1 = OAS floor
       use_2d_scale,              // share one 32x32-tile scale across row+col
+      0,                         // SR role unused
       stream
   );
 
+  return ffi::Error::Success();
+}
+
+ffi::Error CastMxfp4DualKeyedSr_Bridge(
+    hipStream_t stream,
+    ffi::AnyBuffer input,
+    ffi::AnyBuffer sr_key,
+    bool shuffle_fp4,
+    bool shuffle_colwise_fp4,
+    bool shuffle_scales,
+    bool use_hadamard,
+    bool use_hadamard_col,
+    bool use_sr,
+    bool use_sr_col,
+    int scale_margin,
+    int scale_mode,
+    bool use_2d_scale,
+    int sr_role,
+    ffi::Result<ffi::AnyBuffer> rowwise_fp4_out,
+    ffi::Result<ffi::AnyBuffer> rowwise_scale_out,
+    ffi::Result<ffi::AnyBuffer> colwise_fp4_out,
+    ffi::Result<ffi::AnyBuffer> colwise_scale_out
+) {
+  if (!use_sr && !use_sr_col) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: keyed SR target requires rowwise or columnwise SR");
+  }
+  if (!IsValidSrKey(sr_key)) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: deterministic SR key must have dtype uint32 and shape [4]");
+  }
+  if (sr_role < 0 || sr_role > 2) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: sr_role must be 0 (activation), 1 (weight), or 2 (gradient)");
+  }
+  auto dims = input.dimensions();
+  int M = static_cast<int>(dims[0]);
+  int K = static_cast<int>(dims[1]);
+  constexpr int BLOCK_SIZE = 32;
+  if (M % BLOCK_SIZE || K % BLOCK_SIZE ||
+      (reinterpret_cast<uintptr_t>(input.untyped_data()) % 8)) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: M,K must be multiples of 32 and input 8B-aligned");
+  }
+  if (use_2d_scale) {
+    return ffi::Error(
+        ffi::ErrorCode::kInvalidArgument,
+        "cast_mxfp4: use_2d_scale is incompatible with Hadamard or SR");
+  }
+  int rowwise_scale_N = cdiv(K, BLOCK_SIZE);
+  int rowwise_scale_M_pad = cdiv(M, 256) * 256;
+  int rowwise_scale_N_pad = cdiv(rowwise_scale_N, 8) * 8;
+  int colwise_scale_M = K;
+  int colwise_scale_N = cdiv(M, BLOCK_SIZE);
+  int colwise_scale_M_pad = cdiv(K, 256) * 256;
+  int colwise_scale_N_pad = cdiv(colwise_scale_N, 8) * 8;
+  mxfp4::launch_cast_transpose_mxfp4_shuffled(
+      input.untyped_data(), sr_key.untyped_data(),
+      rowwise_fp4_out->untyped_data(), rowwise_scale_out->untyped_data(),
+      colwise_fp4_out->untyped_data(), colwise_scale_out->untyped_data(),
+      M, K, true, true, shuffle_scales, use_hadamard, use_hadamard_col,
+      shuffle_fp4, shuffle_colwise_fp4, use_sr, use_sr_col,
+      rowwise_scale_N_pad, colwise_scale_N_pad,
+      rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad,
+      colwise_scale_M, colwise_scale_N, colwise_scale_M_pad,
+      colwise_scale_N_pad, scale_margin, scale_mode, false, sr_role, stream);
   return ffi::Error::Success();
 }
 
@@ -238,12 +386,31 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     {xla::ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CastMxfp4KeyedSrJA, jax_aiter::CastMxfp4KeyedSr_Bridge,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<hipStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Attr<bool>("shuffle_fp4")
+        .Attr<bool>("shuffle_scales")
+        .Attr<bool>("use_hadamard")
+        .Attr<bool>("use_sr")
+        .Attr<int>("scale_margin")
+        .Attr<int>("scale_mode")
+        .Attr<bool>("use_2d_scale")
+        .Attr<int>("sr_role")
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>(),
+    {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CastMxfp4DualJA, jax_aiter::CastMxfp4Dual_Bridge,
     ffi::Ffi::Bind()
         .Ctx<ffi::PlatformStream<hipStream_t>>()
         .Arg<ffi::AnyBuffer>()        // input: [M, K] bf16
         .Attr<bool>("shuffle_fp4")    // shuffle rowwise FP4 data
         .Attr<bool>("shuffle_colwise_fp4")  // shuffle colwise FP4 data
+        .Attr<bool>("shuffle_scales") // shuffle E8M0 scale layout (both directions)
         .Attr<bool>("use_hadamard")   // rowwise Hadamard
         .Attr<bool>("use_hadamard_col")  // colwise Hadamard (independent of row)
         .Attr<bool>("use_sr")         // rowwise SR (default false = RNE)
@@ -255,6 +422,29 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::AnyBuffer>()        // rowwise_scale: [M_pad, rscale_N_pad] uint8
         .Ret<ffi::AnyBuffer>()        // colwise_fp4:  [K, M/2] uint8
         .Ret<ffi::AnyBuffer>(),       // colwise_scale: [K_pad, cscale_N_pad] uint8
+    {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CastMxfp4DualKeyedSrJA, jax_aiter::CastMxfp4DualKeyedSr_Bridge,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<hipStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Attr<bool>("shuffle_fp4")
+        .Attr<bool>("shuffle_colwise_fp4")
+        .Attr<bool>("shuffle_scales")
+        .Attr<bool>("use_hadamard")
+        .Attr<bool>("use_hadamard_col")
+        .Attr<bool>("use_sr")
+        .Attr<bool>("use_sr_col")
+        .Attr<int>("scale_margin")
+        .Attr<int>("scale_mode")
+        .Attr<bool>("use_2d_scale")
+        .Attr<int>("sr_role")
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>(),
     {xla::ffi::Traits::kCmdBufferCompatible});
 
 #pragma GCC visibility pop

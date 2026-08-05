@@ -49,6 +49,8 @@ MhaFwdUnified_Bridge(
     std::optional<ffi::AnyBuffer> bias_,
     std::optional<ffi::AnyBuffer> alibi_slopes_,
     std::optional<ffi::AnyBuffer> gen_,
+    std::optional<ffi::AnyBuffer> cu_seqlens_q_logical_,
+    std::optional<ffi::AnyBuffer> cu_seqlens_kv_logical_,
     ffi::Result<ffi::AnyBuffer> o,
     ffi::Result<ffi::AnyBuffer> lse,
     ffi::Result<ffi::AnyBuffer> p,
@@ -219,9 +221,24 @@ MhaFwdUnified_Bridge(
   const ck_tile::index_t *cu_seqlen_k_ptr = nullptr;
 
   if (is_varlen) {
+    // Group mode: seqstart_* carry cumulative PHYSICAL offsets (padding
+    // included). When the caller also supplies cumulative LOGICAL lengths,
+    // AITER masks the per-segment padding tail instead of attending to it --
+    // this is the "group mode with padding" contract in mha_fwd.h, and the same
+    // pair TE hands to CK (ck_fused_attn_fwd.cpp).
     seqstart_q_ptr = reinterpret_cast<const ck_tile::index_t *>(cu_seqlens_q_->untyped_data());
     if (cu_seqlens_kv_.has_value() && mha_utils::is_valid_buffer(*cu_seqlens_kv_)) {
       seqstart_k_ptr = reinterpret_cast<const ck_tile::index_t *>(cu_seqlens_kv_->untyped_data());
+    }
+    if (cu_seqlens_q_logical_.has_value() &&
+        mha_utils::is_valid_buffer(*cu_seqlens_q_logical_)) {
+      cu_seqlen_q_ptr =
+          reinterpret_cast<const ck_tile::index_t *>(cu_seqlens_q_logical_->untyped_data());
+    }
+    if (cu_seqlens_kv_logical_.has_value() &&
+        mha_utils::is_valid_buffer(*cu_seqlens_kv_logical_)) {
+      cu_seqlen_k_ptr =
+          reinterpret_cast<const ck_tile::index_t *>(cu_seqlens_kv_logical_->untyped_data());
     }
   } else {
     if (cu_seqlens_q_.has_value() && mha_utils::is_valid_buffer(*cu_seqlens_q_)) {
@@ -406,6 +423,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // bias (optional)
         .Arg<ffi::AnyBuffer>() // alibi_slopes (optional)
         .Arg<ffi::AnyBuffer>() // gen (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_q_logical (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_kv_logical (optional)
         .Ret<ffi::AnyBuffer>() // o
         .Ret<ffi::AnyBuffer>() // lse
         .Ret<ffi::AnyBuffer>() // p (dropout mask)

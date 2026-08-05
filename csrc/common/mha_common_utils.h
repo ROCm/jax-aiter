@@ -209,6 +209,17 @@ void launch_mqa_gqa_reduction(const void *src, void *dst, int64_t batch_size,
                               int64_t groups, xla::ffi::DataType dtype,
                               hipStream_t stream);
 
+// Reduce expanded dK and dV in one traversal when their head dimensions match.
+// AITER writes both expanded tensors with identical [token, q_head, dim]
+// indexing, so combining the reductions removes one full launch and duplicates
+// none of the address arithmetic. Falls back at the caller when Dq != Dv.
+JAX_AITER_EXPORT
+void launch_mqa_gqa_reduction_pair(
+    const void *dk_src, const void *dv_src, void *dk_dst, void *dv_dst,
+    int64_t batch_size, int64_t seqlen_k, int64_t num_heads_q,
+    int64_t num_heads_k, int64_t head_size, int64_t groups,
+    xla::ffi::DataType dtype, hipStream_t stream);
+
 // Holds device pointers to seed and offset for RNG state.
 struct RngStatePointers {
   uint64_t *seed;

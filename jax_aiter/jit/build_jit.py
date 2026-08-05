@@ -4,10 +4,12 @@
 # Build script for JAX-AITER using AITER's JIT system.
 
 import os
+import re
 import sys
 import shutil
 import subprocess
 import json
+import time
 import argparse
 import functools
 from pathlib import Path
@@ -278,6 +280,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module,
             is_standalone,
             torch_exclude,
+            extra_cuda_cflags_per_source=None,
         ) -> None:
             """Wrapper to handle torch import when torch_exclude=True."""
             if torch_exclude:
@@ -303,6 +306,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                         is_python_module=is_python_module,
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude,
+                        extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
                     )
                 finally:
                     if 'torch' in sys.modules and sys.modules['torch'] is mock_torch:
@@ -320,6 +324,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                     is_python_module=is_python_module,
                     is_standalone=is_standalone,
                     torch_exclude=torch_exclude,
+                    extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
                 )
         
         cpp_extension._write_ninja_file_to_build_library = _write_ninja_file_to_build_library_ja_inner
@@ -337,6 +342,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             is_python_module: bool,
             is_standalone: bool = False,
             torch_exclude: bool = False,
+            extra_cuda_cflags_per_source=None,
         ) -> None:
             cpp_extension.verify_ninja_availability()
 
@@ -372,6 +378,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                extra_cuda_cflags_per_source=extra_cuda_cflags_per_source,
             )
 
             if verbose:
@@ -386,37 +393,81 @@ def patch_aiter_core(core_module, jax_aiter_root):
             _write_ninja_file_and_build_library_ja
         )
 
+        _NINJA_PROGRESS_RE = re.compile(r"^\[(\d+)/(\d+)\]")
+        _NINJA_FAIL_RE = re.compile(r"^(FAILED:|ninja: build stopped)|\berror:")
+
         def _run_ninja_build(
             build_directory: str, verbose: bool, error_prefix: str
         ) -> None:
+            """Run ninja, rendering one self-updating progress line.
+
+            The JIT build compiles tens of thousands of generated sources. Ninja
+            already counts them, but the previous implementation captured stdout
+            into a pipe and threw it away unless the build failed, so a two-hour
+            compile looked identical to a hung one. Here the stream is consumed
+            live: progress collapses onto a single line, compiler errors are
+            echoed the moment they appear, and the whole output is retained so a
+            failure still reports the real reason.
+            """
             command = ["ninja"]
             num_workers = cpp_extension._get_num_workers(verbose)
             if num_workers is not None:
                 command.extend(["-j", str(num_workers)])
-            env = os.environ.copy()
 
-            try:
+            # error_prefix looks like: Error building extension 'libmha_bwd'
+            label = (m.group(1) if (m := re.search(r"'([^']+)'", error_prefix))
+                     else "ninja")
+            tty = sys.stdout.isatty()
+            start = time.time()
+            captured: list[str] = []
+            last_tick = 0.0
+            done = total = 0
+
+            sys.stdout.flush()
+            sys.stderr.flush()
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=build_directory,
+                env=os.environ.copy(),
+                text=True,
+                bufsize=1,
+            )
+
+            def _status() -> str:
+                pct = f"{100.0 * done / total:5.1f}%" if total else "  ?  "
+                el = int(time.time() - start)
+                return (f"[{label}] {done}/{total or '?'} {pct} "
+                        f"{el // 60}m{el % 60:02d}s")
+
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                captured.append(line)
+                if m := _NINJA_PROGRESS_RE.match(line):
+                    done, total = int(m.group(1)), int(m.group(2))
+                    now = time.time()
+                    if tty:
+                        sys.stdout.write("\r\033[K" + _status())
+                        sys.stdout.flush()
+                    elif now - last_tick >= 30:
+                        # nohup / CI: periodic lines, since \r would be noise.
+                        print(_status(), flush=True)
+                        last_tick = now
+                    continue
+                if verbose or _NINJA_FAIL_RE.search(line):
+                    if tty:
+                        sys.stdout.write("\r\033[K")
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+
+            rc = proc.wait()
+            if tty:
+                sys.stdout.write("\r\033[K" + _status() + "\n")
                 sys.stdout.flush()
-                sys.stderr.flush()
-                stdout_fileno = 1
-                subprocess.run(
-                    command,
-                    stdout=stdout_fileno if verbose else subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=build_directory,
-                    check=True,
-                    env=env,
-                )
-            except subprocess.CalledProcessError as e:
-                # Python 2 and 3 compatible way of getting the error object.
-                _, error, _ = sys.exc_info()
-                # error.output contains the stdout and stderr of the build attempt.
-                message = error_prefix
-                # `error` is a CalledProcessError (which has an `output`) attribute, but
-                # mypy thinks it's Optional[BaseException] and doesn't narrow.
-                if hasattr(error, "output") and error.output:
-                    message += f": {error.output.decode(*SUBPROCESS_DECODE_ARGS)}"
-                raise RuntimeError(message) from e
+
+            if rc != 0:
+                raise RuntimeError(f"{error_prefix}: {''.join(captured)}")
 
         cpp_extension._run_ninja_build = _run_ninja_build
 

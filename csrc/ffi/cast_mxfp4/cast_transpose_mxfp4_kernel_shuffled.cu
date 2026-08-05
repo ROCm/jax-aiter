@@ -153,6 +153,28 @@ __device__ __forceinline__ float ds_swizzle_xor2(float val) {
 // REDUCTION OPERATIONS - Finding Maximum Absolute Value
 // ============================================================================
 
+__device__ __forceinline__ float dpp_max_xor2(float val) {
+    float out;
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_max_f32 %0, %1, %2 "
+        "quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1"
+        : "=v"(out)
+        : "v"(val), "v"(val));
+    return out;
+}
+
+__device__ __forceinline__ float dpp_max_xor1(float val) {
+    float out;
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_max_f32 %0, %1, %2 "
+        "quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1"
+        : "=v"(out)
+        : "v"(val), "v"(val));
+    return out;
+}
+
 /*
  * Warp Reduction for Max Absolute Value
  * --------------------------------------
@@ -175,20 +197,11 @@ __device__ __forceinline__ float warp_reduce_max_8_dpp(float val) {
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F" : "=v"(tmp) : "v"(v));
     asm volatile("s_waitcnt lgkmcnt(0)" :::);
     val = fmaxf(val, uint_as_float(tmp));
-    v = float_as_uint(val);
-
-    // Step 2: XOR-2 exchange (pair swap within quad) via DPP quad_perm:[2,3,0,1].
-    tmp = __builtin_amdgcn_mov_dpp(v, /*dpp_ctrl=*/0x4E,
-                                   /*row_mask=*/0xF, /*bank_mask=*/0xF,
-                                   /*bound_ctrl=*/false);
-    val = fmaxf(val, uint_as_float(tmp));
-    v = float_as_uint(val);
-
-    // Step 3: XOR-1 exchange (lane swap within quad) via DPP quad_perm:[1,0,3,2].
-    tmp = __builtin_amdgcn_mov_dpp(v, /*dpp_ctrl=*/0xB1,
-                                   /*row_mask=*/0xF, /*bank_mask=*/0xF,
-                                   /*bound_ctrl=*/false);
-    val = fmaxf(val, uint_as_float(tmp));
+    // Steps 2-3 fuse each DPP exchange with its dependent maximum. The explicit
+    // s_nop supplies the two VALU-write -> DPP-read wait states required by
+    // CDNA4 when inline assembly bypasses LLVM's hazard recognizer.
+    val = dpp_max_xor2(val);
+    val = dpp_max_xor1(val);
 
     return val;
 }
@@ -380,54 +393,77 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4(
 }
 
 /*
- * FP32 to FP4 Conversion with Stochastic Rounding (SR)
- * ----------------------------------------------------
- * Drop-in unbiased alternative to cvt_f32x4_to_fp4x4 (RNE). Same E2M1 grid
- * (NO extra precision) but rounds up/down with probability proportional to
- * the fractional distance, so E[dequant(SR(x))] == x. The payoff is
- * cumulative over training steps (per-step RNE bias does not cancel; SR's
- * does), which a single-step calibration cannot observe.
+ * FP32 to FP4 Conversion with Deterministic Stochastic Rounding (SR)
+ * ------------------------------------------------------------------
+ * The caller supplies four uint32 key words as an explicit FFI operand. The
+ * key is mixed with the semantic tensor role, row/column direction, and
+ * logical element coordinates. Identical operands and keys therefore produce
+ * identical packed FP4 bytes, while a new per-step/site key advances the
+ * stochastic stream without hidden clock state.
  *
- * v_cvt_scalef32_sr_pk_fp4_f32 (gfx950 / CDNA4): packs 2 FP32 -> 2 FP4 with a
- * per-element random dither drawn from a 32-bit RNG word, scaled inline.
- *
- * Per-thread PRNG seed (no host plumbing): mix the HW real-time clock with a
- * unique global thread id AND a caller-supplied spatial coordinate hash
- * (global row/col + dual-cast direction) so the dither decorrelates across
- * (a) threads within a launch, (b) element POSITIONS handled by the same
- * thread across chunks, (c) the rowwise vs colwise dual-cast directions, and
- * (d) launches/steps (the clock advances) -> cumulative unbiased SR. A 2-round
- * mix (coord fold -> prng) gives better avalanche than a single prng_b32.
- *
- * NOTE: full bit-REPRODUCIBILITY (deterministic across identical runs) would
- * require a host/JAX step-seed plumbed through the FFI attrs; that is a
- * frontend change (deferred). This seed is cast-kernel-local: reproducible
- * only up to the HW clock term, but now properly decorrelated in space.
- *
- * Mirrors third_party/aiter/.../ck/utility/type_convert.hpp f4_convert_sr.
+ * v_cvt_scalef32_sr_pk_fp4_f32 (gfx950 / CDNA4) packs two FP32 inputs using
+ * one caller-supplied 32-bit random word. We generate a separate word for each
+ * packed pair with an integer avalanche finalizer; v_prng_b32 is an LFSR step,
+ * not a suitable hash for structured counters.
  */
 #if defined(__gfx950__)
 typedef float fp32x2_t __attribute__((ext_vector_type(2)));
 #endif
 
+__device__ __forceinline__ uint32_t rotl32(uint32_t value, unsigned shift) {
+    return (value << shift) | (value >> (32u - shift));
+}
+
+__device__ __forceinline__ uint32_t fmix32(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15;
+    value *= 0x846CA68Bu;
+    value ^= value >> 16;
+    return value;
+}
+
+__device__ __forceinline__ uint32_t deterministic_sr_stream(
+    const uint32_t* __restrict__ key,
+    uint32_t role,
+    uint32_t direction
+) {
+    // JAX supplies four already-random uint32 words. Coordinate words receive
+    // the avalanche finalizer below; a second full fmix here only duplicates
+    // integer work without improving domain separation.
+    return (
+        key[0] ^ rotl32(key[1], 7) ^
+        (key[2] * 0x9E3779B1u) ^ rotl32(key[3], 17) ^
+        (role * 0xD1B54A35u) ^ (direction * 0x94D049BBu));
+}
+
+__device__ __forceinline__ uint32_t deterministic_sr_word(
+    uint32_t stream,
+    uint32_t row,
+    uint32_t col
+) {
+    uint32_t word = fmix32(
+        stream ^ (row * 0x85EBCA77u) ^ (col * 0xC2B2AE3Du));
+    return word == 0 ? 0xA511E9B3u : word;
+}
+
 __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(
     float v0, float v1, float v2, float v3,
-    float scale, uint32_t coord_hash
+    float scale,
+    const uint32_t* __restrict__ key,
+    uint32_t role,
+    uint32_t direction,
+    uint32_t row,
+    uint32_t col
 ) {
 #if defined(__gfx950__)
-    // Unique 1-D global thread id: blockIdx * blockDim + threadIdx (2-D grid,
-    // 1-D block). Decorrelates the per-thread RNG seed.
-    uint32_t global_tid =
-        (blockIdx.x * gridDim.y + blockIdx.y) * blockDim.x + threadIdx.x;
-
-    // Seed = clock*(tid+1) folded with the spatial coordinate hash, then a
-    // 2-round PRNG mix. The coord term decorrelates positions/directions even
-    // when the clock resolution is coarse (same thread, adjacent chunks).
-    uint32_t seed =
-        (uint32_t)(__builtin_amdgcn_s_memrealtime() * (uint64_t)(global_tid + 1u));
-    seed = __builtin_amdgcn_prng_b32(seed ^ (coord_hash * 2654435761u));
-    uint32_t rng0 = __builtin_amdgcn_prng_b32(seed);
-    uint32_t rng1 = __builtin_amdgcn_prng_b32(seed ^ 0x9E3779B9u);  // decorrelate 2nd pair
+    uint32_t stream = deterministic_sr_stream(key, role, direction);
+    uint32_t rng0 = deterministic_sr_word(
+        stream, row, col);
+    uint32_t rng1 = deterministic_sr_word(
+        stream,
+        row + (direction ? 2u : 0u),
+        col + (direction ? 0u : 2u));
 
     fp32x2_t pair0 = {v0, v1};
     fp32x2_t pair1 = {v2, v3};
@@ -563,6 +599,7 @@ template<
 __global__ __launch_bounds__(256, 8)
 void cast_transpose_mxfp4_shuffled(
     const uint16_t* __restrict__ input,
+    const uint32_t* __restrict__ sr_key,
     uint8_t* __restrict__ rowwise_fp4,
     uint8_t* __restrict__ rowwise_scale,
     uint8_t* __restrict__ colwise_fp4,
@@ -580,7 +617,8 @@ void cast_transpose_mxfp4_shuffled(
     const int colwise_scale_N_pad,
     const int scale_margin,
     const int scale_mode,
-    const bool use_2d_scale
+    const bool use_2d_scale,
+    const int sr_role
 ) {
     // ========================================================================
     // Thread and Block Identification
@@ -757,20 +795,20 @@ void cast_transpose_mxfp4_shuffled(
                         native_scale = tile_native_scale;
                         e8m0_scale = tile_e8m0;
                     } else {
-                        e8m0_scale = compute_e8m0_scale(amax, native_scale, scale_margin, scale_mode);
+                        e8m0_scale = compute_e8m0_scale(
+                            amax, native_scale, scale_margin, scale_mode);
                     }
 
                     // Convert to FP4 using hardware instruction (RNE or SR).
-                    // Both paths compiled; USE_SR is a compile-time template
-                    // param dispatched at runtime by the launcher.
-                    // dir=0 (rowwise) SR dither coordinate hash: element (row,col).
+                    // SR is keyed by semantic role, rowwise direction, and
+                    // logical element-pair coordinates.
                     int global_col_base = tile_n + col_base;
-                    uint32_t coord_hash =
-                        ((uint32_t)global_row * 0x9E3779B1u) ^
-                        ((uint32_t)global_col_base * 0x85EBCA77u);
                     uint16_t fp4x4;
                     if constexpr (USE_SR_ROW) {
-                        fp4x4 = cvt_f32x4_to_fp4x4_sr(v0, v1, v2, v3, native_scale, coord_hash);
+                        fp4x4 = cvt_f32x4_to_fp4x4_sr(
+                            v0, v1, v2, v3, native_scale, sr_key,
+                            (uint32_t)sr_role, 0u,
+                            (uint32_t)global_row, (uint32_t)global_col_base);
                     } else {
                         fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
                     }
@@ -849,20 +887,19 @@ void cast_transpose_mxfp4_shuffled(
                         native_scale = tile_native_scale;
                         e8m0_scale = tile_e8m0;
                     } else {
-                        e8m0_scale = compute_e8m0_scale(amax, native_scale, scale_margin, scale_mode);
+                        e8m0_scale = compute_e8m0_scale(
+                            amax, native_scale, scale_margin, scale_mode);
                     }
 
-                    // Convert to FP4 (RNE or SR; both compiled, runtime-selected).
-                    // dir=1 (colwise) SR dither coordinate hash: element (row,col)
-                    // XOR a direction constant so a weight element cast in BOTH
-                    // directions draws independent dither per direction.
+                    // Convert to FP4. Columnwise SR uses a distinct direction
+                    // domain while retaining original logical coordinates.
                     int global_row_base = tile_m + row_base;
-                    uint32_t coord_hash =
-                        ((uint32_t)global_row_base * 0x9E3779B1u) ^
-                        ((uint32_t)global_col * 0x85EBCA77u) ^ 0xC2B2AE3Du;
                     uint16_t fp4x4;
                     if constexpr (USE_SR_COL) {
-                        fp4x4 = cvt_f32x4_to_fp4x4_sr(v0, v1, v2, v3, native_scale, coord_hash);
+                        fp4x4 = cvt_f32x4_to_fp4x4_sr(
+                            v0, v1, v2, v3, native_scale, sr_key,
+                            (uint32_t)sr_role, 1u,
+                            (uint32_t)global_row_base, (uint32_t)global_col);
                     } else {
                         fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
                     }
@@ -921,6 +958,7 @@ void cast_transpose_mxfp4_shuffled(
  */
 extern "C" void launch_cast_transpose_mxfp4_shuffled(
     const void* input,
+    const void* sr_key,
     void* rowwise_fp4,
     void* rowwise_scale,
     void* colwise_fp4,
@@ -948,6 +986,7 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int scale_margin,
     int scale_mode,
     bool use_2d_scale,
+    int sr_role,
     hipStream_t stream
 ) {
     // Grid configuration: tiles of 128x64
@@ -960,14 +999,14 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     #define LAUNCH_KERNEL(ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C) \
         mxfp4::cast_transpose_mxfp4_shuffled<ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C> \
             <<<grid, block, 0, stream>>>( \
-                (const uint16_t*)input, \
+                (const uint16_t*)input, (const uint32_t*)sr_key, \
                 (uint8_t*)rowwise_fp4, (uint8_t*)rowwise_scale, \
                 (uint8_t*)colwise_fp4, (uint8_t*)colwise_scale, \
                 M, N, \
                 rowwise_scale_stride, colwise_scale_stride, \
                 rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, \
                 colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad, \
-                scale_margin, scale_mode, use_2d_scale)
+                scale_margin, scale_mode, use_2d_scale, sr_role)
 
     // Innermost level: select rowwise/colwise enable + fp4-shuffle combos, with
     // the row/col Hadamard + SR template bools already resolved by DISP_HAD/DISP_SR.
