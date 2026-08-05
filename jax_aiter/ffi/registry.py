@@ -38,7 +38,9 @@ SYMBOL_TO_MODULE_MAP = {
     "GemmI8FwdJA": "gemm_i8_ja.so",
     "GemmFp4FwdJA": "gemm_fp4_ja.so",
     "CastMxfp4JA": "cast_mxfp4_ja.so",
+    "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualJA": "cast_mxfp4_ja.so",
+    "CastMxfp4DualKeyedSrJA": "cast_mxfp4_ja.so",
 }
 
 

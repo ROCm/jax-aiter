@@ -187,7 +187,9 @@ from .fp4_utils import bf16_to_mxfp4, e8m0_shuffle, shuffle_weight  # noqa: F401
 # ---------------------------------------------------------------------------
 try:
     register_ffi_target("CastMxfp4JA", "ROCM")
+    register_ffi_target("CastMxfp4KeyedSrJA", "ROCM")
     register_ffi_target("CastMxfp4DualJA", "ROCM")
+    register_ffi_target("CastMxfp4DualKeyedSrJA", "ROCM")
     register_ffi_target("GemmFp4FwdJA", "ROCM")
 except Exception as exc:  # pragma: no cover -- build-time error path
     raise ImportError(
@@ -277,6 +279,27 @@ _SR_DGRAD_ROW = _SR_GRAD or bool(_SR_PASSES & {"dgrad_row", "dgrad_grad_row"})
 _SR_WGRAD_COL = _SR_GRAD or bool(_SR_PASSES & {"wgrad_col", "wgrad_grad_col"})
 _SR_ACT = _SR_ALL or bool(_SR_PASSES & {"act", "fprop", "fprop_act"})
 _SR_WT = _SR_ALL or bool(_SR_PASSES & {"wt", "weight"})
+_SR_ANY = _SR_DGRAD_ROW or _SR_WGRAD_COL or _SR_ACT or _SR_WT
+_SR_ROLE_ACT = 0
+_SR_ROLE_WT = 1
+_SR_ROLE_GRAD = 2
+
+
+def _normalize_sr_key(sr_key):
+    """Return the explicit runtime SR key as a uint32[4] JAX array."""
+    if sr_key is None:
+        raise ValueError(
+            "MXFP4 stochastic rounding requires an explicit runtime sr_key"
+        )
+    key = jnp.asarray(sr_key)
+    if jnp.issubdtype(key.dtype, jax.dtypes.prng_key):
+        key = jax.random.bits(key, shape=(4,), dtype=jnp.uint32)
+    if key.dtype != jnp.uint32 or key.shape != (4,):
+        raise ValueError(
+            f"MXFP4 sr_key must be a typed JAX key or uint32[4], got "
+            f"dtype={key.dtype} shape={key.shape}"
+        )
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +636,8 @@ def _h_grad_col():
 
 def _cast_dual_selective(x, *, shuffle_fp4, shuffle_colwise_fp4,
                          row_hadamard, col_hadamard, row_sr, col_sr,
-                         scale_margin=0, scale_mode=0, use_2d_scale=False):
+                         sr_key=None, sr_role=0, scale_margin=0, scale_mode=0,
+                         use_2d_scale=False):
     """Dual-cast with independent row/col Hadamard/SR in ONE fused launch.
 
     The fused dual-cast kernel takes PER-DIRECTION Hadamard + SR flags
@@ -632,31 +656,35 @@ def _cast_dual_selective(x, *, shuffle_fp4, shuffle_colwise_fp4,
         use_hadamard_col=col_hadamard,
         use_sr=row_sr,
         use_sr_col=col_sr,
+        sr_key=sr_key,
+        sr_role=sr_role,
         scale_margin=scale_margin,
         scale_mode=scale_mode,
         use_2d_scale=use_2d_scale,
     )
 
 
-def _cast_act_raw(x):
+def _cast_act_raw(x, sr_key=None):
     """Activation cast: rowwise only, unshuffled, no Hadamard.
 
     Used by the forward-only primal path (no autograd).
     """
     return _cast_mxfp4_op(x, shuffle_fp4=False, use_hadamard=_h_act_row(),
-                          use_sr=_SR_ACT, scale_mode=_OAS_MODE)
+                          use_sr=_SR_ACT, sr_key=sr_key,
+                          sr_role=_SR_ROLE_ACT, scale_mode=_OAS_MODE)
 
 
-def _cast_wt_raw(x):
+def _cast_wt_raw(x, sr_key=None):
     """Weight cast: rowwise only, B-preshuffle shuffled, no Hadamard.
 
     Used by the forward-only primal path (no autograd).
     """
     return _cast_mxfp4_op(x, shuffle_fp4=True, use_hadamard=_h_wt_row(),
-                          use_sr=_SR_WT, scale_mode=_OAS_MODE)
+                          use_sr=_SR_WT, sr_key=sr_key,
+                          sr_role=_SR_ROLE_WT, scale_mode=_OAS_MODE)
 
 
-def _cast_act_dual_raw(x):
+def _cast_act_dual_raw(x, sr_key=None):
     """Activation dual-cast: rowwise unshuffled + columnwise shuffled, no Hadamard.
 
     rowwise -> A operand of fprop GEMM
@@ -670,11 +698,13 @@ def _cast_act_dual_raw(x):
         col_hadamard=_h_act_col(),
         row_sr=_SR_ACT,
         col_sr=_SR_ACT,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_ACT,
         scale_mode=_OAS_MODE,
     )
 
 
-def _cast_wt_dual_raw(x):
+def _cast_wt_dual_raw(x, sr_key=None):
     """Weight dual-cast: rowwise shuffled + columnwise shuffled, no Hadamard.
 
     rowwise -> B operand of fprop GEMM
@@ -688,6 +718,8 @@ def _cast_wt_dual_raw(x):
         col_hadamard=_h_wt_col(),
         row_sr=_SR_WT,
         col_sr=_SR_WT,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_WT,
         scale_mode=_OAS_MODE,
         use_2d_scale=_WT2D,
     )
@@ -702,7 +734,7 @@ def _cast_wt_dual_raw(x):
 # with shuffle_weight / e8m0_shuffle. (Shuffled rowwise output would entangle
 # K-blocks into the row axis and could NOT be gathered along K.)
 
-def _cast_wt_row_unshuf_raw(x):
+def _cast_wt_row_unshuf_raw(x, sr_key=None):
     """Rowwise weight cast, UNSHUFFLED (Lever B K-sharded path).
 
     Emits packed FP4 + LINEAR E8M0 scales (no B-preshuffle, no scale shuffle) so
@@ -711,10 +743,11 @@ def _cast_wt_row_unshuf_raw(x):
     """
     return _cast_mxfp4_op(x, shuffle_fp4=False, shuffle_scales=False,
                           use_hadamard=_h_wt_row(), use_sr=_SR_WT,
+                          sr_key=sr_key, sr_role=_SR_ROLE_WT,
                           scale_mode=_OAS_MODE)
 
 
-def _cast_wt_dual_ksharded_raw(x):
+def _cast_wt_dual_ksharded_raw(x, sr_key=None):
     """Weight dual-cast for a K-sharded weight (Lever B).
 
     Rowwise output is UNSHUFFLED (gathered + shuffled later in the fwd GEMM);
@@ -724,7 +757,7 @@ def _cast_wt_dual_ksharded_raw(x):
     shuffle_scales flag). Byte-identical VALUES to ``_cast_wt_dual_raw`` -- only
     the rowwise shuffle/scale-shuffle layout differs (re-applied after gather).
     """
-    r_packed, r_scale = _cast_wt_row_unshuf_raw(x)
+    r_packed, r_scale = _cast_wt_row_unshuf_raw(x, sr_key)
     _, _, c_packed, c_scale = _cast_mxfp4_dual_op(
         x,
         shuffle_fp4=True,
@@ -733,13 +766,15 @@ def _cast_wt_dual_ksharded_raw(x):
         use_hadamard_col=_h_wt_col(),
         use_sr=_SR_WT,
         use_sr_col=_SR_WT,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_WT,
         scale_mode=_OAS_MODE,
         use_2d_scale=_WT2D,
     )
     return r_packed, r_scale, c_packed, c_scale
 
 
-def _cast_grad_dual_raw(x):
+def _cast_grad_dual_raw(x, sr_key=None):
     """Grad dual-cast: rowwise unshuffled + columnwise unshuffled, Hadamard ON.
 
     rowwise -> A operand of dgrad GEMM (dA = grad_out @ B_col).
@@ -759,6 +794,8 @@ def _cast_grad_dual_raw(x):
         col_hadamard=_h_grad_col(),
         row_sr=_SR_DGRAD_ROW,
         col_sr=_SR_WGRAD_COL,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_GRAD,
         scale_margin=_SCALE_MARGIN,
         scale_mode=_OAS_MODE,
     )
@@ -921,6 +958,11 @@ def _cast_grad_dual(x):
     return _cast_grad_dual_raw(x)
 
 
+@custom_partitioning
+def _cast_grad_dual_keyed(x, sr_key):
+    return _cast_grad_dual_raw(x, sr_key)
+
+
 def _cast_dual_infer_sharding(mesh, arg_shapes, result_shape):
     x_spec = _get_spec(arg_shapes[0])
     m_axis = x_spec[0]
@@ -946,6 +988,32 @@ def _make_dual_cast_partition(raw_fn):
                  NamedSharding(mesh, col_spec), NamedSharding(mesh, col_spec)),
                 (NamedSharding(mesh, in_spec),))
     return _partition
+
+
+def _cast_dual_keyed_partition(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    in_spec = P(m_axis, None)
+    row_spec = P(m_axis, None)
+    col_spec = P(None, m_axis)
+
+    def _lowered(x, sr_key):
+        return _cast_grad_dual_raw(x, sr_key)
+
+    return (
+        mesh,
+        _lowered,
+        (
+            NamedSharding(mesh, row_spec),
+            NamedSharding(mesh, row_spec),
+            NamedSharding(mesh, col_spec),
+            NamedSharding(mesh, col_spec),
+        ),
+        (
+            NamedSharding(mesh, in_spec),
+            NamedSharding(mesh, P(None)),
+        ),
+    )
 
 
 # ----- Lever B: K-sharded-aware weight dual cast (JA_FP4_PACK_GATEUP_AG) ------
@@ -1029,6 +1097,15 @@ for _wrapped, _raw in ((_cast_act_dual, _cast_act_dual_raw),
         need_replication_factors=("sf", "k", "rkp", "rsp", "hf"),
         sf=32, hf=16,
     )
+
+_cast_grad_dual_keyed.def_partition(
+    _cast_dual_keyed_partition,
+    infer_sharding_from_operands=_cast_dual_infer_sharding,
+    sharding_rule="(c sf) k, r -> (c sf) rkp, (c sf) rsp, k (c hf), k c",
+    need_replication_factors=("sf", "k", "r", "rkp", "rsp", "hf"),
+    sf=32,
+    hf=16,
+)
 
 if _PACK_GATEUP_AG:
     _cast_wt_dual.def_partition(
@@ -1867,8 +1944,14 @@ def _capture_bwd(grad_out, k_dim):
 # Public high-level API: BF16 in, FP4 internally, BF16 out.
 # ---------------------------------------------------------------------------
 
+def _gemm_fp4_bf16_primal(a, b):
+    a_packed, a_scales = _cast_act(a)
+    b_packed, b_scales = _cast_wt(b)
+    return _fp4_fprop(a_packed, b_packed, a_scales, b_scales)
+
+
 @partial(jax.custom_vjp, nondiff_argnums=())
-def gemm_fp4_bf16(a, b):
+def _gemm_fp4_bf16_unkeyed(a, b):
     """Compute ``A @ B^T`` in MXFP4 with BF16 inputs and outputs.
 
     Forward: cast ``a`` and ``b`` to MXFP4 (rowwise only for the no-autograd
@@ -1887,9 +1970,7 @@ def gemm_fp4_bf16(a, b):
     Returns:
         out: [M, N] bfloat16.
     """
-    a_packed, a_scales = _cast_act(a)
-    b_packed, b_scales = _cast_wt(b)
-    return _fp4_fprop(a_packed, b_packed, a_scales, b_scales)
+    return _gemm_fp4_bf16_primal(a, b)
 
 
 def _gemm_fp4_bf16_fwd(a, b):
@@ -1944,7 +2025,7 @@ def _gemm_fp4_bf16_fwd(a, b):
     return out, residual
 
 
-def _gemm_fp4_bf16_bwd(residuals, grad_out):
+def _gemm_fp4_bf16_bwd(residuals, grad_out, sr_key=None):
     """Backward: FP4 (default) or bf16 dA / dB per ``JA_FP4_HIGHP_PASSES``.
 
     dA is the input-gradient (dgrad) GEMM ``grad_out @ B``, contracting the
@@ -1988,7 +2069,16 @@ def _gemm_fp4_bf16_bwd(residuals, grad_out):
     # high-precision when bf16 OR fp8.
     go_row = go_row_s = go_col_fp4 = go_col_scale = None
     if (not _dgrad_highp) or (not _HIGHP_WGRAD):
-        go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
+        if _SR_DGRAD_ROW or _SR_WGRAD_COL:
+            if sr_key is None:
+                raise ValueError(
+                    "gradient stochastic rounding requires a runtime sr_key"
+                )
+            go_row, go_row_s, go_col_fp4, go_col_scale = (
+                _cast_grad_dual_keyed(grad_out, sr_key)
+            )
+        else:
+            go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
 
     # dA = grad_out @ B -- NN layout, contraction over N (replicated under FSDP).
     if _DGRAD_SPLIT:
@@ -2041,4 +2131,44 @@ def _gemm_fp4_bf16_bwd(residuals, grad_out):
     return da, db
 
 
-gemm_fp4_bf16.defvjp(_gemm_fp4_bf16_fwd, _gemm_fp4_bf16_bwd)
+_gemm_fp4_bf16_unkeyed.defvjp(_gemm_fp4_bf16_fwd, _gemm_fp4_bf16_bwd)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=())
+def _gemm_fp4_bf16_keyed(a, b, sr_key):
+    return _gemm_fp4_bf16_primal(a, b)
+
+
+def _gemm_fp4_bf16_keyed_fwd(a, b, sr_key):
+    out, residual = _gemm_fp4_bf16_fwd(a, b)
+    return out, (residual, sr_key)
+
+
+def _gemm_fp4_bf16_keyed_bwd(keyed_residual, grad_out):
+    residual, sr_key = keyed_residual
+    da, db = _gemm_fp4_bf16_bwd(residual, grad_out, sr_key=sr_key)
+    return da, db, None
+
+
+_gemm_fp4_bf16_keyed.defvjp(
+    _gemm_fp4_bf16_keyed_fwd, _gemm_fp4_bf16_keyed_bwd
+)
+
+
+def gemm_fp4_bf16(a, b, *, sr_key=None):
+    """Compute ``A @ B^T`` in MXFP4, with explicit-key deterministic SR.
+
+    The default RNE path retains the original two-operand HLO. When an SR role
+    is enabled, ``sr_key`` must be a typed JAX key or ``uint32[4]`` runtime
+    array. The current high-level training path supports deterministic SR on
+    the gradient row/column representations; activation/weight SR remains a
+    low-level diagnostic.
+    """
+    if _SR_ACT or _SR_WT:
+        raise NotImplementedError(
+            "deterministic high-level MXFP4 currently supports gradient SR "
+            "only; activation/weight SR requires keyed forward cast plumbing"
+        )
+    if _SR_ANY:
+        return _gemm_fp4_bf16_keyed(a, b, _normalize_sr_key(sr_key))
+    return _gemm_fp4_bf16_unkeyed(a, b)

@@ -6,12 +6,15 @@ Works on gfx950 (MI350/MI355X). Tests the full pipeline:
   BF16 -> MXFP4 quantize -> shuffle -> FFI kernel -> compare vs BF16 reference.
 """
 
+import importlib
+
 import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from jax_aiter.gemm_fp4 import gemm_fp4
+from jax_aiter.ops.gemm_fp4 import cast_mxfp4_dual
 from jax_aiter.gemm_fp4.fp4_utils import (
     bf16_to_mxfp4,
     mxfp4_to_bf16,
@@ -170,6 +173,56 @@ def test_fp4_gemm_zeros():
     assert jnp.all(jnp.isfinite(out))
 
 
+def test_keyed_sr_requires_uint32x4_key():
+    x = jnp.ones((64, 128), dtype=jnp.bfloat16)
+    with pytest.raises(ValueError, match=r"uint32\[4\]"):
+        cast_mxfp4_dual(
+            x,
+            shuffle_fp4=False,
+            use_sr_col=True,
+            sr_key=jnp.zeros((2,), dtype=jnp.uint32),
+            sr_role=2,
+        )
+
+
+def test_keyed_column_sr_is_reproducible_and_direction_selective():
+    x = jax.random.normal(
+        jax.random.PRNGKey(123), (256, 512), dtype=jnp.bfloat16
+    )
+    key0 = jnp.array([1, 2, 3, 4], dtype=jnp.uint32)
+    key1 = jnp.array([5, 6, 7, 8], dtype=jnp.uint32)
+    kwargs = dict(
+        shuffle_fp4=False,
+        shuffle_colwise_fp4=False,
+        use_hadamard=False,
+        use_hadamard_col=True,
+        use_sr=False,
+        use_sr_col=True,
+        sr_role=2,
+    )
+    out0 = cast_mxfp4_dual(x, sr_key=key0, **kwargs)
+    out0_repeat = cast_mxfp4_dual(x, sr_key=key0, **kwargs)
+    out1 = cast_mxfp4_dual(x, sr_key=key1, **kwargs)
+    rne = cast_mxfp4_dual(
+        x,
+        shuffle_fp4=False,
+        shuffle_colwise_fp4=False,
+        use_hadamard=False,
+        use_hadamard_col=True,
+        use_sr=False,
+        use_sr_col=False,
+        sr_role=2,
+    )
+
+    for actual, expected in zip(out0, out0_repeat):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(np.asarray(out0[0]), np.asarray(rne[0]))
+    np.testing.assert_array_equal(np.asarray(out0[1]), np.asarray(rne[1]))
+    np.testing.assert_array_equal(np.asarray(out0[3]), np.asarray(rne[3]))
+    np.testing.assert_array_equal(np.asarray(out0[0]), np.asarray(out1[0]))
+    assert np.any(np.asarray(out0[2]) != np.asarray(out1[2]))
+
+
 # --- High-level API tests (gemm_fp4_bf16) ---
 
 from jax_aiter.gemm_fp4 import gemm_fp4_bf16
@@ -219,3 +272,33 @@ def test_gemm_fp4_bf16_gradient_flow(M, N, K):
     assert jnp.all(jnp.isfinite(db)), "Non-finite db"
     assert jnp.any(da != 0), "da all zeros"
     assert jnp.any(db != 0), "db all zeros"
+
+
+def test_gemm_fp4_bf16_keyed_column_sr_gradient_flow(monkeypatch):
+    module = importlib.import_module("jax_aiter.gemm_fp4.gemm_fp4")
+    monkeypatch.setattr(module, "_SR_GRAD", False)
+    monkeypatch.setattr(module, "_SR_DGRAD_ROW", False)
+    monkeypatch.setattr(module, "_SR_WGRAD_COL", True)
+    monkeypatch.setattr(module, "_SR_ACT", False)
+    monkeypatch.setattr(module, "_SR_WT", False)
+    monkeypatch.setattr(module, "_SR_ANY", True)
+
+    key = jax.random.PRNGKey(314)
+    k1, k2 = jax.random.split(key)
+    a = jax.random.normal(k1, (256, 256), dtype=jnp.bfloat16)
+    b = jax.random.normal(k2, (256, 256), dtype=jnp.bfloat16)
+    sr_key = jnp.array([11, 22, 33, 44], dtype=jnp.uint32)
+
+    da, db = jax.grad(
+        lambda a_, b_: jnp.sum(
+            module.gemm_fp4_bf16(a_, b_, sr_key=sr_key)
+        ),
+        argnums=(0, 1),
+    )(a, b)
+
+    assert da.shape == a.shape
+    assert db.shape == b.shape
+    assert jnp.all(jnp.isfinite(da))
+    assert jnp.all(jnp.isfinite(db))
+    assert jnp.any(da != 0)
+    assert jnp.any(db != 0)
