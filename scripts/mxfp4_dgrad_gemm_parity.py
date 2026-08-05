@@ -10,7 +10,8 @@ bf16/fp8 dgrad bypass the f4gemm (XLA dot_general), so the f4gemm's
 faithfulness for the dA shape was never directly checked.
 
 The dgrad call (jax_aiter/gemm_fp4/gemm_fp4.py `_gemm_fp4_bf16_bwd`):
-    da = _fp4_ffi_partitioned(go_row, col_b_fp4, go_row_s, col_b_scale)
+    da = _fp4_dgrad_kgather(go_row, col_b_unshuf, go_row_s, col_b_scale_lin)
+    -> shuffle_weight / e8m0_shuffle after the packed all-gather
     -> GemmFp4FwdJA -> aiter::f4gemm
     Out[M, P] = go_row[M, C] @ col_b[P, C]^T   (FFI M=tokens, N=P=K_orig,
     K=C=N_orig is the contraction = the projection's output-feature dim).

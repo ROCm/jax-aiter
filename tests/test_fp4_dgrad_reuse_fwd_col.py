@@ -184,13 +184,14 @@ def test_gate2_value_and_grad_parity_single_device(M, N, K):
 
 
 # --------------------------------------------------------------------------- #
-# Guardrail -- default-off is the recast path; flag-on drops the raw weight.
+# Guardrail -- default-off stashes raw weight; flag-on stashes packed colwise.
 # --------------------------------------------------------------------------- #
 
 def test_guardrail_default_off_recasts_flag_on_reuses():
     """Under the default packed dgrad, flag OFF stashes the RAW bf16 weight (recast
-    path, 5 residuals); flag ON reuses the saved colwise residual (4 residuals,
-    no raw weight)."""
+    path, 3 residuals); flag ON reuses the saved colwise residual (4 residuals,
+    no raw weight). The removed corrupt dgrad no longer requires shuffled
+    columnwise weight residuals in the flag-off path."""
     _require_packed_dgrad()
     M, N, K = 256, 4096, 4096
     ka, kb = jax.random.split(jax.random.PRNGKey(3))
@@ -202,10 +203,10 @@ def test_guardrail_default_off_recasts_flag_on_reuses():
     with _reuse_flag(True):
         _, res_on = jax.jit(g._gemm_fp4_bf16_fwd)(a, b)
 
-    assert len(res_off) == 5, f"flag-off should stash raw b (recast): got {len(res_off)}"
+    assert len(res_off) == 3, f"flag-off should stash raw b (recast): got {len(res_off)}"
     assert len(res_on) == 4, f"flag-on should NOT stash raw b (reuse): got {len(res_on)}"
-    # flag-off residual[4] is the raw bf16 weight the backward re-casts.
-    assert res_off[4].shape == b.shape and res_off[4].dtype == jnp.bfloat16
+    # flag-off residual[2] is the raw bf16 weight the backward re-casts.
+    assert res_off[2].shape == b.shape and res_off[2].dtype == jnp.bfloat16
 
 
 def test_guardrail_default_module_flag_is_off():
