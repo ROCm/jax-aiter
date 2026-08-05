@@ -56,6 +56,52 @@ template __global__ void mqa_gqa_reduce_kernel<hip_bf16_type>(
     const hip_bf16_type *__restrict__, hip_bf16_type *__restrict__, int64_t,
     int64_t, int64_t, int64_t, int64_t, int64_t);
 
+template <typename T>
+__global__ void mqa_gqa_reduce_pair_kernel(
+    const T *__restrict__ dk_expanded,
+    const T *__restrict__ dv_expanded,
+    T *__restrict__ dk_reduced,
+    T *__restrict__ dv_reduced,
+    int64_t batch_size, int64_t seqlen, int64_t num_heads_q,
+    int64_t num_heads_k, int64_t head_dim, int64_t num_groups) {
+  const int64_t tid =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total_elements =
+      batch_size * seqlen * num_heads_k * head_dim;
+  if (tid >= total_elements)
+    return;
+
+  const int64_t b = tid / (seqlen * num_heads_k * head_dim);
+  int64_t remainder = tid % (seqlen * num_heads_k * head_dim);
+  const int64_t s = remainder / (num_heads_k * head_dim);
+  remainder %= num_heads_k * head_dim;
+  const int64_t hk = remainder / head_dim;
+  const int64_t d = remainder % head_dim;
+
+  float dk_sum = 0.0f;
+  float dv_sum = 0.0f;
+  for (int64_t g = 0; g < num_groups; ++g) {
+    const int64_t h = hk * num_groups + g;
+    const int64_t expanded_idx =
+        b * seqlen * num_heads_q * head_dim +
+        s * num_heads_q * head_dim + h * head_dim + d;
+    dk_sum += static_cast<float>(dk_expanded[expanded_idx]);
+    dv_sum += static_cast<float>(dv_expanded[expanded_idx]);
+  }
+
+  dk_reduced[tid] = static_cast<T>(dk_sum);
+  dv_reduced[tid] = static_cast<T>(dv_sum);
+}
+
+template __global__ void mqa_gqa_reduce_pair_kernel<__half>(
+    const __half *__restrict__, const __half *__restrict__,
+    __half *__restrict__, __half *__restrict__, int64_t, int64_t, int64_t,
+    int64_t, int64_t, int64_t);
+template __global__ void mqa_gqa_reduce_pair_kernel<hip_bf16_type>(
+    const hip_bf16_type *__restrict__, const hip_bf16_type *__restrict__,
+    hip_bf16_type *__restrict__, hip_bf16_type *__restrict__, int64_t, int64_t,
+    int64_t, int64_t, int64_t, int64_t);
+
 JAX_AITER_EXPORT
 void launch_mqa_gqa_reduction(const void *src, void *dst, int64_t batch_size,
                               int64_t seqlen_k, int64_t num_heads_q,
@@ -76,6 +122,34 @@ void launch_mqa_gqa_reduction(const void *src, void *dst, int64_t batch_size,
         static_cast<const hip_bf16_type *>(src),
         static_cast<hip_bf16_type *>(dst), batch_size, seqlen_k, num_heads_q,
         num_heads_k, head_size, groups);
+  }
+}
+
+JAX_AITER_EXPORT
+void launch_mqa_gqa_reduction_pair(
+    const void *dk_src, const void *dv_src, void *dk_dst, void *dv_dst,
+    int64_t batch_size, int64_t seqlen_k, int64_t num_heads_q,
+    int64_t num_heads_k, int64_t head_size, int64_t groups,
+    xla::ffi::DataType dtype, hipStream_t stream) {
+  const int64_t total_elements =
+      batch_size * seqlen_k * num_heads_k * head_size;
+  constexpr int threads = 256;
+  const int blocks = static_cast<int>((total_elements + threads - 1) / threads);
+
+  if (dtype == xla::ffi::DataType::F16) {
+    mqa_gqa_reduce_pair_kernel<__half><<<blocks, threads, 0, stream>>>(
+        static_cast<const __half *>(dk_src),
+        static_cast<const __half *>(dv_src), static_cast<__half *>(dk_dst),
+        static_cast<__half *>(dv_dst), batch_size, seqlen_k, num_heads_q,
+        num_heads_k, head_size, groups);
+  } else if (dtype == xla::ffi::DataType::BF16) {
+    mqa_gqa_reduce_pair_kernel<hip_bf16_type>
+        <<<blocks, threads, 0, stream>>>(
+            static_cast<const hip_bf16_type *>(dk_src),
+            static_cast<const hip_bf16_type *>(dv_src),
+            static_cast<hip_bf16_type *>(dk_dst),
+            static_cast<hip_bf16_type *>(dv_dst), batch_size, seqlen_k,
+            num_heads_q, num_heads_k, head_size, groups);
   }
 }
 

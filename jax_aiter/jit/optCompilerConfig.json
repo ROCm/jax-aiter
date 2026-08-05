@@ -21,6 +21,7 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_batch_prefill.cu'"
         ],
         "flags_extra_cc": [
+            "'-DFAV3_ON=1'",
             "'-DFAV2_ON=1'"
         ],
         "flags_extra_hip": [

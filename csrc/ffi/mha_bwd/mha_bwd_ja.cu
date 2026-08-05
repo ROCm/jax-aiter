@@ -5,12 +5,17 @@
 // Detects mode from tensor rank: 4D = batch [b,s,h,d], 3D = varlen [total,h,d].
 // Calls aiter::mha_bwd(args, stream) which handles CK vs ASM v3 internally.
 //
-// Multi-GPU note: AITER's fmha_v3_bwd impl_ptr_map is now protected by a
-// mutex (Xinya's fix cherry-picked onto third_party/aiter), so ASM v3
-// kernels can be used on all devices concurrently.
+// Multi-GPU note: AITER's ASM kernel cache is a SynchronizedCache upstream as
+// of v0.1.19 (cpp_itfs/mha_bwd.cu), so ASM v3 kernels can be used on all
+// devices concurrently. This no longer depends on a local cherry-pick.
 
 #include <hip/hip_runtime.h>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "xla/ffi/api/c_api.h"
@@ -54,57 +59,50 @@ struct WorkspacePool {
   }
 };
 
-static thread_local WorkspacePool s_dq_acc_pool;
+static thread_local WorkspacePool s_aiter_ws_pool;
 static thread_local WorkspacePool s_dk_exp_pool;
 static thread_local WorkspacePool s_dv_exp_pool;
 static thread_local WorkspacePool s_dbias_pool;
 static thread_local WorkspacePool s_rng_pool;
 
-static size_t compute_dq_acc_size_unified(
-    bool is_varlen, int64_t batch_size, int64_t seqlen_q_or_total,
-    int64_t seqlen_k_or_max, int64_t num_heads, int64_t head_size,
-    bool deterministic, bool use_asm_v3, bool is_v3_atomic_fp32,
-    ffi::DataType q_dtype, std::vector<int64_t> &out_shape) {
-
-  size_t elem_sz = 4;
-
-  if (is_varlen) {
-    // Varlen: 4D layout [split, total_q, nheads, head_size]
-    if (!deterministic) {
-      out_shape = {1, seqlen_q_or_total, num_heads, head_size};
-    } else {
-      int64_t kN0 = head_size <= 128 ? 128 : 64;
-      int64_t nsplits = (seqlen_k_or_max + kN0 - 1) / kN0;
-      out_shape = {nsplits, seqlen_q_or_total, num_heads, head_size};
-    }
-  } else {
-    // Batch: 5D layout depends on path
-    if (!deterministic) {
-      if (use_asm_v3 && is_v3_atomic_fp32) {
-        out_shape = {1, batch_size, num_heads, seqlen_q_or_total, head_size};
-      } else if (use_asm_v3 && !is_v3_atomic_fp32) {
-        int64_t sq_pad = ((seqlen_q_or_total + 15) / 16) * 16;
-        int64_t pd = (head_size == 192) ? 192 : 128;
-        out_shape = {1, batch_size, num_heads, sq_pad, pd};
-        elem_sz = (q_dtype == ffi::DataType::F16 || q_dtype == ffi::DataType::BF16) ? 2 : 4;
-      } else {
-        out_shape = {1, batch_size, seqlen_q_or_total, num_heads, head_size};
-      }
-    } else {
-      int64_t kN0 = head_size <= 128 ? 128 : 64;
-      int64_t nsplits = (seqlen_k_or_max + kN0 - 1) / kN0;
-      if (use_asm_v3) {
-        out_shape = {nsplits, batch_size, num_heads, seqlen_q_or_total, head_size};
-      } else {
-        out_shape = {nsplits, batch_size, seqlen_q_or_total, num_heads, head_size};
+// Pinned host blocks handed to aiter::mha_bwd via mha_bwd_args::pinned_host_alloc,
+// which is mandatory in group mode. aiter extends the shared_ptr lifetime to the
+// stream tail, so the deleter firing is precisely the point at which no pending
+// stream operation can still reference the block and reuse becomes safe.
+class PinnedHostPool {
+ public:
+  std::shared_ptr<void> acquire(size_t bytes) {
+    if (bytes == 0) bytes = 1;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (size_t i = 0; i < free_.size(); ++i) {
+        if (free_[i].second >= bytes) {
+          Block b = free_[i];
+          free_.erase(free_.begin() + i);
+          return wrap(b);
+        }
       }
     }
+    void *p = nullptr;
+    if (hipHostMalloc(&p, bytes, hipHostMallocDefault) != hipSuccess) return {};
+    return wrap(Block{p, bytes});
   }
 
-  size_t total = 1;
-  for (auto d : out_shape) total *= d;
-  return total * elem_sz;
-}
+ private:
+  using Block = std::pair<void *, size_t>;
+
+  std::shared_ptr<void> wrap(Block b) {
+    return std::shared_ptr<void>(b.first, [this, b](void *) {
+      std::lock_guard<std::mutex> lk(mu_);
+      free_.push_back(b);
+    });
+  }
+
+  std::mutex mu_;
+  std::vector<Block> free_;
+};
+
+static PinnedHostPool s_pinned_host_pool;
 
 ffi::Error MhaBwdUnified_Bridge(
     hipStream_t stream,
@@ -116,6 +114,8 @@ ffi::Error MhaBwdUnified_Bridge(
     std::optional<ffi::AnyBuffer> dv_,
     std::optional<ffi::AnyBuffer> bias_, std::optional<ffi::AnyBuffer> alibi_slopes_,
     std::optional<ffi::AnyBuffer> rng_state_, std::optional<ffi::AnyBuffer> gen_,
+    std::optional<ffi::AnyBuffer> cu_seqlens_q_logical_,
+    std::optional<ffi::AnyBuffer> cu_seqlens_k_logical_,
     ffi::Result<ffi::AnyBuffer> dq_ret, ffi::Result<ffi::AnyBuffer> dk_ret,
     ffi::Result<ffi::AnyBuffer> dv_ret, ffi::Result<ffi::AnyBuffer> softmax_d_ret,
     ffi::Result<ffi::AnyBuffer> dbias_ret,
@@ -239,38 +239,8 @@ ffi::Error MhaBwdUnified_Bridge(
     seed_ptr = dummy_rng; offset_ptr = dummy_rng + 1;
   }
 
-  // dq_acc
-  std::vector<int64_t> dq_acc_shape;
-  size_t dq_acc_bytes = compute_dq_acc_size_unified(
-      is_varlen, batch_size, seqlen_q, is_varlen ? max_sk : seqlen_k,
-      num_heads, head_size_q, deterministic, use_asm_v3, is_v3_atomic_fp32,
-      q.element_type(), dq_acc_shape);
-
-  void *dq_acc_ptr = s_dq_acc_pool.get(dq_acc_bytes, stream);
-
-  // dq_acc strides
-  ck_tile::index_t split_stride_dq_acc = 1, batch_stride_dq_acc = 0;
-  ck_tile::index_t nhead_stride_dq_acc = 1, stride_dq_acc = 1;
-
-  int rank = dq_acc_shape.size();
-  if (rank >= 4) {
-    std::vector<ck_tile::index_t> strides(rank);
-    strides[rank - 1] = 1;
-    for (int i = rank - 2; i >= 0; i--)
-      strides[i] = strides[i + 1] * dq_acc_shape[i + 1];
-
-    split_stride_dq_acc = strides[0];
-    if (is_varlen) {
-      // [split, total_q, nheads, head] → strides[1]=total_q stride, strides[2]=nhead stride
-      stride_dq_acc = strides[1];
-      nhead_stride_dq_acc = strides[2];
-    } else {
-      // [split, batch, ...] → batch at [1]
-      batch_stride_dq_acc = strides[1];
-      nhead_stride_dq_acc = strides[2];
-      stride_dq_acc = strides[3];
-    }
-  }
+  // AITER v0.1.19 owns dq_acc sizing and layout internally; the caller supplies
+  // only memory, through mha_bwd_args::workspace_alloc below.
 
   // MQA/GQA expansion
   auto dq_dims = dq_ret->dimensions();
@@ -283,8 +253,13 @@ ffi::Error MhaBwdUnified_Bridge(
   if (is_mqa_gqa) {
     size_t dk_sz = (is_varlen ? seqlen_k : batch_size * seqlen_k) * num_heads * head_size_q * mha_utils::dtype_size(q.element_type());
     size_t dv_sz = (is_varlen ? seqlen_k : batch_size * seqlen_k) * num_heads * head_size_v * mha_utils::dtype_size(v.element_type());
-    dk_expanded_ptr = s_dk_exp_pool.get(dk_sz, stream);
-    dv_expanded_ptr = s_dv_exp_pool.get(dv_sz, stream);
+    // The AITER backward overwrites every logical expanded dK/dV element.
+    // Tight packing therefore needs no pre-clear. Padded packing sets
+    // zero_tensors and is explicitly cleared below so unwritten padding rows
+    // remain defined. Avoiding these unconditional clears removes 512 MiB of
+    // writes per attention call at the llama3-8b production shape.
+    dk_expanded_ptr = s_dk_exp_pool.get(dk_sz, stream, /*zero=*/false);
+    dv_expanded_ptr = s_dv_exp_pool.get(dv_sz, stream, /*zero=*/false);
     dk_final = dk_expanded_ptr; dv_final = dv_expanded_ptr;
   }
 
@@ -350,12 +325,22 @@ ffi::Error MhaBwdUnified_Bridge(
     bs_dv = is_mqa_gqa ? (seqlen_k * num_heads * head_size_v) : mha_utils::calculate_stride(dv_dims, 0);
   }
 
-  // Seqstart pointers
+  // Seqstart pointers. seqstart_* are cumulative PHYSICAL offsets; the optional
+  // cu_seqlen_* are cumulative LOGICAL lengths that tell AITER how much of each
+  // physical span is real (mha_bwd.h sequence-pointer notes). Both must match
+  // what the forward passed, or the backward masks a different region.
   const void *seqstart_q_ptr = nullptr, *seqstart_k_ptr = nullptr;
+  const void *cu_seqlen_q_ptr = nullptr, *cu_seqlen_k_ptr = nullptr;
   if (is_varlen) {
     seqstart_q_ptr = cu_seqlens_q_->untyped_data();
     if (cu_seqlens_k_.has_value() && mha_utils::is_valid_buffer(*cu_seqlens_k_))
       seqstart_k_ptr = cu_seqlens_k_->untyped_data();
+    if (cu_seqlens_q_logical_.has_value() &&
+        mha_utils::is_valid_buffer(*cu_seqlens_q_logical_))
+      cu_seqlen_q_ptr = cu_seqlens_q_logical_->untyped_data();
+    if (cu_seqlens_k_logical_.has_value() &&
+        mha_utils::is_valid_buffer(*cu_seqlens_k_logical_))
+      cu_seqlen_k_ptr = cu_seqlens_k_logical_->untyped_data();
   }
 
   auto args = aiter::mha_bwd_args{
@@ -379,8 +364,9 @@ ffi::Error MhaBwdUnified_Bridge(
       .do_ptr = dout.untyped_data(), .d_ptr = softmax_d_ret->untyped_data(),
       .rand_val_ptr = nullptr,
       .dq_ptr = dq_ret->untyped_data(), .dk_ptr = dk_final, .dv_ptr = dv_final,
-      .dbias_ptr = dbias_expanded_ptr, .dq_acc_ptr = dq_acc_ptr,
+      .dbias_ptr = dbias_expanded_ptr,
       .seqstart_q_ptr = seqstart_q_ptr, .seqstart_k_ptr = seqstart_k_ptr,
+      .cu_seqlen_q_ptr = cu_seqlen_q_ptr, .cu_seqlen_k_ptr = cu_seqlen_k_ptr,
       .seqlen_q = static_cast<int>(seqlen_q), .seqlen_k = static_cast<int>(seqlen_k),
       .batch = static_cast<int>(batch_size),
       .max_seqlen_q = static_cast<int>(max_sq), .max_seqlen_k = static_cast<int>(max_sk),
@@ -390,7 +376,6 @@ ffi::Error MhaBwdUnified_Bridge(
       .stride_v = static_cast<int>(stride_v), .stride_bias = static_cast<int>(stride_bias),
       .stride_o = static_cast<int>(stride_o), .stride_randval = 0,
       .stride_do = static_cast<int>(stride_do),
-      .stride_dq_acc = static_cast<int>(stride_dq_acc),
       .stride_dq = static_cast<int>(stride_dq), .stride_dk = static_cast<int>(stride_dk),
       .stride_dv = static_cast<int>(stride_dv), .stride_dbias = static_cast<int>(stride_dbias),
       .nhead_stride_q = static_cast<int>(nhs_q), .nhead_stride_k = static_cast<int>(nhs_k),
@@ -398,7 +383,6 @@ ffi::Error MhaBwdUnified_Bridge(
       .nhead_stride_o = static_cast<int>(nhs_o), .nhead_stride_randval = 0,
       .nhead_stride_do = static_cast<int>(nhs_do),
       .nhead_stride_lsed = static_cast<int>(nhs_lse),
-      .nhead_stride_dq_acc = static_cast<int64_t>(nhead_stride_dq_acc),
       .nhead_stride_dq = static_cast<int>(nhs_dq),
       .nhead_stride_dk = static_cast<int>(nhs_dk), .nhead_stride_dv = static_cast<int>(nhs_dv),
       .nhead_stride_dbias = static_cast<int>(nhead_stride_dbias),
@@ -407,15 +391,22 @@ ffi::Error MhaBwdUnified_Bridge(
       .batch_stride_o = static_cast<int>(bs_o), .batch_stride_randval = 0,
       .batch_stride_do = static_cast<int>(bs_do),
       .batch_stride_lsed = static_cast<int>(bs_lse),
-      .batch_stride_dq_acc = static_cast<int64_t>(batch_stride_dq_acc),
       .batch_stride_dq = static_cast<int>(bs_dq),
       .batch_stride_dk = static_cast<int>(bs_dk), .batch_stride_dv = static_cast<int>(bs_dv),
       .batch_stride_dbias = static_cast<int>(batch_stride_dbias),
-      .split_stride_dq_acc = static_cast<int>(split_stride_dq_acc),
       .window_size_left = static_cast<int>(mask.left),
       .window_size_right = static_cast<int>(mask.right),
       .p_drop = dropout_p, .p_undrop = p_undrop,
-      .drop_seed_offset = std::make_pair(seed_ptr, offset_ptr)
+      .drop_seed_offset = std::make_pair(seed_ptr, offset_ptr),
+      // zero_init is honoured rather than assumed, so the accumulator is cleared
+      // only when the kernel aiter selects actually reads it.
+      .workspace_alloc = [stream](size_t bytes, bool zero_init) -> void * {
+        if (bytes == 0) return nullptr;
+        return s_aiter_ws_pool.get(bytes, stream, zero_init);
+      },
+      .pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+        return s_pinned_host_pool.acquire(bytes);
+      }
   };
 
   // Ensure HIP device context matches the data device.  XLA usually sets
@@ -436,17 +427,27 @@ ffi::Error MhaBwdUnified_Bridge(
   if (is_mqa_gqa) {
     int64_t groups = num_heads / num_heads_k;
     int64_t total_tokens = is_varlen ? seqlen_k : batch_size * seqlen_k;
+    const char *fuse_env = std::getenv("JA_MHA_FUSE_GQA_REDUCE");
+    const bool fuse_pair =
+        head_size_q == head_size_v &&
+        !(fuse_env != nullptr && std::string(fuse_env) == "0");
 
-    mha_utils::launch_mqa_gqa_reduction(
-        dk_expanded_ptr, dk_ret->untyped_data(),
-        is_varlen ? 1 : batch_size,
-        is_varlen ? seqlen_k : seqlen_k,
-        num_heads, num_heads_k, head_size_q, groups, q.element_type(), stream);
-    mha_utils::launch_mqa_gqa_reduction(
-        dv_expanded_ptr, dv_ret->untyped_data(),
-        is_varlen ? 1 : batch_size,
-        is_varlen ? seqlen_k : seqlen_k,
-        num_heads, num_heads_k, head_size_v, groups, v.element_type(), stream);
+    if (fuse_pair) {
+      mha_utils::launch_mqa_gqa_reduction_pair(
+          dk_expanded_ptr, dv_expanded_ptr, dk_ret->untyped_data(),
+          dv_ret->untyped_data(), is_varlen ? 1 : batch_size, seqlen_k,
+          num_heads, num_heads_k, head_size_q, groups, q.element_type(),
+          stream);
+    } else {
+      mha_utils::launch_mqa_gqa_reduction(
+          dk_expanded_ptr, dk_ret->untyped_data(),
+          is_varlen ? 1 : batch_size, seqlen_k, num_heads, num_heads_k,
+          head_size_q, groups, q.element_type(), stream);
+      mha_utils::launch_mqa_gqa_reduction(
+          dv_expanded_ptr, dv_ret->untyped_data(),
+          is_varlen ? 1 : batch_size, seqlen_k, num_heads, num_heads_k,
+          head_size_v, groups, v.element_type(), stream);
+    }
 
     // dk/dv expanded buffers managed by pool -- no free needed
   }
@@ -484,6 +485,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // alibi_slopes_ (optional)
         .Arg<ffi::AnyBuffer>() // rng_state_ (optional)
         .Arg<ffi::AnyBuffer>() // gen_ (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_q_logical (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_k_logical (optional)
         .Ret<ffi::AnyBuffer>() // dq_ret
         .Ret<ffi::AnyBuffer>() // dk_ret
         .Ret<ffi::AnyBuffer>() // dv_ret
