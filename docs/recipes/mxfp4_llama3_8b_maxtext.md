@@ -12,10 +12,11 @@ The recipe controls are fixed, but release provenance still needs to be sealed:
   `sha256:<TODO_VERIFY digest>`.
 - ROCm, JAX, `jaxlib`, ROCm PJRT/plugin, TransformerEngine, and AITER versions:
   `TODO_VERIFY` from the selected image and built JAX-AITER tree.
-- JAX-AITER release tag/commit containing this recipe: `TODO_VERIFY`.
-  Development base was `perf/mxfp4-deterministic-sr @ 06d7adf`.
-- ROCm/MaxText branch: `aiter-fp4-integration`; record the checked-out commit as
-  `TODO_VERIFY` before publishing results.
+- JAX-AITER: `main @ 4dd85d26d68fef3b26cddd2b0761e2734998a123`.
+- ROCm/MaxText:
+  `aiter-fp4-integration @ ccd72e63e57193c6f1d51b06bd2e7f52ce895404`.
+- Consumed ROCm/AITER:
+  `31350226161346314b3d8882c8085bd31dce6a34`.
 - Dataset and tokenizer checksums: `TODO_VERIFY`.
 
 Do not publish throughput from a run until these values and the resolved recipe
