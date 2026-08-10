@@ -450,14 +450,12 @@ __device__ __forceinline__ uint32_t deterministic_sr_word(
 __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(
     float v0, float v1, float v2, float v3,
     float scale,
-    const uint32_t* __restrict__ key,
-    uint32_t role,
+    uint32_t stream,
     uint32_t direction,
     uint32_t row,
     uint32_t col
 ) {
 #if defined(__gfx950__)
-    uint32_t stream = deterministic_sr_stream(key, role, direction);
     uint32_t rng0 = deterministic_sr_word(
         stream, row, col);
     uint32_t rng1 = deterministic_sr_word(
@@ -644,6 +642,20 @@ void cast_transpose_mxfp4_shuffled(
     const int K_packed = N / 2;
     const int M_packed = M / 2;
 
+    // The explicit key, semantic role and direction are invariant across all
+    // eight 32x32 chunks. Compute each active direction stream once here rather
+    // than repeating the key load/mix in every unrolled chunk body.
+    uint32_t row_sr_stream = 0;
+    uint32_t col_sr_stream = 0;
+    if constexpr (USE_SR_ROW) {
+        row_sr_stream = deterministic_sr_stream(
+            sr_key, (uint32_t)sr_role, 0u);
+    }
+    if constexpr (USE_SR_COL) {
+        col_sr_stream = deterministic_sr_stream(
+            sr_key, (uint32_t)sr_role, 1u);
+    }
+
     // ========================================================================
     // Shared Memory - 32x32 BF16 Tile with Padding
     // ========================================================================
@@ -806,8 +818,7 @@ void cast_transpose_mxfp4_shuffled(
                     uint16_t fp4x4;
                     if constexpr (USE_SR_ROW) {
                         fp4x4 = cvt_f32x4_to_fp4x4_sr(
-                            v0, v1, v2, v3, native_scale, sr_key,
-                            (uint32_t)sr_role, 0u,
+                            v0, v1, v2, v3, native_scale, row_sr_stream, 0u,
                             (uint32_t)global_row, (uint32_t)global_col_base);
                     } else {
                         fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
@@ -897,8 +908,7 @@ void cast_transpose_mxfp4_shuffled(
                     uint16_t fp4x4;
                     if constexpr (USE_SR_COL) {
                         fp4x4 = cvt_f32x4_to_fp4x4_sr(
-                            v0, v1, v2, v3, native_scale, sr_key,
-                            (uint32_t)sr_role, 1u,
+                            v0, v1, v2, v3, native_scale, col_sr_stream, 1u,
                             (uint32_t)global_row_base, (uint32_t)global_col);
                     } else {
                         fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);

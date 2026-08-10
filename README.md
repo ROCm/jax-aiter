@@ -10,6 +10,11 @@ JAX-AITER integrates AMD's [AITER](https://github.com/ROCm/aiter) operator libra
 
 Python 3.12 required. ROCm 7.2+.
 
+For the single-node Llama 3.1 8B MaxText reproduction recipe—MXFP4, TE FP8
+current scaling, BF16, and MLPerf Training 6.0 convergence logging—see
+[`docs/recipes/mxfp4_llama3_8b_maxtext.md`](docs/recipes/mxfp4_llama3_8b_maxtext.md).
+The tracked runners support CPU-only recipe resolution before any GPU run.
+
 ## What is AITER?
 
 **AITER** (AI Tensor Engine for ROCm) is AMD's centralized library of AI operators optimized for ROCm GPUs (MI300, MI350). It provides hand-tuned CK (Composable Kernel) and ASM kernels for attention, normalization, activations, GEMM, and more.
@@ -77,8 +82,8 @@ Two wheel variants are published:
 
 | Variant | Size | Contents | Use when |
 |---------|------|----------|----------|
-| **lite** (`+lite`) | ~43 MiB | MXFP4/FP4 GEMM, BF16 GEMM, MXFP4 cast, RMSNorm, SiLU-and-Mul. **No flash attention (MHA).** | MXFP4 (FP4) training path; the canonical FP4 recipe routes attention through TransformerEngine, so MHA is not needed. |
-| **full** | ~513 MiB | Everything above **plus** AITER flash attention (`flash_attn_func` / `flash_attn_varlen`). | You need AITER MHA. |
+| **lite** (`+lite`) | ~43 MiB | MXFP4/FP4 GEMM, BF16 GEMM, MXFP4 cast, RMSNorm, SiLU-and-Mul. **No flash attention (MHA).** | MXFP4 training with attention routed through TransformerEngine. |
+| **full** | ~513 MiB | Everything above **plus** AITER flash attention (`flash_attn_func` / `flash_attn_varlen`). | You need AITER MHA, including the direct-MHA publication recipe linked above. |
 
 ```bash
 # Lite (MXFP4 path):
