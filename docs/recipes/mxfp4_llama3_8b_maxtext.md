@@ -137,6 +137,13 @@ Check that the banner says batch 4, global batch 32, sequence 8192, seed 0,
 `.97`, FSDP8, Shardy, `scan_layers=False`, fp32 weight/mu state, iota false,
 autotune 5, and the expected quantization and attention backend.
 
+Set `MODEL_CONTROLS=llama31_mlperf` to align a synthetic performance process
+with the Llama 3.1 convergence model controls (`rope_use_scale=False`, MLPerf
+attention scaling, embedding-logit normalization off, and Megatron
+initialization). The historical `MODEL_NAME=llama3-8b` route uses a different
+rotary-embedding implementation and must be reported as a separate operating
+point.
+
 ## Run the three 50-step performance legs
 
 Each command is one foreground process. Run them sequentially, with no

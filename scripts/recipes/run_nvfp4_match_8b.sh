@@ -29,6 +29,7 @@ MEMFRAC="${XLA_PYTHON_CLIENT_MEM_FRACTION:-.97}"
 [[ "$MEMFRAC" == ".97" ]] || die "canonical mem fraction is .97; stop instead of lowering it"
 
 MODEL_NAME="${MODEL_NAME:-llama3.1-8b}"
+MODEL_CONTROLS="${MODEL_CONTROLS:-default}"
 FSDP="${ICI_FSDP_PARALLELISM:-8}"
 SHARDY="${SHARDY:-True}"
 SCAN_LAYERS="${SCAN_LAYERS:-False}"
@@ -42,6 +43,24 @@ USE_IOTA_EMBED="${USE_IOTA_EMBED:-False}"
 WEIGHT_DTYPE="${WEIGHT_DTYPE:-float32}"
 MU_DTYPE="${MU_DTYPE:-float32}"
 INIT_WEIGHTS_SEED="${INIT_WEIGHTS_SEED:-0}"
+
+MODEL_ARGS=()
+case "$MODEL_CONTROLS" in
+  default) ;;
+  llama31_mlperf)
+    [[ "$MODEL_NAME" == "llama3.1-8b" ]] ||
+      die "MODEL_CONTROLS=llama31_mlperf requires MODEL_NAME=llama3.1-8b"
+    MODEL_ARGS=(
+      query_pre_attn_scalar=0.08838834764831843
+      rope_use_scale=False
+      normalize_embedding_logits=False
+      megatron_init_std=0.02
+      megatron_residual_scale=True
+      num_vocab_tiling=1
+    )
+    ;;
+  *) die "bad MODEL_CONTROLS '$MODEL_CONTROLS' (expected default or llama31_mlperf)" ;;
+esac
 
 case "$MODE" in
   mxfp4)
@@ -133,6 +152,7 @@ CMD=("$PYTHON_BIN" -m maxtext.trainers.pre_train.train "$MAXTEXT_CONFIG"
   "mu_dtype=${MU_DTYPE}" "use_iota_embed=${USE_IOTA_EMBED}" dataset_type=synthetic
   logits_dot_in_fp32=False dtype=bfloat16 "per_device_batch_size=${PER_DEVICE_BATCH}"
   "global_batch_size_to_train_on=${GLOBAL_BATCH_SIZE}" "init_weights_seed=${INIT_WEIGHTS_SEED}"
+  "${MODEL_ARGS[@]}"
   "max_target_length=${MAX_TARGET_LENGTH}" "shardy=${SHARDY}" packing=True max_segments_per_seq=32
   "steps=${STEPS}" "use_jax_aiter=${USE_AITER}" "run_name=${MODE}"
   "quantization=${QUANTIZATION}" "${MODE_ARGS[@]}" "enable_nnx=${ENABLE_NNX}" "pure_nnx=${ENABLE_NNX}"
@@ -140,7 +160,7 @@ CMD=("$PYTHON_BIN" -m maxtext.trainers.pre_train.train "$MAXTEXT_CONFIG"
 
 print_recipe() {
   printf '%s\n' "=== RESOLVED_RECIPE_BEGIN ==="
-  printf 'runner=performance mode=%s label=%s processes=1 steps=%s measurement_window=completed_steps_40_49\n' "$MODE" "$LABEL" "$STEPS"
+  printf 'runner=performance mode=%s label=%s model=%s model_controls=%s processes=1 steps=%s measurement_window=completed_steps_40_49\n' "$MODE" "$LABEL" "$MODEL_NAME" "$MODEL_CONTROLS" "$STEPS"
   printf 'quantization=%s attention=%s use_jax_aiter=%s scan_layers=%s remat_policy=%s\n' "${QUANTIZATION:-none}" "$ATTENTION" "$USE_AITER" "$SCAN_LAYERS" "$REMAT_POLICY"
   printf 'autotune=%s weight_dtype=%s mu_dtype=%s use_iota_embed=%s batch=%s global_batch=%s sequence=%s init_seed=%s mem_fraction=%s\n' "$AUTOTUNE_LEVEL" "$WEIGHT_DTYPE" "$MU_DTYPE" "$USE_IOTA_EMBED" "$PER_DEVICE_BATCH" "$GLOBAL_BATCH_SIZE" "$MAX_TARGET_LENGTH" "$INIT_WEIGHTS_SEED" "$MEMFRAC"
   printf 'fsdp=%s shardy=%s scheduler=nvidia combine_threshold=%s enable_nnx=%s\n' "$FSDP" "$SHARDY" "$COMBINE_TH_BYTES" "$ENABLE_NNX"

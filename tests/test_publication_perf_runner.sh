@@ -89,7 +89,7 @@ test_perf_mxfp4_direct_mha() {
   local capture="$TMP/perf-mxfp4"
   run_perf mxfp4 "$capture" &&
     check_common "$capture" &&
-    assert_text "mode=mxfp4 label=MXFP4 processes=1 steps=50 measurement_window=completed_steps_40_49" "$capture" &&
+    assert_text "mode=mxfp4 label=MXFP4 model=llama3.1-8b model_controls=default processes=1 steps=50 measurement_window=completed_steps_40_49" "$capture" &&
     assert_line "RESOLVED_ARG=quantization=aiter_fp4" "$capture" &&
     assert_line "RESOLVED_ARG=attention=aiter_flash" "$capture" &&
     assert_line "RESOLVED_ARG=use_jax_aiter=True" "$capture" &&
@@ -104,7 +104,7 @@ test_perf_te_current_scaling() {
   local capture="$TMP/perf-te"
   run_perf te_fp8_currentscaling "$capture" &&
     check_common "$capture" &&
-    assert_text "mode=te_fp8_currentscaling label=TE FP8 current scaling processes=1 steps=50" "$capture" &&
+    assert_text "mode=te_fp8_currentscaling label=TE FP8 current scaling model=llama3.1-8b model_controls=default processes=1 steps=50" "$capture" &&
     assert_line "RESOLVED_ARG=quantization=te_fp8_currentscaling" "$capture" &&
     assert_line "RESOLVED_ARG=attention=cudnn_flash_te" "$capture" &&
     assert_line "RESOLVED_ARG=use_jax_aiter=False" "$capture" &&
@@ -116,7 +116,7 @@ test_perf_bf16_no_quantization() {
   local capture="$TMP/perf-bf16"
   run_perf bf16 "$capture" &&
     check_common "$capture" &&
-    assert_text "mode=bf16 label=BF16 processes=1 steps=50" "$capture" &&
+    assert_text "mode=bf16 label=BF16 model=llama3.1-8b model_controls=default processes=1 steps=50" "$capture" &&
     assert_line "RESOLVED_ARG=quantization=" "$capture" &&
     assert_line "RESOLVED_ARG=attention=cudnn_flash_te" "$capture" &&
     assert_text "quantization=none attention=cudnn_flash_te" "$capture"
@@ -162,6 +162,19 @@ test_rejects_noncanonical_mem_fraction() {
   assert_text "canonical mem fraction is .97" "$capture"
 }
 
+test_llama31_mlperf_model_controls() {
+  local capture="$TMP/perf-llama31-mlperf"
+  clean_env MODEL_CONTROLS=llama31_mlperf \
+    bash "$PERF_RUNNER" mxfp4 /outputs 50 >"$capture" 2>&1 &&
+    assert_text "model=llama3.1-8b model_controls=llama31_mlperf" "$capture" &&
+    assert_line "RESOLVED_ARG=query_pre_attn_scalar=0.08838834764831843" "$capture" &&
+    assert_line "RESOLVED_ARG=rope_use_scale=False" "$capture" &&
+    assert_line "RESOLVED_ARG=normalize_embedding_logits=False" "$capture" &&
+    assert_line "RESOLVED_ARG=megatron_init_std=0.02" "$capture" &&
+    assert_line "RESOLVED_ARG=megatron_residual_scale=True" "$capture" &&
+    assert_line "RESOLVED_ARG=num_vocab_tiling=1" "$capture"
+}
+
 test_atomic_launch_guard() {
   local fake_root="$TMP/fake-project"
   local out_root="$TMP/guarded-output"
@@ -202,6 +215,7 @@ tests=(
   test_convergence_modes
   test_rejects_stale_aliases
   test_rejects_noncanonical_mem_fraction
+  test_llama31_mlperf_model_controls
   test_atomic_launch_guard
 )
 failures=0
