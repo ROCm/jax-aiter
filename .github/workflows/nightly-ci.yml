@@ -45,7 +45,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          # Depth 1 is enough: the only git call is `rev-parse HEAD` on the
+          # AITER submodule, for the JIT-lib cache key. Full history costs
+          # minutes here because the submodules are 4.5 GB.
+          fetch-depth: 1
 
       - name: Fetch prebuilt JIT libs
         id: fetch_jit
