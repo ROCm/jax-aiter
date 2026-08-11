@@ -729,17 +729,18 @@ class TestFusedGqaReduction:
 # values so the two backends describe their residuals identically to the same
 # policy.
 #
-# Measured, not assumed: the attention forward is already called exactly once in
-# the gradient regardless of policy, because a custom_vjp's residuals cannot be
-# rematerialised -- remat cannot re-enter the custom rule. So the tag is a naming
-# contract, NOT a way to remove a recomputed forward. Evidence:
-# docs/runs/llama3_8b/kernels/20260730_8b_bf16_mha_packed_contract_097_i1/remat_probe.py
+# The tag is load-bearing, not cosmetic. When the residual is saveable the
+# gradient contains one attention forward; when it is not, the forward is traced
+# a second time. So `JA_MHA_REMAT_CONTEXT=1` is worth about one attention forward
+# per layer under MaxText's policy, and these cases assert that difference rather
+# than a fixed count.
 
 class TestRematContextTag:
-    """Tagging must not change how often the attention kernels are invoked."""
+    """`JA_MHA_REMAT_CONTEXT` decides whether the attention forward is recomputed."""
 
     @staticmethod
-    def _grad_jaxpr(policy):
+    def _forward_calls(policy):
+        """Attention forwards traced into the gradient under `policy`."""
         n, hq, hk, d = 256, 4, 4, 64
         key = jax.random.PRNGKey(60)
         k1, k2, k3 = jax.random.split(key, 3)
@@ -757,22 +758,30 @@ class TestRematContextTag:
             return jnp.sum(out.astype(jnp.float32))
 
         wrapped = jax.checkpoint(f, policy=policy)
-        return str(jax.make_jaxpr(jax.grad(wrapped, argnums=(0, 1, 2)))(q, k_t, v))
+        jaxpr = str(jax.make_jaxpr(jax.grad(wrapped, argnums=(0, 1, 2)))(q, k_t, v))
+        return jaxpr.count("MhaFwdUnifiedJA"), jaxpr.count("MhaBwdUnifiedJA")
 
-    @pytest.mark.parametrize("tag", ["1", "0"], ids=["tagged", "untagged"])
-    def test_forward_is_called_once_under_maxtext_policy(self, monkeypatch, tag):
-        monkeypatch.setenv("JA_MHA_REMAT_CONTEXT", tag)
-        jaxpr = self._grad_jaxpr(jax.checkpoint_policies.save_only_these_names("context"))
-        fwd = jaxpr.count("MhaFwdUnifiedJA")
-        bwd = jaxpr.count("MhaBwdUnifiedJA")
-        assert (fwd, bwd) == (1, 1), f"expected 1 fwd / 1 bwd, got {fwd} fwd / {bwd} bwd"
-
-    def test_tagging_does_not_add_kernel_calls_when_nothing_is_saveable(self, monkeypatch):
-        """The strictest policy still cannot recompute a custom_vjp forward."""
+    def test_tag_saves_the_forward_under_maxtext_policy(self, monkeypatch):
         monkeypatch.setenv("JA_MHA_REMAT_CONTEXT", "1")
-        jaxpr = self._grad_jaxpr(jax.checkpoint_policies.nothing_saveable)
-        assert jaxpr.count("MhaFwdUnifiedJA") == 1
-        assert jaxpr.count("MhaBwdUnifiedJA") == 1
+        policy = jax.checkpoint_policies.save_only_these_names("context")
+        assert self._forward_calls(policy) == (1, 1)
+
+    def test_without_the_tag_the_policy_matches_nothing_and_the_forward_repeats(
+        self, monkeypatch
+    ):
+        """This is the whole point of the tag: no name to match, no saved residual."""
+        monkeypatch.setenv("JA_MHA_REMAT_CONTEXT", "0")
+        policy = jax.checkpoint_policies.save_only_these_names("context")
+        assert self._forward_calls(policy) == (2, 1)
+
+    def test_nothing_saveable_recomputes_the_forward_even_when_tagged(self, monkeypatch):
+        """A custom_vjp forward IS re-traced when the policy saves nothing."""
+        monkeypatch.setenv("JA_MHA_REMAT_CONTEXT", "1")
+        assert self._forward_calls(jax.checkpoint_policies.nothing_saveable) == (2, 1)
+
+    def test_everything_saveable_keeps_a_single_forward(self, monkeypatch):
+        monkeypatch.setenv("JA_MHA_REMAT_CONTEXT", "1")
+        assert self._forward_calls(jax.checkpoint_policies.everything_saveable) == (1, 1)
 
 
 # ===========================================================================
