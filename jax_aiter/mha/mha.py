@@ -27,7 +27,6 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.custom_partitioning import custom_partitioning, SdyShardingRule
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from ..ja_compat import dtypes
 from ..ja_compat.chip_info import get_gfx
 from ..ops.mha import (
     mha_fwd as _mha_fwd_raw,
