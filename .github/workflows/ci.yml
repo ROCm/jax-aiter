@@ -38,7 +38,7 @@ jobs:
     runs-on: build-only-jax-aiter
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: CI tooling unit tests
         # These have never run in CI, despite covering the cache logic that
@@ -67,7 +67,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
           # Depth 1 is enough: the only git call is `rev-parse HEAD` on the
