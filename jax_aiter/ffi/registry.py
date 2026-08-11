@@ -29,7 +29,6 @@ SYMBOL_TO_MODULE_MAP = {
     "RmsnormFwdJA": "rmsnorm_fwd_ja.so",
     "SiluAndMulJA": "silu_and_mul_ja.so",
     "GemmFwdJA": "gemm_fwd_ja.so",
-    "GemmFp8Mi350FwdJA": "gemm_fp8_mi350_ja.so",
     "GemmFp4FwdJA": "gemm_fp4_ja.so",
     "CastMxfp4JA": "cast_mxfp4_ja.so",
     "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so",
@@ -167,8 +166,6 @@ def register_ffi_target(target_name: str, platform: str = "ROCM"):
 
         if target_name == "GemmFwdJA":
             _preload_gemm_kernels(module_name)
-        elif target_name == "GemmFp8Mi350FwdJA":
-            _preload_fp8_kernels(module_name)
 
     except Exception as e:
         logger.error(f"Failed to register FFI target '{target_name}': {e}")
@@ -186,19 +183,6 @@ def _preload_gemm_kernels(module_name: str):
             preload_fn()
     except Exception as e:
         logger.warning(f"Failed to preload GEMM kernels: {e}")
-
-
-def _preload_fp8_kernels(module_name: str):
-    """Pre-load FP8 GEMM kernels on all visible devices."""
-    try:
-        handle = _module_handles.get(module_name)
-        if handle is None:
-            return
-        preload_fn = getattr(handle, "gemm_fp8_mi350_ja_preload_kernels", None)
-        if preload_fn is not None:
-            preload_fn()
-    except Exception as e:
-        logger.warning(f"Failed to preload FP8 kernels: {e}")
 
 
 def get_available_symbols() -> List[str]:

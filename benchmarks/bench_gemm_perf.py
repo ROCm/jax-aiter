@@ -254,110 +254,6 @@ def bench_scan():
 
 
 # ============================================================
-# 4. FP8 GEMM benchmarks
-# ============================================================
-
-def bench_fp8_gemm():
-    """Benchmark AITER FP8 GEMM vs BF16 baselines."""
-    print_header("4. FP8 GEMM (AITER CK block-scale FP8 vs BF16)")
-
-    try:
-        from jax_aiter.gemm_fp8 import gemm_fp8_mi350, fp8_supported_for_shape
-    except Exception as e:
-        print(f"  FP8 GEMM not available: {e}")
-        return
-
-    for shape_name, (M, N, K) in SHAPES.items():
-        print(f"\n  Shape: {shape_name} (M={M}, N={N}, K={K})")
-        print(f"  {'-'*60}")
-
-        # Check FP8 shape support
-        fp8_ok = fp8_supported_for_shape(M, N, K)
-        print(f"  FP8 supported: {fp8_ok} (M≥16, K≥512, K%128==0)")
-
-        if not fp8_ok:
-            print(f"  SKIP: Shape not supported by FP8 kernel")
-            continue
-
-        key = jax.random.PRNGKey(42)
-        k1, k2 = jax.random.split(key)
-        a = jax.random.normal(k1, (M, K), dtype=jnp.bfloat16)
-        b = jax.random.normal(k2, (N, K), dtype=jnp.bfloat16)
-
-        # BF16 baselines for comparison
-        def hipblaslt_nt(a, b):
-            return jax.lax.dot_general(a, b, (((1,), (1,)), ((), ())))
-
-        avg, std = bench_fn(jax.jit(hipblaslt_nt), a, b)
-        print_result("BF16 hipBLASLt (dot_general NT)", M, N, K, avg, std)
-
-        try:
-            from jax_aiter.gemm import gemm as aiter_gemm
-            avg, std = bench_fn(jax.jit(aiter_gemm), a, b)
-            print_result("BF16 AITER ASM (FFI NT)", M, N, K, avg, std)
-        except Exception as e:
-            print(f"  BF16 AITER ASM: SKIP ({e})")
-
-        # FP8 forward (per-call scaling)
-        try:
-            avg, std = bench_fn(jax.jit(gemm_fp8_mi350), a, b)
-            print_result("FP8 AITER CK (block-scale, fwd only)", M, N, K, avg, std)
-        except Exception as e:
-            print(f"  FP8 AITER CK: SKIP ({e})")
-
-        # FP8 forward + backward
-        try:
-            def fp8_fwd_bwd(a, b):
-                def f(a, b):
-                    return jnp.sum(gemm_fp8_mi350(a, b))
-                return jax.grad(f, argnums=(0, 1))(a, b)
-
-            avg, std = bench_fn(jax.jit(fp8_fwd_bwd), a, b)
-            print_result("FP8 FWD+BWD (FP8 fwd, BF16 bwd)", M, N, K, avg, std)
-        except Exception as e:
-            print(f"  FP8 FWD+BWD: SKIP ({e})")
-
-        # Raw FP8 GEMM kernel only (pre-quantized inputs, no quantization overhead)
-        try:
-            from jax_aiter.gemm_fp8.gemm_fp8_mi350 import _gemm_fp8_raw
-            # Pre-quantize inputs manually to isolate kernel performance
-            M_, K_ = a.shape
-            N_ = b.shape[0]
-            # Simple per-tensor quantization for benchmarking
-            a_f32 = a.astype(jnp.float32)
-            b_f32 = b.astype(jnp.float32)
-            a_amax = jnp.max(jnp.abs(a_f32))
-            b_amax = jnp.max(jnp.abs(b_f32))
-            a_scale = jnp.maximum(a_amax, 1e-12) / 448.0
-            b_scale = jnp.maximum(b_amax, 1e-12) / 448.0
-            xq = jnp.clip(a_f32 / a_scale, -448, 448).astype(jnp.float8_e4m3fn)
-            wq = jnp.clip(b_f32 / b_scale, -448, 448).astype(jnp.float8_e4m3fn)
-            # Create scale arrays in expected layout
-            x_scale_arr = jnp.ones((K_ // 128, M_), dtype=jnp.float32) * a_scale
-            w_scale_arr = jnp.ones((N_ // 128, K_ // 128), dtype=jnp.float32) * b_scale
-
-            avg, std = bench_fn(jax.jit(_gemm_fp8_raw), xq, wq, x_scale_arr, w_scale_arr)
-            print_result("FP8 RAW KERNEL ONLY (pre-quantized)", M, N, K, avg, std)
-        except Exception as e:
-            print(f"  FP8 RAW KERNEL: SKIP ({e})")
-
-    print(f"""
-  Note: FP8 GEMM uses per-call scaling (quantize A,B to FP8 e4m3 with
-  block-scale, compute in FP8, output in BF16). Backward uses BF16
-  (STE pattern). Shape constraints: M≥16, K≥512, K%128==0, N padded to 256.
-  
-  "FP8 AITER CK" includes full quantization pipeline:
-    padding → per-row amax → scale computation → BF16→FP8 cast → weight
-    shuffle → scale array construction → FFI GEMM call
-  
-  "FP8 RAW KERNEL ONLY" calls just the FFI GEMM with pre-quantized
-  inputs — this isolates the actual FP8 matrix multiply performance.
-""")
-
-
-# ============================================================
-# 5. Triton deep-dive: why is it slow?
-# ============================================================
 
 def bench_triton_deepdive():
     """Deep analysis of Triton kernel performance issues."""
@@ -444,7 +340,6 @@ if __name__ == "__main__":
     bench_isolated_gemm()
     bench_full_backward()
     bench_scan()
-    bench_fp8_gemm()
     bench_triton_deepdive()
 
     print(f"\n{'='*70}")
