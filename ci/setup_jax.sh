@@ -47,9 +47,42 @@ install_jax_stack() {
     "jax-rocm7-plugin==${ROCM_PLUGIN_VERSION}" "jax-rocm7-pjrt==${ROCM_PLUGIN_VERSION}"
 }
 
+verify_jax_stack() {
+  # Distribution names are not necessarily import names. In particular,
+  # jax-rocm7-pjrt installs the `jax_plugins.xla_rocm7` namespace; there is no
+  # Python module named `jax_rocm7_pjrt`.
+  python3 - "$JAX_VERSION" "$ROCM_PLUGIN_VERSION" <<'PY'
+import importlib
+from importlib import metadata
+import sys
+
+import jax
+import jaxlib
+
+expected_jax, expected_rocm = sys.argv[1:]
+assert jax.__version__ == expected_jax, (jax.__version__, expected_jax)
+assert jaxlib.__version__ == expected_jax, (jaxlib.__version__, expected_jax)
+
+for distribution, module in (
+    ("jax-rocm7-plugin", "jax_rocm7_plugin"),
+    ("jax-rocm7-pjrt", "jax_plugins.xla_rocm7"),
+):
+    version = metadata.version(distribution)
+    assert version == expected_rocm, (distribution, version, expected_rocm)
+    imported = importlib.import_module(module)
+    print(
+        f"[ci/setup_jax] {distribution} {version}: "
+        f"{module} -> {imported.__file__}"
+    )
+
+print(f"[ci/setup_jax] jax {jax.__version__} / jaxlib {jaxlib.__version__}")
+PY
+}
+
 if [[ "$JAX_ONLY" == "1" ]]; then
   FORCE="--force-reinstall --no-deps"
   install_jax_stack
+  verify_jax_stack
   echo "[ci/setup_jax] --jax-only: restored jax ${JAX_VERSION} + rocm plugin ${ROCM_PLUGIN_VERSION}."
   exit 0
 fi
@@ -69,13 +102,6 @@ git config --global --add safe.directory "$JA_ROOT_DIR" || true
 git config --global --add safe.directory "$JA_ROOT_DIR/third_party/aiter" || true
 
 # Fail here rather than deep in a build if the ROCm backend did not resolve.
-python3 - <<'PY'
-import importlib
-import jax, jaxlib
-print(f"[ci/setup_jax] jax {jax.__version__} / jaxlib {jaxlib.__version__}")
-for mod in ("jax_rocm7_plugin", "jax_rocm7_pjrt"):
-    importlib.import_module(mod)
-    print(f"[ci/setup_jax] {mod} importable")
-PY
+verify_jax_stack
 
 echo "[ci/setup_jax] tooling + jax ${JAX_VERSION} ROCm stack installed."
