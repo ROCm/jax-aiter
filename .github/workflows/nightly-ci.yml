@@ -1,113 +1,102 @@
 name: JAX-AITER Nightly CI
 
+# The full suite on 4 GPUs, including the cases the PR tier skips.
+#
+# Two things this catches that ci.yml cannot:
+#   * the `slow` sweeps -- the full BATCH_CORE shape grid and the 70B GEMM shapes
+#   * the `multigpu` FSDP sharding cases, which need >= 4 visible devices and so
+#     have always skipped silently on the single-GPU path
+#
+# Like the PR job, JIT libraries are fetched and never built here.
+
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 1 * * *'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
-  IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  CONTAINER_NAME: ja_ci_nightly
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
-  GPU_ARCHS: "gfx942;gfx950"
+  GPU_ARCHS: gfx950
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
-  # Prebuilt JIT-lib release the fetch step pulls the .so's from.
-  JIT_LIBS_RELEASE_TAG: v0.1.0-alpha
+  JIT_LIBS_RELEASE_TAG: jit-libs
 
 jobs:
-  build-and-test:
-    runs-on: [self-hosted, Linux]
-
-    env:
-      CONTAINER_NAME: rv_aiter_nightly
-
+  full-suite:
+    name: full suite (4x MI355)
+    runs-on: linux-jax-aiter-mi355-4
+    timeout-minutes: 90
     steps:
-      - name: Fix permissions from previous Docker run
+      - name: Fix permissions from a previous container run
         run: |
           if [ -d "${{ github.workspace }}" ]; then
-            sudo chown -R $(id -u):$(id -g) "${{ github.workspace }}" || true
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - name: Checkout repository with submodules
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Create aiter_build directory
-        run: mkdir -p build/aiter_build
-
-      # Download + verify the prebuilt MHA JIT libs from the release (same
-      # verify-or-rebuild gate as ci.yml). PR/nightly normally download; the
-      # source build is the fallback only.
-      - name: Fetch prebuilt JIT libs (verify-or-rebuild)
+      - name: Fetch prebuilt JIT libs
         id: fetch_jit
         env:
           GH_TOKEN: ${{ github.token }}
           GH_RELEASE_TAG: ${{ env.JIT_LIBS_RELEASE_TAG }}
           GH_REPO: ${{ github.repository }}
-          GPU_ARCHS: ${{ env.GPU_ARCHS }}
-        run: bash ci/fetch_jit_libs.sh
+        run: |
+          mkdir -p build/aiter_build
+          bash ci/fetch_jit_libs.sh
 
-      - name: Pull container image
+      - name: Fail if the JIT libs are missing
+        if: steps.fetch_jit.outputs.rebuild == 'true'
+        run: |
+          echo "::error::No JIT libs matched this AITER pin / arch / patch set." >&2
+          echo "Run the 'JIT libs (build + publish)' workflow, then re-run this job." >&2
+          exit 1
+
+      - name: Pull image
         run: docker pull "$IMAGE"
 
-      - name: Launch build container
+      - name: Launch container (all visible GPUs)
         run: |
-          set -euxo pipefail
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           docker run -d --name "$CONTAINER_NAME" \
-            --network=host \
-            --device=/dev/kfd \
-            --device=/dev/dri \
-            --ipc=host \
-            --shm-size=16G \
-            --group-add=video \
-            --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
-            -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
-            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
-            -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
-            -e HIP_VISIBLE_DEVICES=0 \
+            --network=host --device=/dev/kfd --device=/dev/dri \
+            --ipc=host --shm-size=32G --group-add=video \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS -e AITER_ASM_DIR \
             -v "${{ github.workspace }}:/jax-aiter" \
-            -w "/jax-aiter" \
-            "$IMAGE" tail -f /dev/null
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
 
-      - name: Install tooling and JAX runtime
-        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
-
-      - name: Display environment
+      - name: Environment
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            echo "=== System ==="
-            echo "Processors: $(nproc)"
-            rocm-smi || echo "rocm-smi not available"
-            rocminfo | grep -E "Marketing Name:|gfx" || true
+            echo "processors: $(nproc)"
+            rocm-smi || true
+            python3 -c "import jax; print(\"jax devices:\", jax.devices())"
           '
 
-      - name: Build (umbrella + JIT[fallback] + FFI + install)
-        run: |
-          docker exec \
-            -e JA_DO_JIT_BUILD="${{ steps.fetch_jit.outputs.rebuild }}" \
-            "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
+      - name: Install tooling and JAX
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
-      - name: Test (smoke + unit subset, 1 GPU)
-        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/test.sh'
-
-      - name: Build summary
-        if: always()
+      - name: Build (umbrella + FFI shims + install)
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            echo "=== Build Artifacts ==="
-            echo "Umbrella:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
-            echo "AITER JIT:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None"
-            echo "FFI modules:"; ls -lh build/jax_aiter_build/*.so 2>/dev/null || echo "None"
-          ' || true
+          docker exec -e JA_SKIP_JIT_BUILD=true "$CONTAINER_NAME" \
+            bash -lc 'bash ci/build.sh'
+
+      - name: Test (full suite, including slow and multigpu)
+        run: |
+          docker exec -e JA_TEST_TIER=nightly "$CONTAINER_NAME" \
+            bash -lc 'bash ci/test.sh'
 
       - name: Cleanup
         if: always()
