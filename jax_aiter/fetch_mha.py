@@ -21,7 +21,6 @@ import hashlib
 import json
 import lzma
 import shutil
-import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -63,9 +62,9 @@ def _sha256(path: Path) -> str:
 def _decompress(src: Path, dst: Path, compression: str) -> None:
     """Extract src to dst.
 
-    gzip and xz go through the standard library. zstd has no stdlib decoder
-    before Python 3.14, so it shells out and says so plainly if the binary is
-    absent, rather than failing with an opaque traceback.
+    gzip and xz go through the standard library. zstd is decoded by the
+    ``zstandard`` wheel declared in install_requires, so users do not need a
+    system package just to complete the jax-aiter installation.
     """
     if compression == "gzip":
         with gzip.open(src, "rb") as fin, open(dst, "wb") as fout:
@@ -76,15 +75,17 @@ def _decompress(src: Path, dst: Path, compression: str) -> None:
             shutil.copyfileobj(fin, fout, length=8 * 1024 * 1024)
         return
     if compression == "zstd":
-        if shutil.which("zstd") is None:
+        try:
+            import zstandard
+        except ImportError as exc:
             raise SystemExit(
-                "error: these assets are zstd-compressed and no 'zstd' binary was found.\n"
-                "       Install it (apt-get install zstd) and re-run."
-            )
-        subprocess.run(
-            ["zstd", "-d", "-f", "--long=27", "-o", str(dst), str(src)],
-            check=True,
-        )
+                "error: the required 'zstandard' Python package is missing.\n"
+                "       Reinstall jax-aiter with dependencies and re-run."
+            ) from exc
+        with open(src, "rb") as fin, open(dst, "wb") as fout:
+            dctx = zstandard.ZstdDecompressor(max_window_size=1 << 27)
+            with dctx.stream_reader(fin) as reader:
+                shutil.copyfileobj(reader, fout, length=8 * 1024 * 1024)
         return
     raise SystemExit(f"error: unknown compression '{compression}' in the manifest.")
 

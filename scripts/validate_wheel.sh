@@ -8,7 +8,7 @@
 # SIBLING container and runs the variant's smoke test(s). This proves a
 # downstream user can install and run the wheel with no source tree.
 #
-#   lite -> FP4 GEMM smoke (smoke_fp4_gemm.py).
+#   lite -> FP4 GEMM smoke; then MHA must fail with the fetch command named.
 #   full -> FP4 GEMM smoke + MHA flash-attn fwd/bwd smoke (smoke_mha.py),
 #           proving the bundled libmha_fwd/bwd.so load + run from the wheel.
 #
@@ -43,10 +43,20 @@ fi
 # Resolve the wheel to test (explicit path wins; else newest matching dist/).
 if [[ -z "$WHEEL" ]]; then
   if [[ "$VARIANT" == "lite" ]]; then
-    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*+lite-*.whl 2>/dev/null | head -n1 || true)"
+    WHEEL="$(python3 - "$REPO/dist" <<'PY'
+from pathlib import Path
+import sys
+
+wheels = sorted(
+    (p for p in Path(sys.argv[1]).glob("jax_aiter-*.whl") if "+full" not in p.name),
+    key=lambda p: p.stat().st_mtime,
+    reverse=True,
+)
+print(wheels[0] if wheels else "")
+PY
+)"
   else
-    # full = the non-+lite wheel.
-    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*-cp312-*.whl 2>/dev/null | grep -v '+lite' | head -n1 || true)"
+    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*+full-*.whl 2>/dev/null | head -n1 || true)"
   fi
 fi
 if [[ -z "$WHEEL" || ! -f "$WHEEL" ]]; then
@@ -63,7 +73,10 @@ docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO/docker/validation"
 
 # Smoke command per variant.
 if [[ "$VARIANT" == "lite" ]]; then
-  SMOKE="python /test/smoke_fp4_gemm.py"
+  SMOKE="python /test/smoke_fp4_gemm.py && \
+    (python -c 'import jax_aiter.mha' 2>&1 | tee /tmp/mha-error; \
+     test \${PIPESTATUS[0]} -ne 0; \
+     grep -q 'jax-aiter-fetch-mha' /tmp/mha-error)"
 else
   SMOKE="python /test/smoke_fp4_gemm.py && python /test/smoke_mha.py"
 fi

@@ -33,24 +33,30 @@ def _read_version() -> str:
     return match.group(1)
 
 
-# Wheel variant: "full" (default -- preserves `pip install .` for CI/dev,
-# ships everything) or "lite" (drops the MHA libs + thin shims).
-JA_WHEEL_VARIANT = os.environ.get("JA_WHEEL_VARIANT", "full").strip().lower()
+# Wheel variant: "lite" is the default/PyPI package. It includes every thin FFI
+# shim but drops the two multi-GB MHA JIT libraries; users add those with
+# `jax-aiter-fetch-mha`. "full" is a GitHub-release convenience artifact.
+JA_WHEEL_VARIANT = os.environ.get("JA_WHEEL_VARIANT", "lite").strip().lower()
 IS_LITE = JA_WHEEL_VARIANT == "lite"
+if JA_WHEEL_VARIANT not in {"lite", "full"}:
+    raise RuntimeError(
+        f"JA_WHEEL_VARIANT must be 'lite' or 'full', got {JA_WHEEL_VARIANT!r}"
+    )
 
 # Stale shim with no source -- never ship it (it would otherwise leak in).
 _ALWAYS_SKIP_LIBS = {"moe_fwd_ja.so"}
-# MHA libs + thin FFI shims: dropped from the lite wheel.
+# Only the large JIT libs are downloaded separately. The thin MHA FFI shims
+# must be in the default wheel or fetching the JIT libs would still leave
+# `import jax_aiter.mha` unusable.
 _LITE_SKIP_LIBS = {
     "libmha_fwd.so",
     "libmha_bwd.so",
-    "mha_fwd_ja.so",
-    "mha_bwd_ja.so",
 }
 
 BASE_VERSION = _read_version()
-# Lite wheels carry a `+lite` PEP 440 local-version tag; full carries none.
-FULL_VERSION = BASE_VERSION + ("+lite" if IS_LITE else "")
+# The PyPI/default package gets the public version. The optional oversized full
+# artifact gets a local tag and is published on GitHub, not PyPI.
+FULL_VERSION = BASE_VERSION + ("" if IS_LITE else "+full")
 
 
 def _copy_libs() -> int:
@@ -64,7 +70,8 @@ def _copy_libs() -> int:
       * The staging dir is wiped first so a prior (e.g. full) build can never
         leak stale libs into a later (e.g. lite) wheel.
       * ``moe_fwd_ja.so`` (no source) is always skipped.
-      * The lite variant additionally skips the MHA libs + thin shims.
+      * The lite variant additionally skips the MHA JIT libs, but keeps the
+        thin MHA FFI shims so `jax-aiter-fetch-mha` completes the install.
     """
     # Clear the staging dir first to prevent stale-lib leak across variants.
     shutil.rmtree(PKG_LIB_DIR, ignore_errors=True)
@@ -104,9 +111,13 @@ def _copy_libs() -> int:
 
 
 def _copy_hsa_kernels() -> int:
-    """Copy HSA kernel files (.co) from third_party/aiter/hsa into jax_aiter/_hsa.
+    """Copy one architecture's HSA files into jax_aiter/_hsa.
 
-    By default the entire hsa/ tree is copied (full and lite alike). When the
+    Alpha2 supports gfx950/MI355X only, matching the available CI hardware.
+    ``JA_WHEEL_ARCH`` is parameterized for a future MI300 wheel, but accepting a
+    semicolon-separated fat build here would silently double the artifact.
+
+    When the
     lite variant is built AND ``JA_LITE_DROP_FMHA_HSA=1`` is set, the fused
     MHA v3 kernel subtrees (``fmha_v3_fwd`` / ``fmha_v3_bwd``) are skipped to
     trim a further ~30-80 MiB. This drop is opt-in because it is irreversible
@@ -121,19 +132,34 @@ def _copy_hsa_kernels() -> int:
     shutil.rmtree(PKG_HSA_DIR, ignore_errors=True)
     PKG_HSA_DIR.mkdir(parents=True, exist_ok=True)
 
+    wheel_arch = os.environ.get(
+        "JA_WHEEL_ARCH", os.environ.get("GPU_ARCHS", "gfx950")
+    ).strip()
+    if ";" in wheel_arch or wheel_arch != "gfx950":
+        raise RuntimeError(
+            "Alpha2 wheels are gfx950-only; set JA_WHEEL_ARCH=gfx950 "
+            f"(got {wheel_arch!r})"
+        )
+
     drop_fmha = IS_LITE and os.environ.get("JA_LITE_DROP_FMHA_HSA") == "1"
     _FMHA_MARKERS = ("fmha_v3_fwd", "fmha_v3_bwd")
 
     n = 0
-    n_skipped = 0
-    # Copy the entire hsa directory structure.
+    n_arch_skipped = 0
+    n_fmha_skipped = 0
+    # Keep root metadata/helpers plus the selected architecture. Do not copy
+    # other GPU subtrees into a wheel we cannot test on available hardware.
     for item in HSA_DIR.rglob("*"):
         if item.is_file():
             # Calculate relative path from HSA_DIR.
             rel_path = item.relative_to(HSA_DIR)
+            if len(rel_path.parts) > 1 and rel_path.parts[0].startswith("gfx"):
+                if rel_path.parts[0] != wheel_arch:
+                    n_arch_skipped += 1
+                    continue
 
             if drop_fmha and any(m in rel_path.as_posix() for m in _FMHA_MARKERS):
-                n_skipped += 1
+                n_fmha_skipped += 1
                 continue
 
             dest_file = PKG_HSA_DIR / rel_path
@@ -147,9 +173,13 @@ def _copy_hsa_kernels() -> int:
 
     if drop_fmha:
         print(
-            f"[jax-aiter setup] lite HSA trim: dropped {n_skipped} fmha_v3 "
+            f"[jax-aiter setup] lite HSA trim: dropped {n_fmha_skipped} fmha_v3 "
             f"kernel files, copied {n}"
         )
+    print(
+        f"[jax-aiter setup] wheel architecture={wheel_arch}; "
+        f"skipped {n_arch_skipped} files for other architectures"
+    )
     return n
 
 
@@ -187,6 +217,11 @@ class bdist_wheel(_bdist_wheel):
     def finalize_options(self):
         super().finalize_options()
         self.root_is_pure = False
+        # Release builds run in the project's manylinux_2_28 image and set this
+        # explicitly. Local developer builds retain wheel's normal linux tag.
+        release_plat = os.environ.get("JA_WHEEL_PLAT_NAME", "").strip()
+        if release_plat:
+            self.plat_name = release_plat
 
 
 setup(
@@ -207,7 +242,7 @@ setup(
     # pinned here -- it must match the ROCm the machine actually has, and pinning
     # it would fight the container's own stack. The README states which pair was
     # validated.
-    install_requires=["jax"],
+    install_requires=["jax", "zstandard"],
     extras_require={
         "dev": ["pytest", "pytest-rerunfailures", "black", "flake8"],
     },

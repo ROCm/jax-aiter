@@ -11,12 +11,11 @@ Public API:
     flash_attn_func: Batch flash attention with custom_vjp
     flash_attn_varlen: Variable-length flash attention with custom_vjp
 
-Lite-variant guard: the lite wheel ships without the MHA kernels (the
-multi-GB ``libmha_fwd.so``/``libmha_bwd.so`` JIT libs and their
-``mha_*_ja.so`` FFI shims are dropped). If those libs are absent we raise a
-clear ``ModuleNotFoundError`` here at import time instead of surfacing a
-cryptic FFI "Module not loaded" RuntimeError deep inside the first
-``flash_attn_func`` call.
+Default-wheel guard: the wheel includes the thin ``mha_*_ja.so`` FFI shims but
+omits the multi-GB ``libmha_fwd.so``/``libmha_bwd.so`` JIT libraries. Users add
+those with ``jax-aiter-fetch-mha``. If they are absent we raise a clear
+``ModuleNotFoundError`` here instead of surfacing a cryptic FFI
+"Module not loaded" RuntimeError deep inside the first ``flash_attn_func`` call.
 """
 
 from ..ja_compat import config as _ja_config
