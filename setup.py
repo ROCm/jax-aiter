@@ -202,10 +202,21 @@ setup(
     packages=find_packages(include=["jax_aiter", "jax_aiter.*"]),
     include_package_data=True,  # picks up MANIFEST.in entries for sdist.
     python_requires="~=3.12",
-    install_requires=[],
+    # jax is a genuine runtime dependency: every op registers an XLA FFI target
+    # at import. The ROCm backend (jax-rocm7-plugin / -pjrt) is deliberately NOT
+    # pinned here -- it must match the ROCm the machine actually has, and pinning
+    # it would fight the container's own stack. The README states which pair was
+    # validated.
+    install_requires=["jax"],
     extras_require={
-        "dev": ["pytest", "black", "flake8"],
-        "examples": ["torch"],
+        "dev": ["pytest", "pytest-rerunfailures", "black", "flake8"],
+    },
+    entry_points={
+        "console_scripts": [
+            # Pulls the ~2.6 GB of flash-attention libraries the default wheel
+            # omits, instead of a 2-3 hour source build.
+            "jax-aiter-fetch-mha = jax_aiter.fetch_mha:main",
+        ],
     },
     package_data={
         # Wheel inclusion: include the copied .so files and HSA kernels.

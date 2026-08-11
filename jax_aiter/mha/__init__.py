@@ -40,8 +40,15 @@ def _mha_libs_present() -> bool:
 
 if not _mha_libs_present():
     raise ModuleNotFoundError(
-        "jax_aiter was built as the 'lite' variant without MHA kernels; "
-        "install the 'full' variant to use flash attention."
+        "jax_aiter is installed without the flash-attention libraries.\n"
+        "\n"
+        "They are ~2.6 GB, so the default wheel omits them. Download the\n"
+        "prebuilt ones (a minute or two, versus a 2-3 hour source build):\n"
+        "\n"
+        "    jax-aiter-fetch-mha\n"
+        "\n"
+        "Everything else -- MXFP4/FP4 GEMM, BF16 GEMM, MXFP4 cast, RMSNorm,\n"
+        "SiLU-and-Mul -- works without them."
     )
 
 from .mha import (
