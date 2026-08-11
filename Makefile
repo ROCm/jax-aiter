@@ -81,10 +81,11 @@ KV_PROBE_INCLUDES := -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC)
 # append_kv and paged attention compile aiter sources directly rather than
 # linking a JIT library, so they need aiter's own include tree.
 #
-# AITER_TORCH_EXCLUDE drops the one torch dependency in aiter_opus_plus.h (a
-# t2opus mapping for c10 scalar types that nothing on the aiter_tensor_t path
-# uses), so these shims build with no PyTorch headers at all.
-KV_DEFINES  := -DAITER_TORCH_EXCLUDE
+# AITER_NO_TORCH_TYPES is aiter's own opt-out for the c10 include in
+# aiter_opus_plus.h, which exists only for the t2opus mapping of torch scalar
+# types. Nothing on the aiter_tensor_t path needs it, so these shims build with
+# no PyTorch headers at all.
+KV_DEFINES  := -DAITER_NO_TORCH_TYPES
 KV_INCLUDES := $(KV_PROBE_INCLUDES) $(KV_DEFINES) \
                -I$(AITER_SRC_DIR)/csrc/include \
                -I$(AITER_SRC_DIR)/csrc/include/ck_tile \
