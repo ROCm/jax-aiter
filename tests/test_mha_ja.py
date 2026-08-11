@@ -184,10 +184,18 @@ VARLEN_CONFIGS = [
 # BATCH FORWARD TESTS
 # ===========================================================================
 
+@pytest.mark.slow
 @pytest.mark.parametrize("b,sq,sk,hq,hk,d,dtype", BATCH_CORE)
 @pytest.mark.parametrize("causal", [False, True], ids=["nomask", "causal"])
 def test_batch_fwd_shape(b, sq, sk, hq, hk, d, dtype, causal):
-    """Forward: correct shape, dtype, finite values for all configs."""
+    """Forward: correct shape, dtype, finite values for all configs.
+
+    Nightly only. 25 configs x 2 causal is the largest block in the suite, and
+    what it checks is covered on the PR path from several directions:
+    test_batch_fwd_accuracy over the same configs, test_padded_head_dim_fwd
+    across d=32..256, and TestRegressions for GQA/MQA routing and off-by-one
+    seqlens. This sweep earns its keep by breadth, which is a nightly job.
+    """
     q, k_t, v = make_qkv(b, sq, sk, hq, hk, d, dtype)
     out = run_fwd(q, k_t, v, causal=causal)
     assert out.shape == (b, sq, hq, d)
@@ -210,10 +218,11 @@ def test_batch_fwd_accuracy(b, sq, sk, hq, hk, d, dtype, causal):
 # BATCH BACKWARD TESTS
 # ===========================================================================
 
+@pytest.mark.slow
 @pytest.mark.parametrize("b,sq,sk,hq,hk,d,dtype", BATCH_CORE)
 @pytest.mark.parametrize("causal", [False, True], ids=["nomask", "causal"])
 def test_batch_bwd_shape(b, sq, sk, hq, hk, d, dtype, causal):
-    """Backward: gradient shapes, dtypes, finiteness."""
+    """Backward: gradient shapes, dtypes, finiteness. Nightly only, as above."""
     q, k_t, v = make_qkv(b, sq, sk, hq, hk, d, dtype, seed=1)
     dq, dk, dv = run_bwd(q, k_t, v, causal=causal)
     assert dq.shape == q.shape, f"dq {dq.shape} != {q.shape}"

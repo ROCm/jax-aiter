@@ -219,6 +219,7 @@ def test_guardrail_default_module_flag_is_off():
 # Shardy -- FSDP-mesh parity under an N-sharded weight (dgrad N-gather path).
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.multigpu
 @pytest.mark.skipif(len(jax.devices()) < 4,
                     reason="FSDP N-shard dgrad-reuse test needs >= 4 devices")
 @pytest.mark.parametrize("shardy", [False, True])
