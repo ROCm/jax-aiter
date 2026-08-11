@@ -25,14 +25,18 @@ def _mha_libs_present() -> bool:
     """True iff both the MHA JIT lib and its FFI shim are on disk.
 
     Works for the dev layout (``$JA_ROOT_DIR/build/...``) and the installed
-    wheel layout (``jax_aiter/_lib/...``); both are resolved by
-    ``ja_compat.config.get_lib_root()``.
+    wheel layout, where downloaded JIT libraries live in a versioned user cache
+    and thin FFI shims stay under ``jax_aiter/_lib``.
     """
     try:
-        lib_root = _ja_config.get_lib_root()
-        aiter_lib = lib_root / "aiter_build" / "libmha_fwd.so"
-        ja_shim = lib_root / "jax_aiter_build" / "mha_fwd_ja.so"
-        return bool(aiter_lib.exists() and ja_shim.exists())
+        aiter_dir = _ja_config.get_aiter_lib_dir()
+        ja_dir = _ja_config.get_jax_aiter_lib_dir()
+        return bool(
+            (aiter_dir / "libmha_fwd.so").is_file()
+            and (aiter_dir / "libmha_bwd.so").is_file()
+            and (ja_dir / "mha_fwd_ja.so").is_file()
+            and (ja_dir / "mha_bwd_ja.so").is_file()
+        )
     except Exception:
         return False
 

@@ -91,9 +91,9 @@ def _decompress(src: Path, dst: Path, compression: str) -> None:
 
 
 def _target_dir() -> Path:
-    from .ja_compat.config import get_lib_root
+    from .ja_compat.config import get_downloaded_aiter_lib_dir
 
-    return Path(str(get_lib_root())) / "aiter_build"
+    return get_downloaded_aiter_lib_dir()
 
 
 def _local_arch() -> str | None:
@@ -194,6 +194,14 @@ def main(argv: list[str] | None = None) -> int:
             blob.unlink(missing_ok=True)
             print(f"  {name}: installed ({entry['size'] / 1e6:.0f} MB)")
 
+        # Keep the exact provenance/checksums next to the installed libraries.
+        shutil.copy2(manifest_path, dest / MANIFEST_NAME)
+
+    if args.dest:
+        print(
+            "  custom destination: set "
+            f"JAX_AITER_LIB_DIR={dest.resolve()} before importing jax_aiter"
+        )
     print("jax-aiter: done. `from jax_aiter.mha import flash_attn_func` should now work.")
     return 0
 

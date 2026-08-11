@@ -12,6 +12,7 @@ except ImportError:
     pkg_files = resources.files
 
 logger = logging.getLogger("JAX_AITER")
+_JIT_LIB_NAMES = ("librmsnorm_fwd.so", "libmha_fwd.so", "libmha_bwd.so")
 
 
 def get_packaged_lib_dir():
@@ -42,6 +43,52 @@ def get_lib_root() -> Path:
     raise FileNotFoundError(
         f"Can't find JAX Aiter library. Set JA_ROOT_DIR or install the package."
     )
+
+
+def get_downloaded_aiter_lib_dir() -> Path:
+    """Writable location for JIT libraries downloaded after wheel install.
+
+    Development checkouts keep using ``build/aiter_build``. Installed wheels
+    use a versioned user cache, avoiding writes to root-owned site-packages and
+    preventing an old package's libraries from being loaded after an upgrade.
+    ``JAX_AITER_LIB_DIR`` is an advanced override; normal users need no env var.
+    """
+    root = os.environ.get("JA_ROOT_DIR")
+    if root:
+        return Path(root).resolve() / "build" / "aiter_build"
+
+    override = os.environ.get("JAX_AITER_LIB_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+
+    from ..__version__ import __version__
+
+    cache_home = Path(
+        os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
+    ).expanduser()
+    return cache_home / "jax-aiter" / __version__ / "aiter_build"
+
+
+def get_aiter_lib_dir() -> Path:
+    """JIT-library directory to load.
+
+    Prefer a complete downloaded set, otherwise use what the wheel packaged
+    (the default wheel includes RMSNorm; the +full wheel includes all three).
+    Requiring the complete set avoids loading from a half-finished download.
+    """
+    root = os.environ.get("JA_ROOT_DIR")
+    if root:
+        return get_lib_root() / "aiter_build"
+
+    downloaded = get_downloaded_aiter_lib_dir()
+    if all((downloaded / name).is_file() for name in _JIT_LIB_NAMES):
+        return downloaded
+    return get_lib_root() / "aiter_build"
+
+
+def get_jax_aiter_lib_dir() -> Path:
+    """Directory containing the thin, wheel-packaged FFI shims."""
+    return get_lib_root() / "jax_aiter_build"
 
 
 def get_umbrella_lib() -> Path:

@@ -80,9 +80,11 @@ def load_thin_modules():
     if not _umbrella_handle:
         raise RuntimeError("Umbrella library must be loaded first")
 
-    build_root = ja_config.get_lib_root()
-    aiter_dir = build_root / "aiter_build"
-    ja_dir = build_root / "jax_aiter_build"
+    # The default wheel packages thin FFI shims but downloads the multi-GB JIT
+    # libraries into a writable user cache. These directories can therefore
+    # have different roots.
+    aiter_dir = ja_config.get_aiter_lib_dir()
+    ja_dir = ja_config.get_jax_aiter_lib_dir()
 
     def _load_modules(dir_path):
         loaded = []
