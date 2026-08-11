@@ -827,12 +827,14 @@ class TestRegressions:
             assert jnp.all(jnp.isfinite(dk))
             assert jnp.all(jnp.isfinite(dv))
 
-    @pytest.mark.parametrize("d", [
-        pytest.param(96, marks=pytest.mark.xfail(reason="gfx950 CK varlen bwd causal max_sk>256 kernel issue")),
-        pytest.param(128, marks=pytest.mark.xfail(reason="gfx950 CK varlen bwd causal max_sk>256 kernel issue")),
-    ], ids=["d96", "d128"])
+    @pytest.mark.parametrize("d", [96, 128], ids=["d96", "d128"])
     def test_varlen_large_sk_causal(self, d):
-        """c5bc2e2: varlen max_sk>256 causal d>=96 on gfx950."""
+        """c5bc2e2: varlen max_sk>256 causal d>=96 stays finite on gfx950.
+
+        These were xfailed for an older kernel issue, but both cases now XPASS
+        consistently (three repeats). Keep them as ordinary regression guards
+        so a recurrence fails CI instead of being hidden by a stale exemption.
+        """
         q, k_t, v, cu_sq, cu_sk, msq, msk = make_varlen(4, 512, 512, 4, 4, d, jnp.bfloat16, seed=43)
         dq, dk, dv = run_varlen_bwd(q, k_t, v, cu_sq, cu_sk, msq, msk, causal=True)
         assert jnp.all(jnp.isfinite(dq)), f"d={d}: varlen dq NaN"
