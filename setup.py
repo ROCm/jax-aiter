@@ -1,4 +1,5 @@
 from setuptools import setup, find_packages
+from setuptools.dist import Distribution
 from setuptools.command.build_py import build_py as _build_py
 from setuptools.command.develop import develop as _develop
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
@@ -224,6 +225,19 @@ class bdist_wheel(_bdist_wheel):
             self.plat_name = release_plat
 
 
+class BinaryDistribution(Distribution):
+    """Tell setuptools this package contains platform binaries.
+
+    Setting ``bdist_wheel.root_is_pure = False`` changes the tag but does not
+    change setuptools' install scheme by itself. Without this override the
+    package was written under ``.data/purelib`` and auditwheel rejected it as an
+    invalid binary wheel.
+    """
+
+    def has_ext_modules(self):
+        return True
+
+
 setup(
     name="jax-aiter",
     version=FULL_VERSION,
@@ -267,6 +281,7 @@ setup(
         "develop": develop,
         "bdist_wheel": bdist_wheel,
     },
+    distclass=BinaryDistribution,
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Developers",

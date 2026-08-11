@@ -47,6 +47,7 @@ jobs:
         run: |
           python3 ci/test_jit_libs_manifest.py
           python3 ci/perf/test_parse_perf_log.py
+          python3 ci/check_manylinux_policy.py --selftest
 
       - name: MaxText patch still applies
         run: |

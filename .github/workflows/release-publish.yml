@@ -110,8 +110,10 @@ jobs:
       - name: Audit wheel policy and contents
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            auditwheel show dist/jax_aiter-0.1.0a2-*.whl
-            auditwheel show dist/jax_aiter-0.1.0a2+full-*.whl
+            python3 ci/check_manylinux_policy.py \
+              dist/jax_aiter-0.1.0a2-*.whl --max-minor 28
+            python3 ci/check_manylinux_policy.py \
+              dist/jax_aiter-0.1.0a2+full-*.whl --max-minor 28
             python3 - <<"PY"
           from pathlib import Path
           from zipfile import ZipFile
