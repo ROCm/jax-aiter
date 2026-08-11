@@ -1,0 +1,155 @@
+name: JIT libs (build + publish)
+
+# Builds the three AITER JIT libraries and publishes them as release assets.
+#
+# This is the ONLY place they are built. Everything else fetches them via
+# ci/fetch_jit_libs.sh and runs with JA_SKIP_JIT_BUILD=true, so a cache miss
+# fails a job in seconds instead of quietly starting a 2-3 hour build on a
+# shared runner.
+#
+# ci/jit_libs_manifest.py keys the cache on aiter_sha + gpu_archs + patch_hash
+# (hard gates) and rocm_version (advisory), so this only needs to run when the
+# AITER submodule pointer, the scripts/*.patch set, or the JIT build recipe
+# changes -- which is exactly the push filter below.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish the assets on
+        type: string
+        default: jit-libs
+      gpu_archs:
+        description: Semicolon-separated arch list
+        type: string
+        default: gfx950
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        default: jit-libs
+      gpu_archs:
+        type: string
+        default: gfx950
+  push:
+    # Deliberately branch-scoped: this job is hours long, so an unrelated
+    # feature branch touching the AITER pin should not launch one.
+    branches:
+      - main
+      - feature/alpha2-overhaul
+    paths:
+      - third_party/aiter
+      - scripts/*.patch
+      - jax_aiter/jit/**
+      - ci/setup_jax.sh
+      - .github/workflows/jit-libs.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  # Never run two of these at once: they are hours long and publish to the same
+  # assets. Queue instead of cancelling so a half-uploaded set is not left behind.
+  group: jit-libs
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  CONTAINER_NAME: ja_jit_libs
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+  GPU_ARCHS: ${{ inputs.gpu_archs || 'gfx950' }}
+  RELEASE_TAG: ${{ inputs.release_tag || 'jit-libs' }}
+
+jobs:
+  build-and-publish:
+    name: build + publish JIT libs
+    # No GPU needed: hipcc cross-compiles for gfx950 offline. Verified on this
+    # runner -- a gfx950 object built with no /dev/kfd present.
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 300
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Launch build container
+        run: |
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host --ipc=host --shm-size=16G \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS -e AITER_ASM_DIR \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
+
+      - name: Install tooling and JAX
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
+
+      - name: Report the cache key this build will publish under
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            echo "aiter_sha  : $(git -C third_party/aiter rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo "gpu_archs  : ${GPU_ARCHS}"
+            echo "rocm_version: $(rocm-sdk version 2>/dev/null || echo unknown)"
+            echo "patch_hash : $(cat scripts/*.patch 2>/dev/null | sha256sum | cut -c1-16 || echo none)"
+          '
+
+      - name: Build the JIT libs
+        run: |
+          docker exec -e JA_DO_JIT_BUILD=true "$CONTAINER_NAME" \
+            bash -lc 'mkdir -p build/aiter_build && python3 jax_aiter/jit/build_jit.py --verbose'
+
+      - name: Show what was built
+        run: docker exec "$CONTAINER_NAME" bash -lc 'ls -lh build/aiter_build/*.so'
+
+      - name: Detect ROCm version for the manifest
+        id: rocm
+        # TheRock has no /opt/rocm/.info/version, which is where the manifest
+        # tool looks by default; without this it records "unknown".
+        run: |
+          v="$(docker exec "$CONTAINER_NAME" bash -lc 'rocm-sdk version 2>/dev/null' || true)"
+          echo "version=${v:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "rocm_version=${v:-unknown}"
+
+      - name: Ensure the rolling release exists
+        # ci/publish_jit_libs.sh only uploads; it does not create the release.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --title "AITER JIT libraries (rolling)" \
+              --prerelease \
+              --notes "Prebuilt AITER JIT libraries that CI consumes via ci/fetch_jit_libs.sh. Rolling: assets are replaced whenever the AITER pin, the scripts/*.patch set or the arch list changes. Infrastructure, not a product release -- see the versioned releases for wheels."
+          fi
+
+      - name: Hand the build output back to the runner user
+        # The container runs as root, so build/ is root-owned; publishing runs on
+        # the host and needs to create build/jit_libs_dist/ next to it.
+        run: sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/build"
+
+      - name: Compress, manifest and upload to the release
+        # On the host: it has the gh CLI. ci/publish_jit_libs.sh prefers zstd and
+        # degrades to xz or gzip if it is absent.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ROCM_VERSION: ${{ steps.rocm.outputs.version }}
+        run: |
+          bash ci/publish_jit_libs.sh --tag "$RELEASE_TAG"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
