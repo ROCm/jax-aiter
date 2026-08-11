@@ -8,3 +8,16 @@
 [build-system]
 requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
+
+# Pytest configuration only. Package metadata stays in setup.py (see above).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Without this, pytest's default `*_test.py` glob also collects the smoke
+# scripts, which import jax_aiter and initialise the backend just to report
+# zero tests.
+python_files = ["test_*.py"]
+markers = [
+    "gpu: needs a GPU (an AITER FFI kernel actually executes)",
+    "multigpu: needs at least 4 visible devices; skipped on a single-GPU runner",
+    "slow: exhaustive sweeps and large shapes; nightly only, not on the PR path",
+]

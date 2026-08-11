@@ -41,9 +41,13 @@ import pytest
 EXPECTED_KERNEL = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
 DISPATCH_128x512 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
 
-REPO = Path("/ruvaidya/aiter_proj")
-HANDLER = REPO / "jax-aiter/csrc/ffi/gemm_fp4/gemm_fp4_ja.cu"
-VERIFY = REPO / "jax-aiter/scripts/verify_fp4_dispatch_rocprof.py"
+# Derived from this file, not hardcoded: an absolute developer path made
+# HANDLER.exists() and VERIFY.exists() false anywhere else, so the two checks
+# below -- including the only guard that the dispatch table still matches the
+# 20260615 oracle -- silently skipped instead of running.
+REPO = Path(__file__).resolve().parents[1]
+HANDLER = REPO / "csrc/ffi/gemm_fp4/gemm_fp4_ja.cu"
+VERIFY = REPO / "scripts/verify_fp4_dispatch_rocprof.py"
 
 # Per-shape oracle expected by the 20260615 study (M,N,K) -> (tile, splitK).
 ORACLE_TABLE = {
@@ -146,7 +150,7 @@ def test_force_kernel_dispatches_via_rocprof_trace(tmp_path):
     if not _gpu_available():
         pytest.skip("no ROCm GPU visible to JAX")
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO / "jax-aiter")
+    env["PYTHONPATH"] = str(REPO)
     env.setdefault("HIP_VISIBLE_DEVICES", "0")
     checks = [
         "32768,4096,4096:dispatch:128x512:1",   # tall fprop/dgrad -> 128x512
@@ -157,7 +161,7 @@ def test_force_kernel_dispatches_via_rocprof_trace(tmp_path):
            "--warmup", "2", "--iters", "8"]
     for c in checks:
         cmd += ["--check", c]
-    proc = subprocess.run(cmd, env=env, cwd=str(REPO / "jax-aiter"),
+    proc = subprocess.run(cmd, env=env, cwd=str(REPO),
                           capture_output=True, text=True, timeout=600)
     print(proc.stdout)
     print(proc.stderr, file=sys.stderr)

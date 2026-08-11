@@ -225,17 +225,18 @@ def test_batch_bwd_shape(b, sq, sk, hq, hk, d, dtype, causal):
     assert jnp.all(jnp.isfinite(dv)), "dv NaN/Inf"
 
 
-_BWD_XFAIL_DIMS = {96, 111, 128}
-
 @pytest.mark.parametrize("b,sq,sk,hq,hk,d,dtype", BATCH_ACCURACY)
 def test_batch_bwd_accuracy(b, sq, sk, hq, hk, d, dtype):
     """Backward accuracy: gradients vs JAX reference (10x relaxed tolerance).
 
-    Head dims >= 96 are xfailed due to known CK/ASM backward accuracy
-    limitations on gfx950 (large dq errors at these dims).
+    Head dims 96 / 111 / 128 used to be xfailed here for a CK/ASM backward
+    accuracy limitation on gfx950, via an imperative pytest.xfail() that skipped
+    the body outright. With the body actually running, all of them pass -- 5/5
+    XPASS, stable over three repeats despite the backward's atomics -- so the
+    limitation no longer holds on this stack and the exemption is gone. The
+    varlen max_sk>256 xfails in TestRegressions are a different code path and
+    still stand.
     """
-    if d in _BWD_XFAIL_DIMS:
-        pytest.xfail(f"Known backward accuracy issue for d={d} on gfx950")
     q, k_t, v = make_qkv(b, sq, sk, hq, hk, d, dtype, seed=2)
     scale = d ** (-0.5)
 
