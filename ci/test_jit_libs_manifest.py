@@ -160,21 +160,36 @@ def test_verify_rocm_advisory_by_default_strict_optional():
     print("PASS test_verify_rocm_advisory_by_default_strict_optional")
 
 
-def test_normalize_archs_and_patch_hash_none():
+def test_normalize_archs_and_jit_input_hash():
     assert jlm.normalize_archs("gfx950;gfx942") == ["gfx942", "gfx950"]
     assert jlm.normalize_archs("gfx942, gfx950") == ["gfx942", "gfx950"]
     assert jlm.normalize_archs("") == []
     with tempfile.TemporaryDirectory() as td:
-        # No scripts/ dir -> "none".
+        root = Path(td)
+        # No JIT recipe files -> "none".
         assert jlm.compute_patch_hash(td) == "none"
-        # A patch present -> deterministic sha256: prefix.
-        sd = Path(td) / "scripts"
-        sd.mkdir()
-        (sd / "a.patch").write_text("--- patch ---\n")
+
+        jit = root / "jax_aiter" / "jit"
+        jit.mkdir(parents=True)
+        (jit / "build_jit.py").write_text("recipe = 1\n")
+        (jit / "optCompilerConfig.json").write_text("{}\n")
         h1 = jlm.compute_patch_hash(td)
+        assert h1.startswith("sha256:")
+        assert h1 == jlm.compute_patch_hash(td)
+
+        # Unrelated integration patches must not invalidate multi-GB JIT libs.
+        sd = root / "scripts"
+        sd.mkdir()
+        (sd / "maxtext_aiter_fp4.patch").write_text("--- unrelated ---\n")
+        assert jlm.compute_patch_hash(td) == h1
+
+        # JIT recipe and explicitly named JIT patches are hard cache inputs.
+        (jit / "optCompilerConfig.json").write_text('{"changed": true}\n')
         h2 = jlm.compute_patch_hash(td)
-        assert h1.startswith("sha256:") and h1 == h2
-    print("PASS test_normalize_archs_and_patch_hash_none")
+        assert h2 != h1
+        (sd / "aiter_jit_example.patch").write_text("--- jit patch ---\n")
+        assert jlm.compute_patch_hash(td) != h2
+    print("PASS test_normalize_archs_and_jit_input_hash")
 
 
 def _run_all():

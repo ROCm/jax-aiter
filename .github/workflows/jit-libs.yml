@@ -7,10 +7,10 @@ name: JIT libs (build + publish)
 # fails a job in seconds instead of quietly starting a 2-3 hour build on a
 # shared runner.
 #
-# ci/jit_libs_manifest.py keys the cache on aiter_sha + gpu_archs + patch_hash
-# (hard gates) and rocm_version (advisory), so this only needs to run when the
-# AITER submodule pointer, the scripts/*.patch set, or the JIT build recipe
-# changes -- which is exactly the push filter below.
+# ci/jit_libs_manifest.py keys the cache on aiter_sha + gpu_archs + the JIT
+# recipe hash (stored in schema-v1's patch_hash field) as hard gates, with
+# rocm_version advisory. Unrelated MaxText/XLA patch files do not invalidate
+# multi-GB MHA binaries.
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ on:
       - feature/alpha2-overhaul
     paths:
       - third_party/aiter
-      - scripts/*.patch
+      - scripts/aiter_jit_*.patch
       - jax_aiter/jit/**
       - ci/setup_jax.sh
 
@@ -103,7 +103,7 @@ jobs:
             echo "aiter_sha  : $(git -C third_party/aiter rev-parse HEAD 2>/dev/null || echo unknown)"
             echo "gpu_archs  : ${GPU_ARCHS}"
             echo "rocm_version: $(rocm-sdk version 2>/dev/null || echo unknown)"
-            echo "patch_hash : $(cat scripts/*.patch 2>/dev/null | sha256sum | cut -c1-16 || echo none)"
+            echo "jit_hash   : $(python3 -c 'from ci.jit_libs_manifest import compute_patch_hash; print(compute_patch_hash(\".\"))')"
           '
 
       - name: Build the JIT libs
@@ -133,7 +133,7 @@ jobs:
               --repo "${{ github.repository }}" \
               --title "AITER JIT libraries (rolling)" \
               --prerelease \
-              --notes "Prebuilt AITER JIT libraries that CI consumes via ci/fetch_jit_libs.sh. Rolling: assets are replaced whenever the AITER pin, the scripts/*.patch set or the arch list changes. Infrastructure, not a product release -- see the versioned releases for wheels."
+              --notes "Prebuilt AITER JIT libraries that CI consumes via ci/fetch_jit_libs.sh. Rolling: assets are replaced whenever the AITER pin, JIT recipe or arch list changes. Infrastructure, not a product release -- see the versioned releases for wheels."
           fi
 
       - name: Hand the build output back to the runner user

@@ -50,9 +50,25 @@ jobs:
 
       - name: MaxText patch still applies
         run: |
-          if [ -f scripts/maxtext_aiter_fp4.patch ]; then
-            echo "TODO: check against the pinned MaxText revision once the patch is regenerated."
-          fi
+          set -euo pipefail
+          base=14aa40b3af3aae793c72bb886533b4e8790ee6fa
+          target=ccd72e63e57193c6f1d51b06bd2e7f52ce895404
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          git -C "$work" init -q
+          git -C "$work" remote add origin https://github.com/ROCm/maxtext.git
+          git -C "$work" fetch -q --depth=1 origin "$target"
+          target_tree="$(git -C "$work" rev-parse FETCH_HEAD)"
+          git -C "$work" fetch -q --depth=1 origin "$base"
+          git -C "$work" checkout -q --detach FETCH_HEAD
+          git -C "$work" apply --check \
+            "${{ github.workspace }}/scripts/maxtext_aiter_fp4.patch"
+          git -C "$work" apply \
+            "${{ github.workspace }}/scripts/maxtext_aiter_fp4.patch"
+          # Intent-to-add makes `git diff` include files created by the patch.
+          git -C "$work" add -N .
+          git -C "$work" diff --quiet --ignore-space-at-eol "$target_tree" --
+          echo "MaxText patch applies to $base and exactly reproduces $target"
 
   gpu:
     name: gpu tests (1x MI355)
@@ -89,7 +105,7 @@ jobs:
         # Building them here would occupy a shared GPU runner for hours.
         if: steps.fetch_jit.outputs.rebuild == 'true'
         run: |
-          echo "::error::No JIT libs matched this AITER pin / arch / patch set." >&2
+          echo "::error::No JIT libs matched this AITER pin / arch / JIT recipe." >&2
           echo "Run the 'JIT libs (build + publish)' workflow, then re-run this job." >&2
           exit 1
 

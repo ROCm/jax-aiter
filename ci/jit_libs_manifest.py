@@ -66,21 +66,33 @@ def sha256_file(path: str | os.PathLike, chunk: int = 8 * 1024 * 1024) -> str:
 
 
 def compute_patch_hash(repo_root: str | os.PathLike) -> str:
-    """sha256 of the concatenated ``scripts/*.patch`` (sorted), or ``"none"``.
+    """Hash repository-owned inputs that can change the JIT library bytes.
 
-    Returns a ``"sha256:<hex>"`` string. Patches are concatenated in sorted
-    filename order so the hash is deterministic regardless of glob ordering.
+    ``patch_hash`` is the schema-v1 field name, but hashing every
+    ``scripts/*.patch`` was wrong: editing the MaxText or XLA integration patch
+    invalidated multi-GB MHA binaries even though those files never enter their
+    build. Hash the JIT driver/config plus explicitly named ``aiter_jit_*.patch``
+    files instead. AITER source itself is keyed separately by ``aiter_sha``.
     """
-    scripts_dir = Path(repo_root) / "scripts"
-    patches = sorted(scripts_dir.glob("*.patch")) if scripts_dir.is_dir() else []
-    if not patches:
+    root = Path(repo_root)
+    inputs = [
+        root / "jax_aiter" / "jit" / "build_jit.py",
+        root / "jax_aiter" / "jit" / "optCompilerConfig.json",
+    ]
+    scripts_dir = root / "scripts"
+    if scripts_dir.is_dir():
+        inputs.extend(sorted(scripts_dir.glob("aiter_jit_*.patch")))
+    inputs = [path for path in inputs if path.is_file()]
+    if not inputs:
         return "none"
+
     h = hashlib.sha256()
-    for p in patches:
-        # Include the basename so a rename alone changes the hash.
-        h.update(p.name.encode("utf-8"))
+    for path in sorted(inputs):
+        # Include a stable repository-relative path so a rename changes the
+        # hash without making it depend on the checkout's absolute location.
+        h.update(path.relative_to(root).as_posix().encode("utf-8"))
         h.update(b"\0")
-        with open(p, "rb") as f:
+        with open(path, "rb") as f:
             for block in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(block)
     return "sha256:" + h.hexdigest()

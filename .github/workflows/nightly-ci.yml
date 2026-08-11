@@ -63,7 +63,7 @@ jobs:
       - name: Fail if the JIT libs are missing
         if: steps.fetch_jit.outputs.rebuild == 'true'
         run: |
-          echo "::error::No JIT libs matched this AITER pin / arch / patch set." >&2
+          echo "::error::No JIT libs matched this AITER pin / arch / JIT recipe." >&2
           echo "Run the 'JIT libs (build + publish)' workflow, then re-run this job." >&2
           exit 1
 
