@@ -121,9 +121,8 @@ def _tag_context(*vals):
     """Name attention residuals so a layer-remat policy can save them."""
     if os.environ.get("JA_MHA_REMAT_CONTEXT", "1") == "0":
         return vals if len(vals) > 1 else vals[0]
-    name = os.environ.get("JA_MHA_CONTEXT_CKPT_NAME", _CONTEXT_CKPT_NAME)
     tagged = tuple(
-        v if v is None else checkpoint_name(v, name) for v in vals
+        v if v is None else checkpoint_name(v, _CONTEXT_CKPT_NAME) for v in vals
     )
     return tagged if len(tagged) > 1 else tagged[0]
 
