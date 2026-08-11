@@ -42,7 +42,6 @@ on:
       - scripts/*.patch
       - jax_aiter/jit/**
       - ci/setup_jax.sh
-      - .github/workflows/jit-libs.yml
 
 permissions:
   contents: write
@@ -76,10 +75,12 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
-          fetch-depth: 0
+          # The cache key only needs `git rev-parse HEAD` on the AITER
+          # submodule. Full history made this 4.5 GB checkout take 15+ minutes.
+          fetch-depth: 1
 
       - name: Pull image
         run: docker pull "$IMAGE"
