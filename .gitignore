@@ -60,7 +60,6 @@ coverage.xml
 build/
 third_party/*
 !third_party/aiter
-!third_party/pytorch
 
 # Python cache.
 __pycache__/
@@ -93,6 +92,11 @@ ci_perf_out/
 # its parent dir is excluded, so ignore docs/* contents rather than docs/).
 docs/*
 !docs/RELEASE_NOTES_v0.1.0-alpha.md
+!docs/RELEASE_NOTES_v0.1.0-alpha2.md
+!docs/architecture.md
+!docs/development.md
 !docs/recipes/
 !docs/recipes/*.md
+!docs/release/
+!docs/release/RELEASE_PLAYBOOK.md
 .rocprofv3/

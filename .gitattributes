@@ -1,0 +1,3 @@
+# Unified diff context lines use a single leading space, which is valid patch
+# syntax but looks like trailing whitespace when the patch itself is reviewed.
+*.patch -whitespace
