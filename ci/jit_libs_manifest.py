@@ -76,9 +76,16 @@ def compute_patch_hash(repo_root: str | os.PathLike) -> str:
     """
     root = Path(repo_root)
     inputs = [
+        root / "Makefile",
         root / "jax_aiter" / "jit" / "build_jit.py",
         root / "jax_aiter" / "jit" / "optCompilerConfig.json",
+        root / "ci" / "setup_jax.sh",
+        root / "ci" / "jit_libs_manifest.py",
+        root / "ci" / "publish_jit_libs.sh",
     ]
+    common_dir = root / "csrc" / "common"
+    if common_dir.is_dir():
+        inputs.extend(path for path in common_dir.iterdir() if path.is_file())
     scripts_dir = root / "scripts"
     if scripts_dir.is_dir():
         inputs.extend(sorted(scripts_dir.glob("aiter_jit_*.patch")))
@@ -99,16 +106,47 @@ def compute_patch_hash(repo_root: str | os.PathLike) -> str:
 
 
 def compute_aiter_sha(repo_root: str | os.PathLike) -> str:
-    """``git -C third_party/aiter rev-parse HEAD`` (or ``"unknown"``)."""
-    aiter_dir = Path(repo_root) / "third_party" / "aiter"
+    """Resolve the consumed AITER commit, even before submodule checkout."""
+    root = Path(repo_root)
+    aiter_dir = root / "third_party" / "aiter"
     try:
         out = subprocess.run(
-            ["git", "-C", str(aiter_dir), "rev-parse", "HEAD"],
+            [
+                "git",
+                "-c",
+                f"safe.directory={aiter_dir.resolve()}",
+                "-C",
+                str(aiter_dir),
+                "rev-parse",
+                "HEAD",
+            ],
             capture_output=True, text=True, check=True,
         )
         return out.stdout.strip()
     except Exception:
-        return "unknown"
+        pass
+    try:
+        out = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={root.resolve()}",
+                "-C",
+                str(root),
+                "ls-tree",
+                "HEAD",
+                "third_party/aiter",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        fields = out.stdout.split()
+        if len(fields) >= 3 and fields[1] == "commit":
+            return fields[2]
+    except Exception:
+        pass
+    return "unknown"
 
 
 def detect_rocm_version() -> str:
@@ -150,6 +188,27 @@ def normalize_archs(archs: str | None) -> list[str]:
         if tok:
             out.append(tok)
     return sorted(set(out))
+
+
+def compute_cache_id(
+    *, aiter_sha: str, gpu_archs: str, patch_hash: str
+) -> str:
+    """Stable identifier for one immutable set of JIT build inputs."""
+    payload = "\0".join(
+        (aiter_sha, ";".join(normalize_archs(gpu_archs)), patch_hash)
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def compute_current_cache_id(
+    repo_root: str | os.PathLike, gpu_archs: str
+) -> str:
+    root = Path(repo_root)
+    return compute_cache_id(
+        aiter_sha=compute_aiter_sha(root),
+        gpu_archs=gpu_archs,
+        patch_hash=compute_patch_hash(root),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -316,6 +375,12 @@ def decompress_file(src: str | os.PathLike, dst: str | os.PathLike, compression:
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+def _cmd_cache_id(args: argparse.Namespace) -> int:
+    cache_id = compute_current_cache_id(args.repo_root, args.gpu_archs)
+    print(f"{args.prefix}-{cache_id}" if args.prefix else cache_id)
+    return 0
+
+
 def _cmd_emit(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo_root).resolve()
     aiter_sha = args.aiter_sha or compute_aiter_sha(repo_root)
@@ -374,6 +439,12 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="AITER JIT-lib release manifest tool")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("cache-id", help="print immutable JIT input identifier")
+    c.add_argument("--repo-root", default=".")
+    c.add_argument("--gpu-archs", required=True)
+    c.add_argument("--prefix", default="")
+    c.set_defaults(func=_cmd_cache_id)
 
     e = sub.add_parser("emit", help="write manifest.json for compressed libs")
     e.add_argument("--repo-root", default=".")

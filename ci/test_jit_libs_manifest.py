@@ -86,6 +86,48 @@ def test_verify_matching_is_skip_build():
     print("PASS test_verify_matching_is_skip_build")
 
 
+def test_cache_id_is_stable_and_keyed():
+    one = jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs="gfx950;gfx942", patch_hash=PATCH_HASH
+    )
+    reordered = jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs="gfx942,gfx950", patch_hash=PATCH_HASH
+    )
+    assert one == reordered and len(one) == 16
+    assert one != jlm.compute_cache_id(
+        aiter_sha=OTHER_SHA, gpu_archs=ARCHS, patch_hash=PATCH_HASH
+    )
+    assert one != jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs="gfx950", patch_hash=PATCH_HASH
+    )
+    assert one != jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs=ARCHS, patch_hash=OTHER_PATCH
+    )
+    print("PASS test_cache_id_is_stable_and_keyed")
+
+
+def test_wheel_asset_binding_matches_current_checkout():
+    root = _HERE.parent
+    spec = importlib.util.spec_from_file_location(
+        "jit_assets", root / "jax_aiter" / "jit_assets.py"
+    )
+    assets = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(assets)
+
+    aiter_sha = jlm.compute_aiter_sha(root)
+    recipe_hash = jlm.compute_patch_hash(root)
+    cache_id = jlm.compute_cache_id(
+        aiter_sha=aiter_sha,
+        gpu_archs=assets.GPU_ARCHS,
+        patch_hash=recipe_hash,
+    )
+    assert assets.AITER_SHA == aiter_sha
+    assert assets.JIT_RECIPE_HASH == recipe_hash
+    assert assets.CACHE_ID == cache_id
+    assert assets.RELEASE_TAG == f"jit-libs-{cache_id}"
+    print("PASS test_wheel_asset_binding_matches_current_checkout")
+
+
 def test_verify_mismatched_aiter_sha_is_rebuild():
     with tempfile.TemporaryDirectory() as td:
         manifest, *_ = _make_fixture(Path(td))

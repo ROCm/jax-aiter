@@ -15,19 +15,12 @@ name: JIT libs (build + publish)
 on:
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: Release tag to publish the assets on
-        type: string
-        default: jit-libs
       gpu_archs:
         description: Semicolon-separated arch list
         type: string
         default: gfx950
   workflow_call:
     inputs:
-      release_tag:
-        type: string
-        default: jit-libs
       gpu_archs:
         type: string
         default: gfx950
@@ -42,6 +35,10 @@ on:
       - scripts/aiter_jit_*.patch
       - jax_aiter/jit/**
       - ci/setup_jax.sh
+      - ci/jit_libs_manifest.py
+      - ci/publish_jit_libs.sh
+      - Makefile
+      - csrc/common/**
 
 permissions:
   contents: write
@@ -59,7 +56,6 @@ env:
   AITER_SYMBOL_VISIBLE: 1
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
   GPU_ARCHS: ${{ inputs.gpu_archs || 'gfx950' }}
-  RELEASE_TAG: ${{ inputs.release_tag || 'jit-libs' }}
 
 jobs:
   build-and-publish:
@@ -82,10 +78,40 @@ jobs:
           # submodule. Full history made this 4.5 GB checkout take 15+ minutes.
           fetch-depth: 1
 
+      - name: Compute immutable asset tag
+        id: cache
+        run: |
+          tag="$(python3 ci/jit_libs_manifest.py cache-id \
+            --repo-root . --gpu-archs "$GPU_ARCHS" --prefix jit-libs)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "immutable JIT release: $tag"
+
+      - name: Reuse an existing immutable release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.cache.outputs.tag }}"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            work="$(mktemp -d)"
+            trap 'rm -rf "$work"' EXIT
+            gh release download "$tag" --repo "${{ github.repository }}" \
+              --pattern manifest.json --dir "$work"
+            GITHUB_OUTPUT="" python3 ci/jit_libs_manifest.py verify \
+              --repo-root . --manifest "$work/manifest.json" \
+              --gpu-archs "$GPU_ARCHS"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "matching immutable assets already exist; no rebuild needed"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Pull image
+        if: steps.existing.outputs.exists != 'true'
         run: docker pull "$IMAGE"
 
       - name: Launch build container
+        if: steps.existing.outputs.exists != 'true'
         run: |
           docker run -d --name "$CONTAINER_NAME" \
             --network=host --ipc=host --shm-size=16G \
@@ -95,9 +121,11 @@ jobs:
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX
+        if: steps.existing.outputs.exists != 'true'
         run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       - name: Report the cache key this build will publish under
+        if: steps.existing.outputs.exists != 'true'
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             echo "aiter_sha  : $(git -C third_party/aiter rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -106,15 +134,26 @@ jobs:
             echo "jit_hash   : $(python3 -c 'from ci.jit_libs_manifest import compute_patch_hash; print(compute_patch_hash(\".\"))')"
           '
 
+      - name: Build required umbrella library
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            make
+            test -s build/jax_aiter_build/libjax_aiter.so
+          '
+
       - name: Build the JIT libs
+        if: steps.existing.outputs.exists != 'true'
         run: |
           docker exec -e JA_DO_JIT_BUILD=true "$CONTAINER_NAME" \
             bash -lc 'mkdir -p build/aiter_build && python3 jax_aiter/jit/build_jit.py --verbose'
 
       - name: Show what was built
+        if: steps.existing.outputs.exists != 'true'
         run: docker exec "$CONTAINER_NAME" bash -lc 'ls -lh build/aiter_build/*.so'
 
       - name: Detect ROCm version for the manifest
+        if: steps.existing.outputs.exists != 'true'
         id: rocm
         # TheRock has no /opt/rocm/.info/version, which is where the manifest
         # tool looks by default; without this it records "unknown".
@@ -123,25 +162,27 @@ jobs:
           echo "version=${v:-unknown}" >> "$GITHUB_OUTPUT"
           echo "rocm_version=${v:-unknown}"
 
-      - name: Ensure the rolling release exists
-        # ci/publish_jit_libs.sh only uploads; it does not create the release.
+      - name: Create immutable JIT release
+        if: steps.existing.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if ! gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
-              --repo "${{ github.repository }}" \
-              --title "AITER JIT libraries (rolling)" \
-              --prerelease \
-              --notes "Prebuilt AITER JIT libraries that CI consumes via ci/fetch_jit_libs.sh. Rolling: assets are replaced whenever the AITER pin, JIT recipe or arch list changes. Infrastructure, not a product release -- see the versioned releases for wheels."
-          fi
+          tag="${{ steps.cache.outputs.tag }}"
+          gh release create "$tag" \
+            --repo "${{ github.repository }}" \
+            --target "$GITHUB_SHA" \
+            --title "AITER JIT libraries $tag" \
+            --prerelease \
+            --notes "Immutable prebuilt AITER JIT libraries consumed via ci/fetch_jit_libs.sh. The tag is derived from AITER SHA + architecture + JIT recipe hash. Infrastructure, not a product release."
 
       - name: Hand the build output back to the runner user
+        if: steps.existing.outputs.exists != 'true'
         # The container runs as root, so build/ is root-owned; publishing runs on
         # the host and needs to create build/jit_libs_dist/ next to it.
         run: sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/build"
 
       - name: Compress, manifest and upload to the release
+        if: steps.existing.outputs.exists != 'true'
         # On the host: it has the gh CLI. ci/publish_jit_libs.sh prefers zstd and
         # degrades to xz or gzip if it is absent.
         env:
@@ -149,7 +190,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           ROCM_VERSION: ${{ steps.rocm.outputs.version }}
         run: |
-          bash ci/publish_jit_libs.sh --tag "$RELEASE_TAG"
+          bash ci/publish_jit_libs.sh --tag "${{ steps.cache.outputs.tag }}"
 
       - name: Cleanup
         if: always()

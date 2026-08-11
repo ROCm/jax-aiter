@@ -27,8 +27,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from .jit_assets import (
+    AITER_SHA as EXPECTED_AITER_SHA,
+    GPU_ARCHS as EXPECTED_GPU_ARCHS,
+    JIT_RECIPE_HASH as EXPECTED_JIT_RECIPE_HASH,
+    RELEASE_TAG as DEFAULT_TAG,
+)
+
 DEFAULT_REPO = "ROCm/jax-aiter"
-DEFAULT_TAG = "jit-libs"
 MANIFEST_NAME = "manifest.json"
 
 
@@ -131,6 +137,23 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path = tmpdir / MANIFEST_NAME
         _download(_release_url(args.repo, args.tag, MANIFEST_NAME, args.base_url), manifest_path)
         manifest = json.loads(manifest_path.read_text())
+
+        expected_keys = {
+            "aiter_sha": EXPECTED_AITER_SHA,
+            "gpu_archs": EXPECTED_GPU_ARCHS,
+            # schema-v1 name; semantically this is the JIT recipe/ABI hash.
+            "patch_hash": EXPECTED_JIT_RECIPE_HASH,
+        }
+        mismatches = [
+            f"{key}: manifest={manifest.get(key)!r}, wheel={expected!r}"
+            for key, expected in expected_keys.items()
+            if manifest.get(key) != expected
+        ]
+        if mismatches:
+            raise SystemExit(
+                "error: JIT assets do not match this jax-aiter wheel:\n  "
+                + "\n  ".join(mismatches)
+            )
 
         built_for = manifest.get("gpu_archs", "unknown")
         local = _local_arch()

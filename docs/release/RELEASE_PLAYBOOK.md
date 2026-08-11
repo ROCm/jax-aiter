@@ -36,7 +36,7 @@ AITER: 31350226161346314b3d8882c8085bd31dce6a34
 The PyTorch submodule must not exist in `.gitmodules`; JIT builds have no
 PyTorch header or runtime dependency.
 
-## 3. Build the rolling JIT assets when needed
+## 3. Build immutable JIT assets when needed
 
 Run `.github/workflows/jit-libs.yml` only when one of these hard cache inputs
 changes:
@@ -56,9 +56,11 @@ gh run list --repo ROCm/jax-aiter --workflow=jit-libs.yml --limit 5
 gh run watch RUN_ID --repo ROCm/jax-aiter
 ```
 
-The workflow publishes `manifest.json` and three checksummed blobs to the
-rolling `jit-libs` prerelease. Consumer workflows must fetch them; they are not
-allowed to rebuild on a GPU runner.
+The workflow derives an immutable `jit-libs-<cache-id>` prerelease tag from the
+AITER SHA, architecture, and JIT recipe hash, then publishes `manifest.json`
+and three checksummed blobs. Wheels embed that identity and reject assets for
+different inputs. Consumer workflows fetch them; they do not rebuild on a GPU
+runner.
 
 ## 4. Run tests
 
@@ -82,7 +84,7 @@ Manually dispatch `.github/workflows/release-publish.yml` with
 
 The workflow:
 
-1. fetches the rolling JIT assets;
+1. fetches the wheel-bound immutable JIT assets;
 2. builds both wheels in
    `ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14`;
 3. runs `auditwheel show`;

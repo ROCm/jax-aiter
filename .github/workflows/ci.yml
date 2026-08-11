@@ -30,7 +30,6 @@ env:
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
-  JIT_LIBS_RELEASE_TAG: jit-libs
 
 jobs:
   cpu:
@@ -38,6 +37,12 @@ jobs:
     runs-on: build-only-jax-aiter
     timeout-minutes: 15
     steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
       - uses: actions/checkout@v5
 
       - name: CI tooling unit tests
@@ -96,7 +101,6 @@ jobs:
         id: fetch_jit
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_RELEASE_TAG: ${{ env.JIT_LIBS_RELEASE_TAG }}
           GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p build/aiter_build

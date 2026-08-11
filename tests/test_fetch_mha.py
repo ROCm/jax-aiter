@@ -14,6 +14,7 @@ import zstandard
 
 from jax_aiter import fetch_mha
 from jax_aiter.ja_compat import config
+from jax_aiter import jit_assets
 
 
 def _sha256(data: bytes) -> str:
@@ -42,10 +43,10 @@ def _release(tmp_path: Path, compression: str, *, arch: str = "gfx950"):
     manifest = {
         "schema": 1,
         "tag": "jit-libs",
-        "aiter_sha": "fixture",
+        "aiter_sha": jit_assets.AITER_SHA,
         "gpu_archs": arch,
         "rocm_version": "7.14.0",
-        "patch_hash": "none",
+        "patch_hash": jit_assets.JIT_RECIPE_HASH,
         "compression": compression,
         "files": [
             {
@@ -86,6 +87,20 @@ def test_fetch_rejects_wrong_arch_before_installing(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="built for 'gfx950'.*reports 'gfx942'"):
         fetch_mha.main(["--base-url", release.as_uri(), "--dest", str(dest)])
     assert not (dest / "libmha_fwd.so").exists()
+
+
+def test_fetch_rejects_assets_for_different_build_inputs(tmp_path, monkeypatch):
+    release, _, _ = _release(tmp_path, "gzip")
+    manifest_path = release / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["aiter_sha"] = "0" * 40
+    manifest_path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(fetch_mha, "_local_arch", lambda: "gfx950")
+
+    with pytest.raises(SystemExit, match=r"(?s)assets do not match.*aiter_sha"):
+        fetch_mha.main(
+            ["--base-url", release.as_uri(), "--dest", str(tmp_path / "installed")]
+        )
 
 
 def test_fetch_rejects_corrupt_blob_without_partial_install(tmp_path, monkeypatch):

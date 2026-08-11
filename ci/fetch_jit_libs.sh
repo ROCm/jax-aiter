@@ -19,8 +19,9 @@
 # falls back to `gh release download` when curl can't reach the asset.
 #
 # Env overrides:
-#   GH_RELEASE_TAG (default v0.1.0-alpha)   GH_REPO (default ROCm/jax-aiter)
-#   AITER_BUILD_DIR (default build/aiter_build)   GPU_ARCHS (default gfx942;gfx950)
+#   GH_RELEASE_TAG (default: immutable tag computed from current hard inputs)
+#   GH_REPO (default ROCm/jax-aiter)
+#   AITER_BUILD_DIR (default build/aiter_build)   GPU_ARCHS (default gfx950)
 #   JA_MANIFEST_NAME (default manifest.json)
 #   ROCM_VERSION + JA_FETCH_STRICT_ROCM=1 -> make the ROCm check a hard gate too
 set -uo pipefail
@@ -28,10 +29,11 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-TAG="${GH_RELEASE_TAG:-v0.1.0-alpha}"
 REPO="${GH_REPO:-ROCm/jax-aiter}"
 AITER_BUILD_DIR="${AITER_BUILD_DIR:-build/aiter_build}"
-GPU_ARCHS="${GPU_ARCHS:-gfx942;gfx950}"
+GPU_ARCHS="${GPU_ARCHS:-gfx950}"
+TAG="${GH_RELEASE_TAG:-$(python3 ci/jit_libs_manifest.py cache-id \
+  --repo-root "$REPO_ROOT" --gpu-archs "$GPU_ARCHS" --prefix jit-libs)}"
 MANIFEST_NAME="${JA_MANIFEST_NAME:-manifest.json}"
 # Asset base URL. Defaults to the public release-download path; override
 # JA_RELEASE_BASE_URL to point at a mirror/cache (assets served as <base>/<asset>).

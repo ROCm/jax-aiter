@@ -83,6 +83,14 @@ jobs:
             -e MAXTEXT_DIR=/maxtext_perf \
             "$CONTAINER_NAME" bash -lc 'bash ci/perf/run_8b_fp4.sh'
 
+      - name: Hand perf output back to the runner user
+        if: always()
+        run: |
+          if [ -d "${{ github.workspace }}/ci_perf_out" ]; then
+            sudo chown -R "$(id -u):$(id -g)" \
+              "${{ github.workspace }}/ci_perf_out"
+          fi
+
       - name: Parse tail-10 (record-only)
         if: always()
         run: |

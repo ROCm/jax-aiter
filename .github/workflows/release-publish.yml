@@ -35,13 +35,15 @@ env:
   JA_WHEEL_ARCH: gfx950
   JA_WHEEL_PLAT_NAME: manylinux_2_28_x86_64
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
-  JIT_LIBS_RELEASE_TAG: jit-libs
 
 jobs:
   build:
     name: build manylinux wheels
+    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name == 'v0.1.0-alpha2'
     runs-on: build-only-jax-aiter
     timeout-minutes: 90
+    outputs:
+      built_sha: ${{ steps.source.outputs.sha }}
     env:
       CONTAINER_NAME: ja_release_build
 
@@ -57,11 +59,23 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
+      - name: Bind build to the alpha2 source commit
+        id: source
+        run: |
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          test "$tag" = "v0.1.0-alpha2"
+          sha="$(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag_sha="$(git rev-list -n 1 "$tag")"
+            test "$tag_sha" = "$sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "building $tag from $sha"
+
       - name: Fetch prebuilt JIT libs
         id: fetch_jit
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_RELEASE_TAG: ${{ env.JIT_LIBS_RELEASE_TAG }}
           GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p build/aiter_build
@@ -153,7 +167,16 @@ jobs:
     runs-on: linux-jax-aiter-mi355-1
     timeout-minutes: 90
     steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
       - uses: actions/checkout@v5
+
+      - name: Verify validation checkout matches wheel build
+        run: test "$(git rev-parse HEAD)" = "${{ needs.build.outputs.built_sha }}"
 
       - uses: actions/download-artifact@v4
         with:
@@ -192,9 +215,17 @@ jobs:
           tag="${{ steps.tag.outputs.tag }}"
           if ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             gh release create "$tag" --repo "${{ github.repository }}" \
+              --target "${{ needs.build.outputs.built_sha }}" \
               --title "jax-aiter v0.1.0-alpha2" --prerelease \
               --notes-file docs/RELEASE_NOTES_v0.1.0-alpha2.md
           fi
+
+      - name: Verify release tag points at the built commit
+        if: github.event_name == 'release' || inputs.publish
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          git fetch -q origin "refs/tags/$tag:refs/tags/$tag" || true
+          test "$(git rev-list -n 1 "$tag")" = "${{ needs.build.outputs.built_sha }}"
 
       - name: Upload validated wheels to GitHub release
         if: github.event_name == 'release' || inputs.publish

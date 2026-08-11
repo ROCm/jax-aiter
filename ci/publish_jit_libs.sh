@@ -22,7 +22,7 @@
 #
 # Env overrides:
 #   GH_RELEASE_TAG (default v0.1.0-alpha)   GH_REPO (default ROCm/jax-aiter)
-#   GPU_ARCHS (default "gfx942;gfx950")      ROCM_VERSION (recorded in manifest)
+#   GPU_ARCHS (default "gfx950")             ROCM_VERSION (recorded in manifest)
 #   JA_ZSTD_LEVEL (default 19)               AITER_BUILD_DIR (default build/aiter_build)
 #   JA_LIBS (space list; default the 3 JIT libs)   JA_DIST_DIR (default build/jit_libs_dist)
 set -euo pipefail
@@ -30,11 +30,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-TAG="${GH_RELEASE_TAG:-v0.1.0-alpha}"
 REPO="${GH_REPO:-ROCm/jax-aiter}"
 DIST_DIR="${JA_DIST_DIR:-build/jit_libs_dist}"
 AITER_BUILD_DIR="${AITER_BUILD_DIR:-build/aiter_build}"
-GPU_ARCHS="${GPU_ARCHS:-gfx942;gfx950}"
+GPU_ARCHS="${GPU_ARCHS:-gfx950}"
+TAG="${GH_RELEASE_TAG:-$(python3 ci/jit_libs_manifest.py cache-id \
+  --repo-root "$REPO_ROOT" --gpu-archs "$GPU_ARCHS" --prefix jit-libs)}"
 ZSTD_LEVEL="${JA_ZSTD_LEVEL:-19}"
 DO_UPLOAD=1
 ALLOW_UPLOAD_FAIL=0

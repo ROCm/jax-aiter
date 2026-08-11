@@ -28,7 +28,6 @@ env:
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
-  JIT_LIBS_RELEASE_TAG: jit-libs
 
 jobs:
   full-suite:
@@ -54,7 +53,6 @@ jobs:
         id: fetch_jit
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_RELEASE_TAG: ${{ env.JIT_LIBS_RELEASE_TAG }}
           GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p build/aiter_build
