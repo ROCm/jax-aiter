@@ -86,13 +86,15 @@ def load_thin_modules():
     aiter_dir = ja_config.get_aiter_lib_dir()
     ja_dir = ja_config.get_jax_aiter_lib_dir()
 
-    def _load_modules(dir_path):
+    def _load_modules(dir_path, skip_names=frozenset()):
         loaded = []
         if not dir_path.exists():
             return loaded
 
         for module_so in sorted(dir_path.glob("*.so")):
             if module_so.name == "libjax_aiter.so":
+                continue
+            if module_so.name in skip_names or module_so.name in _module_handles:
                 continue
             try:
                 module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
@@ -108,8 +110,16 @@ def load_thin_modules():
     if aiter_loaded:
         logger.info(f"Loaded aiter_build modules: {aiter_loaded}")
 
-    # Then load jax_aiter_build modules
-    ja_loaded = _load_modules(ja_dir)
+    # Then load jax_aiter_build modules. The default wheel contains the MHA
+    # shims but downloads their backing JIT libraries later; do not dlopen the
+    # shims until their symbols can resolve.
+    aiter_available = set(_module_handles)
+    skip_ja = set()
+    if "libmha_fwd.so" not in aiter_available:
+        skip_ja.add("mha_fwd_ja.so")
+    if "libmha_bwd.so" not in aiter_available:
+        skip_ja.add("mha_bwd_ja.so")
+    ja_loaded = _load_modules(ja_dir, skip_ja)
     if ja_loaded:
         logger.info(f"Loaded jax_aiter_build modules: {ja_loaded}")
 
@@ -147,6 +157,13 @@ def register_ffi_target(target_name: str, platform: str = "ROCM"):
     # Ensure libraries are loaded.
     if _umbrella_handle is None:
         load_umbrella_library()
+        load_thin_modules()
+
+    # A caller can fetch optional MHA libraries in the same Python process
+    # after core ops initialized the registry. Retry loading when this target's
+    # module was previously unavailable; already-loaded modules are skipped.
+    module_name = SYMBOL_TO_MODULE_MAP[target_name]
+    if module_name not in _module_handles:
         load_thin_modules()
 
     logger.info(f"Registering FFI target: {target_name}")
