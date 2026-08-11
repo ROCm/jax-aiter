@@ -74,10 +74,31 @@ JA_CORE_MODULES := $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
 JA_MHA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
                   $(JA_BUILD_DIR)/mha_bwd_ja.so
 
+# Paged-KV FFI shims. The M0 aliasing probe deliberately carries no aiter
+# dependency, so it builds and runs before third_party/aiter is populated.
+KV_PROBE_INCLUDES := -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC)
+
+# append_kv and paged attention compile aiter sources directly rather than
+# linking a JIT library, so they need aiter's own include tree.
+#
+# AITER_TORCH_EXCLUDE drops the one torch dependency in aiter_opus_plus.h (a
+# t2opus mapping for c10 scalar types that nothing on the aiter_tensor_t path
+# uses), so these shims build with no PyTorch headers at all.
+KV_DEFINES  := -DAITER_TORCH_EXCLUDE
+KV_INCLUDES := $(KV_PROBE_INCLUDES) $(KV_DEFINES) \
+               -I$(AITER_SRC_DIR)/csrc/include \
+               -I$(AITER_SRC_DIR)/csrc/include/ck_tile \
+               -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include
+
+JA_KV_PROBE_MODULES := $(JA_BUILD_DIR)/kv_alias_probe_ja.so
+
+JA_KV_MODULES := $(JA_KV_PROBE_MODULES) \
+                 $(JA_BUILD_DIR)/append_kv_ja.so
+
 # Full set (unchanged target for `make ja_mods`): core + MHA.
 JA_MODULES := $(JA_CORE_MODULES) $(JA_MHA_MODULES)
 
-.PHONY: all clean clean-stage ja_mods ja_mods_nomha
+.PHONY: all clean clean-stage ja_mods ja_mods_nomha ja_kv_probe
 
 all: $(OUT_SO)
 
@@ -85,6 +106,12 @@ ja_mods: $(JA_MODULES)
 
 # Lite wheel: build only the core (non-MHA) FFI shims.
 ja_mods_nomha: $(JA_CORE_MODULES)
+
+# M0 only: the aliasing probe, buildable with no aiter sources present.
+ja_kv_probe: $(JA_KV_PROBE_MODULES)
+
+# Paged-KV shims: probe plus append_kv (M1) and paged attention (M2).
+ja_kv: $(JA_KV_MODULES)
 
 %/: 
 	mkdir -p $@
@@ -107,6 +134,15 @@ $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so: csrc/ffi/rmsnorm/rmsnorm_fwd_ja.cu | $(JA_BUI
 
 $(JA_BUILD_DIR)/silu_and_mul_ja.so: csrc/ffi/activation/silu_and_mul_ja.cu | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
+
+$(JA_BUILD_DIR)/kv_alias_probe_ja.so: csrc/ffi/kv/kv_alias_probe_ja.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(KV_PROBE_INCLUDES) $< -o $@
+
+# Compiles aiter's cache kernels into the module, so append_kv needs no JIT lib.
+$(JA_BUILD_DIR)/append_kv_ja.so: csrc/ffi/kv/append_kv_ja.cu \
+                                 $(AITER_SRC_DIR)/csrc/kernels/cache_kernels.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(KV_INCLUDES) \
+		csrc/ffi/kv/append_kv_ja.cu $(AITER_SRC_DIR)/csrc/kernels/cache_kernels.cu -o $@
 
 $(GEMM_BF16_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m bf16gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)

@@ -34,6 +34,19 @@ SYMBOL_TO_MODULE_MAP = {
     "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualKeyedSrJA": "cast_mxfp4_ja.so",
+    "KvAliasProbeJA": "kv_alias_probe_ja.so",
+    "AppendKvJA": "append_kv_ja.so",
+}
+
+# Symbols whose module resolves no CK or umbrella symbols and so can be loaded
+# on its own. Everything else needs libjax_aiter.so loaded first, both for the
+# symbols it provides and to keep the HIP context alive.
+#
+# The paged-KV shims qualify because they compile the aiter kernels they need
+# directly into the module rather than linking a JIT-built library.
+STANDALONE_SYMBOLS = {
+    "KvAliasProbeJA",
+    "AppendKvJA",
 }
 
 
@@ -124,6 +137,39 @@ def load_thin_modules():
         logger.info(f"Loaded jax_aiter_build modules: {ja_loaded}")
 
 
+def load_standalone_module(module_name: str):
+    """Load a single self-contained module without the umbrella library.
+
+    Only valid for modules listed via STANDALONE_SYMBOLS, which link nothing
+    from libjax_aiter.so. This lets self-contained shims be used in a tree where
+    the heavy aiter sources have not been built.
+    """
+    if module_name in _module_handles:
+        return
+
+    # Go through the same directory resolution as load_thin_modules rather than
+    # joining onto the build root directly: the default wheel packages the thin
+    # shims and downloads the JIT libraries into a writable cache, so the two
+    # can have different roots.
+    search_dirs = (
+        ja_config.get_jax_aiter_lib_dir(),
+        ja_config.get_aiter_lib_dir(),
+    )
+    for directory in search_dirs:
+        candidate = directory / module_name
+        if candidate.exists():
+            _module_handles[module_name] = ctypes.CDLL(
+                str(candidate), mode=ctypes.RTLD_GLOBAL
+            )
+            logger.info(f"Loaded standalone module: {module_name}")
+            return
+
+    raise FileNotFoundError(
+        f"Standalone module not found: {module_name} in "
+        f"{[str(d) for d in search_dirs]}. Run `make ja_kv` first."
+    )
+
+
 def resolve_symbol(target_name: str) -> int:
     """Resolve a symbol from the appropriate module."""
     module_name = SYMBOL_TO_MODULE_MAP.get(target_name)
@@ -156,15 +202,23 @@ def register_ffi_target(target_name: str, platform: str = "ROCM"):
 
     # Ensure libraries are loaded.
     if _umbrella_handle is None:
-        load_umbrella_library()
-        load_thin_modules()
+        if target_name in STANDALONE_SYMBOLS:
+            load_standalone_module(SYMBOL_TO_MODULE_MAP[target_name])
+        else:
+            load_umbrella_library()
+            load_thin_modules()
 
     # A caller can fetch optional MHA libraries in the same Python process
     # after core ops initialized the registry. Retry loading when this target's
     # module was previously unavailable; already-loaded modules are skipped.
+    # Standalone modules take their own path, since load_thin_modules requires
+    # the umbrella library that they exist precisely to do without.
     module_name = SYMBOL_TO_MODULE_MAP[target_name]
     if module_name not in _module_handles:
-        load_thin_modules()
+        if target_name in STANDALONE_SYMBOLS:
+            load_standalone_module(module_name)
+        else:
+            load_thin_modules()
 
     logger.info(f"Registering FFI target: {target_name}")
 
