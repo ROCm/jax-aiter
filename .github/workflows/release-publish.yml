@@ -7,8 +7,6 @@ name: JAX-AITER Release Build + Validate
 # It also does NOT upload to PyPI. That irreversible step stays manual until the
 # user explicitly approves the AMD-owned PyPI project/token arrangement.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -21,7 +19,7 @@ on:
         default: false
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions:
@@ -32,6 +30,7 @@ env:
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
+  ROCM_VERSION: "7.14.0"
   JA_WHEEL_ARCH: gfx950
   JA_WHEEL_PLAT_NAME: manylinux_2_28_x86_64
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
@@ -39,7 +38,6 @@ env:
 jobs:
   build:
     name: build manylinux wheels
-    if: github.event_name == 'workflow_dispatch' || github.event.release.tag_name == 'v0.1.0-alpha2'
     runs-on: build-only-jax-aiter
     timeout-minutes: 90
     outputs:
@@ -62,13 +60,9 @@ jobs:
       - name: Bind build to the alpha2 source commit
         id: source
         run: |
-          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          tag="${{ inputs.tag }}"
           test "$tag" = "v0.1.0-alpha2"
           sha="$(git rev-parse HEAD)"
-          if [ "${{ github.event_name }}" = "release" ]; then
-            tag_sha="$(git rev-list -n 1 "$tag")"
-            test "$tag_sha" = "$sha"
-          fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "building $tag from $sha"
 
@@ -204,11 +198,11 @@ jobs:
       - name: Resolve release tag
         id: tag
         run: |
-          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          tag="${{ inputs.tag }}"
           echo "tag=${tag:-v0.1.0-alpha2}" >> "$GITHUB_OUTPUT"
 
       - name: Ensure the GitHub release exists
-        if: github.event_name == 'release' || inputs.publish
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -221,14 +215,14 @@ jobs:
           fi
 
       - name: Verify release tag points at the built commit
-        if: github.event_name == 'release' || inputs.publish
+        if: inputs.publish
         run: |
           tag="${{ steps.tag.outputs.tag }}"
           git fetch -q origin "refs/tags/$tag:refs/tags/$tag" || true
           test "$(git rev-list -n 1 "$tag")" = "${{ needs.build.outputs.built_sha }}"
 
       - name: Upload validated wheels to GitHub release
-        if: github.event_name == 'release' || inputs.publish
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -250,13 +250,17 @@ setup(
     license="MIT",
     packages=find_packages(include=["jax_aiter", "jax_aiter.*"]),
     include_package_data=True,  # picks up MANIFEST.in entries for sdist.
-    python_requires="~=3.12",
-    # jax is a genuine runtime dependency: every op registers an XLA FFI target
-    # at import. The ROCm backend (jax-rocm7-plugin / -pjrt) is deliberately NOT
-    # pinned here -- it must match the ROCm the machine actually has, and pinning
-    # it would fight the container's own stack. The README states which pair was
-    # validated.
-    install_requires=["jax", "zstandard"],
+    python_requires="==3.12.*",
+    # Alpha2 supports one tested runtime. Pin all four distributions so a bare
+    # `pip install jax-aiter` cannot silently resolve a future incompatible JAX
+    # frontend/backend combination.
+    install_requires=[
+        "jax==0.11.0",
+        "jaxlib==0.11.0",
+        "jax-rocm7-plugin==0.11.0",
+        "jax-rocm7-pjrt==0.11.0",
+        "zstandard",
+    ],
     extras_require={
         "dev": ["pytest", "pytest-rerunfailures", "black", "flake8"],
     },

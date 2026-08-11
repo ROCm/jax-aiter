@@ -91,25 +91,19 @@ The workflow:
 4. checks that only gfx950 HSA files are packaged;
 5. checks default has MHA shims but not MHA JIT libraries;
 6. checks `+full` has both;
-7. clean-room validates default FP4 plus its MHA guard;
-8. clean-room validates full FP4 and MHA forward/backward on MI355X.
+7. as a non-root user, clean-room validates default FP4, the pre-fetch MHA
+   guard, immutable JIT fetch, then MHA forward/backward;
+8. clean-room validates full FP4 and bundled MHA forward/backward on MI355X.
 
 Do not publish if either job is skipped or fails.
 
 ## 6. Create the GitHub prerelease
 
-After validation:
-
-```bash
-gh release create v0.1.0-alpha2 \
-  --repo ROCm/jax-aiter \
-  --title "jax-aiter v0.1.0-alpha2" \
-  --prerelease \
-  --notes-file docs/RELEASE_NOTES_v0.1.0-alpha2.md
-```
-
-Then dispatch the release workflow with `publish=true` and tag
-`v0.1.0-alpha2`. It re-runs all wheel gates before uploading.
+Do not publish an empty release first. Dispatch the release workflow with
+`publish=true` and tag `v0.1.0-alpha2` from the exact source ref. Only after
+both build and MI355 validation pass does the workflow create the prerelease
+with `--target <built-sha>`, verify the tag points at that SHA, and upload the
+wheels.
 
 ## 7. PyPI is a separate approval
 

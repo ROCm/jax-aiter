@@ -34,8 +34,10 @@ REPO="${GH_REPO:-ROCm/jax-aiter}"
 DIST_DIR="${JA_DIST_DIR:-build/jit_libs_dist}"
 AITER_BUILD_DIR="${AITER_BUILD_DIR:-build/aiter_build}"
 GPU_ARCHS="${GPU_ARCHS:-gfx950}"
+ROCM_VERSION="${ROCM_VERSION:-7.14.0}"
 TAG="${GH_RELEASE_TAG:-$(python3 ci/jit_libs_manifest.py cache-id \
-  --repo-root "$REPO_ROOT" --gpu-archs "$GPU_ARCHS" --prefix jit-libs)}"
+  --repo-root "$REPO_ROOT" --gpu-archs "$GPU_ARCHS" \
+  --rocm-version "$ROCM_VERSION" --prefix jit-libs)}"
 ZSTD_LEVEL="${JA_ZSTD_LEVEL:-19}"
 DO_UPLOAD=1
 ALLOW_UPLOAD_FAIL=0

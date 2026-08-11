@@ -27,6 +27,7 @@ env:
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
+  ROCM_VERSION: "7.14.0"
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
 
 jobs:

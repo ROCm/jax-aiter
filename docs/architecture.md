@@ -33,7 +33,7 @@ Installed default wheels combine two roots:
 
 - thin FFI shims from `jax_aiter/_lib/jax_aiter_build`;
 - downloaded JIT libraries from
-  `$XDG_CACHE_HOME/jax-aiter/<version>/aiter_build`.
+  `$XDG_CACHE_HOME/jax-aiter/<version>/<cache-id>/aiter_build`.
 
 The cache becomes active only when all three expected JIT libraries are
 present. This prevents an interrupted fetch from becoming the runtime source.

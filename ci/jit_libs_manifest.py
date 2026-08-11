@@ -191,23 +191,29 @@ def normalize_archs(archs: str | None) -> list[str]:
 
 
 def compute_cache_id(
-    *, aiter_sha: str, gpu_archs: str, patch_hash: str
+    *, aiter_sha: str, gpu_archs: str, patch_hash: str, rocm_version: str
 ) -> str:
     """Stable identifier for one immutable set of JIT build inputs."""
     payload = "\0".join(
-        (aiter_sha, ";".join(normalize_archs(gpu_archs)), patch_hash)
+        (
+            aiter_sha,
+            ";".join(normalize_archs(gpu_archs)),
+            patch_hash,
+            rocm_version,
+        )
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def compute_current_cache_id(
-    repo_root: str | os.PathLike, gpu_archs: str
+    repo_root: str | os.PathLike, gpu_archs: str, rocm_version: str
 ) -> str:
     root = Path(repo_root)
     return compute_cache_id(
         aiter_sha=compute_aiter_sha(root),
         gpu_archs=gpu_archs,
         patch_hash=compute_patch_hash(root),
+        rocm_version=rocm_version,
     )
 
 
@@ -376,7 +382,10 @@ def decompress_file(src: str | os.PathLike, dst: str | os.PathLike, compression:
 # CLI
 # --------------------------------------------------------------------------
 def _cmd_cache_id(args: argparse.Namespace) -> int:
-    cache_id = compute_current_cache_id(args.repo_root, args.gpu_archs)
+    rocm_version = args.rocm_version or detect_rocm_version()
+    cache_id = compute_current_cache_id(
+        args.repo_root, args.gpu_archs, rocm_version
+    )
     print(f"{args.prefix}-{cache_id}" if args.prefix else cache_id)
     return 0
 
@@ -443,6 +452,7 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("cache-id", help="print immutable JIT input identifier")
     c.add_argument("--repo-root", default=".")
     c.add_argument("--gpu-archs", required=True)
+    c.add_argument("--rocm-version", default="")
     c.add_argument("--prefix", default="")
     c.set_defaults(func=_cmd_cache_id)
 

@@ -92,10 +92,10 @@ jax-aiter-fetch-mha
 python3 -c "from jax_aiter.mha import flash_attn_func; print('MHA ready')"
 ```
 
-The command installs into a versioned user cache
-(`~/.cache/jax-aiter/0.1.0a2/`) and verifies the architecture plus compressed
-and extracted SHA-256 checksums. It does not write into system
-`site-packages`.
+The command installs into an immutable, versioned user-cache generation
+(`~/.cache/jax-aiter/0.1.0a2/<cache-id>/`) and verifies the wheel's embedded
+AITER, ROCm, architecture, and JIT-recipe identity plus compressed and
+extracted SHA-256 checksums. It does not write into system `site-packages`.
 
 ## Quick API examples
 

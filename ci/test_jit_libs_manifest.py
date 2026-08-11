@@ -88,20 +88,29 @@ def test_verify_matching_is_skip_build():
 
 def test_cache_id_is_stable_and_keyed():
     one = jlm.compute_cache_id(
-        aiter_sha=AITER_SHA, gpu_archs="gfx950;gfx942", patch_hash=PATCH_HASH
+        aiter_sha=AITER_SHA, gpu_archs="gfx950;gfx942",
+        patch_hash=PATCH_HASH, rocm_version="7.14.0"
     )
     reordered = jlm.compute_cache_id(
-        aiter_sha=AITER_SHA, gpu_archs="gfx942,gfx950", patch_hash=PATCH_HASH
+        aiter_sha=AITER_SHA, gpu_archs="gfx942,gfx950",
+        patch_hash=PATCH_HASH, rocm_version="7.14.0"
     )
     assert one == reordered and len(one) == 16
     assert one != jlm.compute_cache_id(
-        aiter_sha=OTHER_SHA, gpu_archs=ARCHS, patch_hash=PATCH_HASH
+        aiter_sha=OTHER_SHA, gpu_archs=ARCHS, patch_hash=PATCH_HASH,
+        rocm_version="7.14.0"
     )
     assert one != jlm.compute_cache_id(
-        aiter_sha=AITER_SHA, gpu_archs="gfx950", patch_hash=PATCH_HASH
+        aiter_sha=AITER_SHA, gpu_archs="gfx950", patch_hash=PATCH_HASH,
+        rocm_version="7.14.0"
     )
     assert one != jlm.compute_cache_id(
-        aiter_sha=AITER_SHA, gpu_archs=ARCHS, patch_hash=OTHER_PATCH
+        aiter_sha=AITER_SHA, gpu_archs=ARCHS, patch_hash=OTHER_PATCH,
+        rocm_version="7.14.0"
+    )
+    assert one != jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs=ARCHS, patch_hash=PATCH_HASH,
+        rocm_version="7.15.0"
     )
     print("PASS test_cache_id_is_stable_and_keyed")
 
@@ -120,6 +129,7 @@ def test_wheel_asset_binding_matches_current_checkout():
         aiter_sha=aiter_sha,
         gpu_archs=assets.GPU_ARCHS,
         patch_hash=recipe_hash,
+        rocm_version=assets.ROCM_VERSION,
     )
     assert assets.AITER_SHA == aiter_sha
     assert assets.JIT_RECIPE_HASH == recipe_hash

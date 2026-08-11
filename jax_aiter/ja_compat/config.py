@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 from pathlib import Path
 from typing import Iterable, Optional
@@ -62,28 +63,58 @@ def get_downloaded_aiter_lib_dir() -> Path:
         return Path(override).expanduser().resolve()
 
     from ..__version__ import __version__
+    from ..jit_assets import CACHE_ID
 
     cache_home = Path(
         os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")
     ).expanduser()
-    return cache_home / "jax-aiter" / __version__ / "aiter_build"
+    return cache_home / "jax-aiter" / __version__ / CACHE_ID / "aiter_build"
+
+
+def _has_packaged_jit_set(directory: Path) -> bool:
+    return all((directory / name).is_file() for name in _JIT_LIB_NAMES)
+
+
+def _has_complete_download(directory: Path) -> bool:
+    """A downloaded generation is active only after its completion manifest."""
+    from ..jit_assets import AITER_SHA, GPU_ARCHS, JIT_RECIPE_HASH
+
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text())
+        if (
+            manifest.get("aiter_sha") != AITER_SHA
+            or manifest.get("gpu_archs") != GPU_ARCHS
+            or manifest.get("patch_hash") != JIT_RECIPE_HASH
+        ):
+            return False
+        entries = {entry["name"]: entry for entry in manifest["files"]}
+        for name in _JIT_LIB_NAMES:
+            path = directory / name
+            if not path.is_file() or path.stat().st_size != entries[name]["size"]:
+                return False
+        return True
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def get_aiter_lib_dir() -> Path:
     """JIT-library directory to load.
 
-    Prefer a complete downloaded set, otherwise use what the wheel packaged
-    (the default wheel includes RMSNorm; the +full wheel includes all three).
-    Requiring the complete set avoids loading from a half-finished download.
+    Prefer a complete wheel-packaged set (+full) so a stale user cache cannot
+    shadow it. The default wheel includes only RMSNorm, so it falls through to
+    a downloaded generation carrying a completion manifest.
     """
     root = os.environ.get("JA_ROOT_DIR")
     if root:
         return get_lib_root() / "aiter_build"
 
+    packaged = get_lib_root() / "aiter_build"
+    if _has_packaged_jit_set(packaged):
+        return packaged
     downloaded = get_downloaded_aiter_lib_dir()
-    if all((downloaded / name).is_file() for name in _JIT_LIB_NAMES):
+    if _has_complete_download(downloaded):
         return downloaded
-    return get_lib_root() / "aiter_build"
+    return packaged
 
 
 def get_jax_aiter_lib_dir() -> Path:

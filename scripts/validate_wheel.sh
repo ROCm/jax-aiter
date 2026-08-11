@@ -74,9 +74,9 @@ docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO/docker/validation"
 # Smoke command per variant.
 if [[ "$VARIANT" == "lite" ]]; then
   SMOKE="python /test/smoke_fp4_gemm.py && \
-    (python -c 'import jax_aiter.mha' 2>&1 | tee /tmp/mha-error; \
-     test \${PIPESTATUS[0]} -ne 0; \
-     grep -q 'jax-aiter-fetch-mha' /tmp/mha-error)"
+    python /test/check_mha_guard.py && \
+    jax-aiter-fetch-mha && \
+    python /test/smoke_mha.py"
 else
   SMOKE="python /test/smoke_fp4_gemm.py && python /test/smoke_mha.py"
 fi
@@ -85,9 +85,14 @@ fi
 echo "[validate_wheel] docker run smoke ($VARIANT)"
 docker run --rm \
   --device=/dev/kfd --device=/dev/dri --group-add video \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp/ja-home -e XDG_CACHE_HOME=/tmp/ja-home/.cache \
+  -e GPU_ARCHS=gfx950 \
   -v "$REPO/dist:/dist:ro" \
   -v "$REPO/docker/validation:/test:ro" \
   "$IMAGE_TAG" \
-  bash -lc "pip install --break-system-packages /dist/$WHEEL_BASE && $SMOKE"
+  bash -lc "mkdir -p /tmp/ja-home /tmp/ja-install && \
+    python -m pip install --target /tmp/ja-install --no-deps /dist/$WHEEL_BASE && \
+    export PYTHONPATH=/tmp/ja-install PATH=/tmp/ja-install/bin:\$PATH && $SMOKE"
 
 echo "[validate_wheel] PASS ($VARIANT)"

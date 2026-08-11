@@ -20,6 +20,7 @@ import gzip
 import hashlib
 import json
 import lzma
+import os
 import shutil
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from .jit_assets import (
     AITER_SHA as EXPECTED_AITER_SHA,
     GPU_ARCHS as EXPECTED_GPU_ARCHS,
     JIT_RECIPE_HASH as EXPECTED_JIT_RECIPE_HASH,
+    ROCM_VERSION as EXPECTED_ROCM_VERSION,
     RELEASE_TAG as DEFAULT_TAG,
 )
 
@@ -102,13 +104,13 @@ def _target_dir() -> Path:
     return get_downloaded_aiter_lib_dir()
 
 
-def _local_arch() -> str | None:
-    try:
-        from .ja_compat.chip_info import get_gfx
+def _local_arch() -> str:
+    from .ja_compat.chip_info import get_gfx
 
-        return get_gfx()
-    except Exception:
-        return None
+    arch = get_gfx()
+    if not arch or arch == "native":
+        raise RuntimeError(f"could not resolve GPU architecture: {arch!r}")
+    return arch
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -128,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     dest = Path(args.dest) if args.dest else _target_dir()
-    dest.mkdir(parents=True, exist_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"jax-aiter: fetching attention libraries into {dest}")
 
@@ -139,8 +141,11 @@ def main(argv: list[str] | None = None) -> int:
         manifest = json.loads(manifest_path.read_text())
 
         expected_keys = {
+            "schema": 1,
+            "tag": args.tag,
             "aiter_sha": EXPECTED_AITER_SHA,
             "gpu_archs": EXPECTED_GPU_ARCHS,
+            "rocm_version": EXPECTED_ROCM_VERSION,
             # schema-v1 name; semantically this is the JIT recipe/ABI hash.
             "patch_hash": EXPECTED_JIT_RECIPE_HASH,
         }
@@ -156,7 +161,18 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         built_for = manifest.get("gpu_archs", "unknown")
-        local = _local_arch()
+        try:
+            local = _local_arch()
+        except Exception as exc:
+            if not args.skip_arch_check:
+                raise SystemExit(
+                    "error: could not detect the local GPU architecture; "
+                    "refusing to install unchecked assets.\n"
+                    "       Set GPU_ARCHS=gfx950 or explicitly pass "
+                    "--skip-arch-check."
+                ) from exc
+            local = None
+            print(f"  warning: architecture detection failed: {exc}")
         if local and built_for != "unknown" and local not in built_for.split(";"):
             message = (
                 f"these libraries were built for '{built_for}' but this machine "
@@ -178,47 +194,89 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {len(files)} libraries, {total / 1e6:.0f} MB compressed "
               f"({compression}), built for {built_for}")
 
-        for entry in files:
-            name = entry["name"]
-            final = dest / name
-            if final.is_file() and not args.force:
-                if _sha256(final) == entry["sha256"]:
-                    print(f"  {name}: already present and matching, skipping")
-                    continue
-                print(f"  {name}: present but does not match the manifest, replacing")
+        if not args.force and (dest / MANIFEST_NAME).is_file():
+            try:
+                installed_manifest = json.loads(
+                    (dest / MANIFEST_NAME).read_text()
+                )
+                installed_matches = installed_manifest == manifest and all(
+                    (dest / entry["name"]).is_file()
+                    and _sha256(dest / entry["name"]) == entry["sha256"]
+                    for entry in files
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                installed_matches = False
+            if installed_matches:
+                for entry in files:
+                    print(
+                        f"  {entry['name']}: already present and matching, "
+                        "skipping"
+                    )
+                return 0
 
-            blob = tmpdir / entry["compressed_name"]
-            _download(_release_url(args.repo, args.tag, entry["compressed_name"],
-                                 args.base_url), blob)
-
-            actual = _sha256(blob)
-            if actual != entry["compressed_sha256"]:
-                raise SystemExit(
-                    f"error: checksum mismatch on {entry['compressed_name']}\n"
-                    f"       expected {entry['compressed_sha256']}\n"
-                    f"       got      {actual}"
+        # Stage and verify the complete generation on the destination
+        # filesystem. The active directory is untouched until every blob and
+        # extracted library has passed validation.
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{dest.name}.staging-", dir=dest.parent)
+        )
+        backup = None
+        try:
+            for entry in files:
+                name = entry["name"]
+                blob = tmpdir / entry["compressed_name"]
+                _download(
+                    _release_url(
+                        args.repo,
+                        args.tag,
+                        entry["compressed_name"],
+                        args.base_url,
+                    ),
+                    blob,
                 )
 
-            staged = tmpdir / name
-            _decompress(blob, staged, compression)
+                actual = _sha256(blob)
+                if actual != entry["compressed_sha256"]:
+                    raise SystemExit(
+                        f"error: checksum mismatch on {entry['compressed_name']}\n"
+                        f"       expected {entry['compressed_sha256']}\n"
+                        f"       got      {actual}"
+                    )
 
-            actual = _sha256(staged)
-            if actual != entry["sha256"]:
-                raise SystemExit(
-                    f"error: checksum mismatch after extracting {name}\n"
-                    f"       expected {entry['sha256']}\n"
-                    f"       got      {actual}"
-                )
+                staged = staging / name
+                _decompress(blob, staged, compression)
+                actual = _sha256(staged)
+                if actual != entry["sha256"]:
+                    raise SystemExit(
+                        f"error: checksum mismatch after extracting {name}\n"
+                        f"       expected {entry['sha256']}\n"
+                        f"       got      {actual}"
+                    )
+                staged.chmod(0o755)
+                blob.unlink(missing_ok=True)
+                print(f"  {name}: verified ({entry['size'] / 1e6:.0f} MB)")
 
-            # Move into place only once verified, so an interrupted run never
-            # leaves a partial library that would fail at dlopen time.
-            shutil.move(str(staged), str(final))
-            final.chmod(0o755)
-            blob.unlink(missing_ok=True)
-            print(f"  {name}: installed ({entry['size'] / 1e6:.0f} MB)")
+            # The manifest is the completion marker checked by the loader.
+            shutil.copy2(manifest_path, staging / MANIFEST_NAME)
 
-        # Keep the exact provenance/checksums next to the installed libraries.
-        shutil.copy2(manifest_path, dest / MANIFEST_NAME)
+            if dest.exists():
+                backup = dest.parent / f".{dest.name}.backup-{os.getpid()}"
+                if backup.exists():
+                    shutil.rmtree(backup)
+                dest.rename(backup)
+            staging.rename(dest)
+            staging = None
+            if backup is not None:
+                shutil.rmtree(backup)
+                backup = None
+        except BaseException:
+            if backup is not None and backup.exists() and not dest.exists():
+                backup.rename(dest)
+                backup = None
+            raise
+        finally:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging)
 
     if args.dest:
         print(

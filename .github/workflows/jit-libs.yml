@@ -56,6 +56,7 @@ env:
   AITER_SYMBOL_VISIBLE: 1
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
   GPU_ARCHS: ${{ inputs.gpu_archs || 'gfx950' }}
+  ROCM_VERSION: "7.14.0"
 
 jobs:
   build-and-publish:
@@ -82,7 +83,8 @@ jobs:
         id: cache
         run: |
           tag="$(python3 ci/jit_libs_manifest.py cache-id \
-            --repo-root . --gpu-archs "$GPU_ARCHS" --prefix jit-libs)"
+            --repo-root . --gpu-archs "$GPU_ARCHS" \
+            --rocm-version "$ROCM_VERSION" --prefix jit-libs)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "immutable JIT release: $tag"
 
@@ -159,6 +161,7 @@ jobs:
         # tool looks by default; without this it records "unknown".
         run: |
           v="$(docker exec "$CONTAINER_NAME" bash -lc 'rocm-sdk version 2>/dev/null' || true)"
+          test "$v" = "$ROCM_VERSION"
           echo "version=${v:-unknown}" >> "$GITHUB_OUTPUT"
           echo "rocm_version=${v:-unknown}"
 
