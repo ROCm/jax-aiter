@@ -3,10 +3,26 @@
 # JAX-AITER build. No PyTorch dependency.
 # Targets: all (umbrella lib), ja_mods (FFI modules), clean.
 
-HIPCC        ?= /opt/rocm/bin/hipcc
 ROCM_ARCH    ?= gfx950
 PYTHON3      ?= python3
-HIP_LIB      := /opt/rocm/lib
+
+# ROCm location. Legacy images install under /opt/rocm; TheRock images ship ROCm
+# as the `rocm-sdk` pip package and have no /opt/rocm at all. Deliberately not
+# named ROCM_PATH: some images export that pointing at a versioned directory,
+# which would silently move the legacy rpath off /opt/rocm.
+ifneq ($(wildcard /opt/rocm/bin/hipcc),)
+JA_ROCM_PATH := /opt/rocm
+HIP_RPATH    := -Wl,-rpath,$(JA_ROCM_PATH)/lib
+else
+JA_ROCM_PATH := $(shell rocm-sdk path --root 2>/dev/null)
+# TheRock registers its libraries with ldconfig and resolves the rest through
+# $ORIGIN-relative RUNPATHs inside the _rocm_sdk_* packages. An rpath into
+# _rocm_sdk_devel/lib would shadow the per-arch device libraries, so omit it.
+HIP_RPATH    :=
+endif
+
+HIPCC        ?= $(if $(wildcard $(JA_ROCM_PATH)/bin/hipcc),$(JA_ROCM_PATH)/bin/hipcc,$(shell command -v hipcc 2>/dev/null))
+HIP_LIB      := $(JA_ROCM_PATH)/lib
 
 AITER_SRC_DIR:= third_party/aiter
 AITER_HIP_DIR:= build/hipified_aiter
@@ -22,7 +38,7 @@ UMBRELLA_CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
                      -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC) -I$(AITER_INC) \
                      -fvisibility-inlines-hidden -fvisibility=hidden
 
-UMBRELLA_LDFLAGS := -lamdhip64 -lhiprtc -Wl,-rpath,$(HIP_LIB) -Wl,-soname,libjax_aiter.so
+UMBRELLA_LDFLAGS := -lamdhip64 -lhiprtc $(HIP_RPATH) -Wl,-soname,libjax_aiter.so
 
 JA_BUILD_DIR := build/jax_aiter_build
 
