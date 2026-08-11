@@ -27,6 +27,11 @@ MAXTEXT_CONFIG="${MAXTEXT_CONFIG:-src/maxtext/configs/base.yml}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 MEMFRAC="${XLA_PYTHON_CLIENT_MEM_FRACTION:-.97}"
 [[ "$MEMFRAC" == ".97" ]] || die "canonical mem fraction is .97; stop instead of lowering it"
+JAX_AITER_RUNTIME="${JAX_AITER_RUNTIME:-source}"
+case "$JAX_AITER_RUNTIME" in
+  source|installed) ;;
+  *) die "JAX_AITER_RUNTIME must be source or installed" ;;
+esac
 
 MODEL_NAME="${MODEL_NAME:-llama3.1-8b}"
 MODEL_CONTROLS="${MODEL_CONTROLS:-default}"
@@ -98,10 +103,17 @@ export NVTE_FUSED_ATTN=1 NVTE_FUSED_ATTN_CK=1 NVTE_FUSED_ATTN_AOTRITON=0
 export NVTE_CK_USES_FWD_V3=1 NVTE_CK_USES_BWD_V3=1
 export NVTE_CK_IS_V3_ATOMIC_FP32=1 NVTE_CK_HOW_V3_BF16_CVT=2
 export DECOUPLE_GCLOUD=TRUE
-export JA_ROOT_DIR="${JA_ROOT_DIR:-$JAX_AITER_ROOT}"
-export AITER_ASM_DIR="${AITER_ASM_DIR:-${JAX_AITER_ROOT}/third_party/aiter/hsa/}"
 export AITER_SYMBOL_VISIBLE=1 GPU_ARCHS="${GPU_ARCHS:-gfx950}"
-export PYTHONPATH="${MAXTEXT_ROOT}/src:${JAX_AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ "$JAX_AITER_RUNTIME" == "installed" ]]; then
+  # Prevent a mounted source tree from shadowing the validated wheel or making
+  # the loader look in $JA_ROOT_DIR/build instead of its versioned user cache.
+  unset JA_ROOT_DIR AITER_ASM_DIR
+  export PYTHONPATH="${MAXTEXT_ROOT}/src"
+else
+  export JA_ROOT_DIR="${JA_ROOT_DIR:-$JAX_AITER_ROOT}"
+  export AITER_ASM_DIR="${AITER_ASM_DIR:-${JAX_AITER_ROOT}/third_party/aiter/hsa/}"
+  export PYTHONPATH="${MAXTEXT_ROOT}/src:${JAX_AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 
 if [[ "$MODE" == "mxfp4" ]]; then
   export FP4_SELECT="${FP4_SELECT:-dispatch}" AITER_FP4_ATTN=1
@@ -168,7 +180,7 @@ print_recipe() {
   printf 'fp4_select=%s fp4_attention_gemm=%s sr_key_mode=%s mha_fuse_gqa_reduce=%s mha_zero_pad=%s\n' "${FP4_SELECT:-n/a}" "${AITER_FP4_ATTN:-n/a}" "$SR_KEY_MODE" "${JA_MHA_FUSE_GQA_REDUCE:-n/a}" "${JA_MHA_ZERO_PAD:-n/a}"
   printf 'te_atomic_fp32=%s te_bf16_cvt=%s ja_mha_atomic_fp32=%s ja_mha_bf16_cvt=%s\n' "$NVTE_CK_IS_V3_ATOMIC_FP32" "$NVTE_CK_HOW_V3_BF16_CVT" "${JA_MHA_BWD_ATOMIC_FP32:-n/a}" "${JA_MHA_BWD_BF16_CVT:-n/a}"
   printf 'rocm_safeguards=jax_platforms:%s,queue_interposition:%s,register_enabled:%s,no_scratch_reclaim:%s,dev_kernarg:%s,fine_grain_pcie:%s\n' "$JAX_PLATFORMS" "$ROCPROFILER_QUEUE_INTERPOSITION" "$ROCPROFILER_REGISTER_ENABLED" "$HSA_NO_SCRATCH_RECLAIM" "$HIP_FORCE_DEV_KERNARG" "$HSA_FORCE_FINE_GRAIN_PCIE"
-  printf 'project_root=%s jax_aiter_root=%s maxtext_root=%s oom_policy=stop_and_report_no_memfrac_fallback\n' "$PROJECT_ROOT" "$JAX_AITER_ROOT" "$MAXTEXT_ROOT"
+  printf 'project_root=%s jax_aiter_root=%s runtime=%s maxtext_root=%s oom_policy=stop_and_report_no_memfrac_fallback\n' "$PROJECT_ROOT" "$JAX_AITER_ROOT" "$JAX_AITER_RUNTIME" "$MAXTEXT_ROOT"
   printf '%s\n' "=== RESOLVED_RECIPE_END ==="
 }
 

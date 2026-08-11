@@ -79,7 +79,8 @@ check_common() {
     assert_line "RESOLVED_ARG=enable_nnx=False" "$capture" &&
     assert_line "RESOLVED_ARG=pure_nnx=False" "$capture" &&
     assert_line "RESOLVED_ARG=pure_nnx_decoder=False" "$capture" &&
-    assert_text "project_root=/opt/mxfp4-repro jax_aiter_root=/opt/mxfp4-repro/jax-aiter maxtext_root=/opt/mxfp4-repro/maxtext" "$capture" &&
+    assert_text "project_root=/opt/mxfp4-repro jax_aiter_root=/opt/mxfp4-repro/jax-aiter" "$capture" &&
+    assert_text "maxtext_root=/opt/mxfp4-repro/maxtext" "$capture" &&
     assert_text "rocm_safeguards=jax_platforms:rocm,queue_interposition:0,register_enabled:0,no_scratch_reclaim:1,dev_kernarg:1,fine_grain_pcie:1" "$capture" &&
     assert_text "--xla_gpu_autotune_level=5" "$capture" &&
     assert_one_quantization_arg "$capture"
@@ -92,6 +93,7 @@ test_perf_mxfp4_direct_mha() {
     assert_text "mode=mxfp4 label=MXFP4 model=llama3.1-8b model_controls=default processes=1 steps=50 measurement_window=completed_steps_40_49" "$capture" &&
     assert_line "RESOLVED_ARG=quantization=aiter_fp4" "$capture" &&
     assert_line "RESOLVED_ARG=attention=aiter_flash" "$capture" &&
+    assert_text "runtime=source" "$capture" &&
     assert_line "RESOLVED_ARG=use_jax_aiter=True" "$capture" &&
     assert_line "RESOLVED_ARG=remat_policy=minimal_flash_save_fp4col" "$capture" &&
     assert_text "hadamard_passes=wgrad sr_passes=wgrad_col dgrad_partition=gather_packed dgrad_reuse_fwd_col=1 remat_save_col=both pack_gateup_ag=1" "$capture" &&
@@ -175,6 +177,15 @@ test_llama31_mlperf_model_controls() {
     assert_line "RESOLVED_ARG=num_vocab_tiling=1" "$capture"
 }
 
+test_installed_wheel_runtime_resolution() {
+  local capture="$TMP/perf-installed-runtime"
+  clean_env env JAX_AITER_RUNTIME=installed \
+    bash "$PERF_RUNNER" mxfp4 /outputs 50 >"$capture" 2>&1 &&
+    assert_text "runtime=installed" "$capture" &&
+    assert_line "RESOLVED_ARG=attention=aiter_flash" "$capture" &&
+    assert_line "RESOLVED_ARG=quantization=aiter_fp4" "$capture"
+}
+
 test_atomic_launch_guard() {
   local fake_root="$TMP/fake-project"
   local out_root="$TMP/guarded-output"
@@ -216,6 +227,7 @@ tests=(
   test_rejects_stale_aliases
   test_rejects_noncanonical_mem_fraction
   test_llama31_mlperf_model_controls
+  test_installed_wheel_runtime_resolution
   test_atomic_launch_guard
 )
 failures=0
