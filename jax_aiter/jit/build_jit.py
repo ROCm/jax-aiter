@@ -121,8 +121,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
                     "CK_DIR": core_module.CK_DIR,
                     "get_asm_dir": core_module.get_asm_dir,
                     "jax_ffi_include_dir": jax_ffi_include,
-                    "torch_site": torch_site,
-                    "pytorch_include_dirs": pytorch_include_dirs,
                 }
                 try:
                     return eval(value, eval_globals)
@@ -152,19 +150,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
             except:
                 jax_ffi_include = ""
 
-            # Get PyTorch include directories (needed for compilation).
-            torch_site = str(core_module.JA_ROOT_DIR / "third_party" / "pytorch")
-            pytorch_include_dirs = [
-                f"{torch_site}/torch/csrc/api/include",
-                f"{torch_site}/aten",
-                f"{torch_site}/aten/src",
-                f"{torch_site}/aten/src/ATen",
-                f"{torch_site}/build_static",
-                f"{torch_site}/build_static/aten/src",
-                f"{torch_site}/build_static/install/include",
-                f"{torch_site}/torch/csrc",
-            ]
-
             # Process the config values through eval.
             processed_config = {}
             for key, value in config.items():
@@ -173,23 +158,17 @@ def patch_aiter_core(core_module, jax_aiter_root):
             # Merge with defaults.
             d_opt_build_args.update(processed_config)
 
-            # Always add PyTorch include directories (needed for compilation).
-            # Even with torch_exclude=True, we need headers for compilation.
-            pytorch_includes = [f"-I{torch_site}"]
-            pytorch_includes.extend(
-                [f"-I{inc_dir}" for inc_dir in pytorch_include_dirs]
-            )
-
             # Define JAX-aiter specific include flags.
             ja_includes = [
                 f"-I{jax_ffi_include}",
                 f"-I{core_module.JA_ROOT_DIR}/csrc/common",
             ]
 
-            # Add PyTorch includes to both CC and HIP flags.
+            # All three configured modules use torch_exclude=True. The previous
+            # PyTorch include list was dead weight: Ninja's dependency database
+            # for every built object contains zero PyTorch headers.
             if "flags_extra_cc" not in d_opt_build_args:
                 d_opt_build_args["flags_extra_cc"] = []
-            d_opt_build_args["flags_extra_cc"].extend(pytorch_includes)
             d_opt_build_args["flags_extra_cc"].extend(ja_includes)
 
             # Add jax-aiter library linking flags.
@@ -286,11 +265,14 @@ def patch_aiter_core(core_module, jax_aiter_root):
             if torch_exclude:
                 import sys
                 import types
-                import os
 
-                torch_site = str(core_module.JA_ROOT_DIR / "third_party" / "pytorch")
                 mock_torch = types.ModuleType('torch')
-                mock_torch.__file__ = os.path.join(torch_site, '__init__.py')
+                # cpp_extension only needs a module-shaped object while
+                # torch_exclude=True. Point at an existing repository file;
+                # no PyTorch source tree or runtime package is consumed.
+                mock_torch.__file__ = str(
+                    core_module.JA_ROOT_DIR / "jax_aiter" / "__init__.py"
+                )
                 sys.modules['torch'] = mock_torch
                 
                 try:
