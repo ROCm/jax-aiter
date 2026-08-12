@@ -98,9 +98,14 @@ jobs:
       - name: Install build tooling and JAX
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            # The manylinux image is intentionally minimal. --jax-only uses
+            # --no-deps so first provide JAX's runtime requirements.
+            python3 -m pip install --break-system-packages \
+              numpy ml_dtypes scipy opt_einsum
             bash ci/setup_jax.sh --jax-only
             python3 -m pip install --break-system-packages \
-              cmake ninja pyyaml psutil pandas wheel auditwheel
+              cmake ninja pyyaml psutil wheel auditwheel
           '
 
       - name: Build default/PyPI-shaped wheel
