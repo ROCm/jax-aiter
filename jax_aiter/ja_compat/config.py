@@ -77,12 +77,18 @@ def _has_packaged_jit_set(directory: Path) -> bool:
 
 def _has_complete_download(directory: Path) -> bool:
     """A downloaded generation is active only after its completion manifest."""
-    from ..jit_assets import AITER_SHA, GPU_ARCHS, JIT_RECIPE_HASH
+    from ..jit_assets import (
+        AITER_SHA,
+        ASSET_CONTRACT_VERSION,
+        GPU_ARCHS,
+        JIT_RECIPE_HASH,
+    )
 
     try:
         manifest = json.loads((directory / "manifest.json").read_text())
         if (
             manifest.get("aiter_sha") != AITER_SHA
+            or manifest.get("asset_contract") != ASSET_CONTRACT_VERSION
             or manifest.get("gpu_archs") != GPU_ARCHS
             or manifest.get("patch_hash") != JIT_RECIPE_HASH
         ):

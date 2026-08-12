@@ -153,6 +153,7 @@ def test_wheel_asset_binding_matches_current_checkout():
         rocm_version=assets.ROCM_VERSION,
     )
     assert assets.AITER_SHA == aiter_sha
+    assert assets.ASSET_CONTRACT_VERSION == jlm.ASSET_CONTRACT_VERSION
     assert assets.JIT_RECIPE_HASH == recipe_hash
     assert assets.CACHE_ID == cache_id
     assert assets.RELEASE_TAG == f"jit-libs-{cache_id}"

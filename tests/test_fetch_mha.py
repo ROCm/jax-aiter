@@ -58,6 +58,7 @@ def _release(tmp_path: Path, compression: str, *, arch: str = "gfx950"):
 
     manifest = {
         "schema": 1,
+        "asset_contract": jit_assets.ASSET_CONTRACT_VERSION,
         "tag": fetch_mha.DEFAULT_TAG,
         "aiter_sha": jit_assets.AITER_SHA,
         "gpu_archs": arch,
@@ -201,6 +202,7 @@ def test_loader_uses_cache_only_when_all_jit_libs_are_present(tmp_path, monkeypa
         json.dumps(
             {
                 "aiter_sha": jit_assets.AITER_SHA,
+                "asset_contract": jit_assets.ASSET_CONTRACT_VERSION,
                 "gpu_archs": jit_assets.GPU_ARCHS,
                 "patch_hash": jit_assets.JIT_RECIPE_HASH,
                 "files": entries,

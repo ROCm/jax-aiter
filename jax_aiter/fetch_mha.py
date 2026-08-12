@@ -30,6 +30,7 @@ from pathlib import Path
 
 from .jit_assets import (
     AITER_SHA as EXPECTED_AITER_SHA,
+    ASSET_CONTRACT_VERSION as EXPECTED_ASSET_CONTRACT,
     GPU_ARCHS as EXPECTED_GPU_ARCHS,
     JIT_RECIPE_HASH as EXPECTED_JIT_RECIPE_HASH,
     ROCM_VERSION as EXPECTED_ROCM_VERSION,
@@ -142,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
         expected_keys = {
             "schema": 1,
+            "asset_contract": EXPECTED_ASSET_CONTRACT,
             "tag": args.tag,
             "aiter_sha": EXPECTED_AITER_SHA,
             "gpu_archs": EXPECTED_GPU_ARCHS,

@@ -36,6 +36,9 @@ import sys
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+# Bump only when release/manifest semantics become incompatible. This belongs
+# in the immutable asset ID; implementation-only fixes do not change JIT bytes.
+ASSET_CONTRACT_VERSION = 2
 
 # The canonical 3 JIT libs (order = build order). Override with --libs.
 DEFAULT_LIBS = ("librmsnorm_fwd.so", "libmha_fwd.so", "libmha_bwd.so")
@@ -80,8 +83,6 @@ def compute_patch_hash(repo_root: str | os.PathLike) -> str:
         root / "jax_aiter" / "jit" / "build_jit.py",
         root / "jax_aiter" / "jit" / "optCompilerConfig.json",
         root / "ci" / "setup_jax.sh",
-        root / "ci" / "jit_libs_manifest.py",
-        root / "ci" / "publish_jit_libs.sh",
     ]
     common_dir = root / "csrc" / "common"
     if common_dir.is_dir():
@@ -109,22 +110,26 @@ def compute_aiter_sha(repo_root: str | os.PathLike) -> str:
     """Resolve the consumed AITER commit, even before submodule checkout."""
     root = Path(repo_root)
     aiter_dir = root / "third_party" / "aiter"
-    try:
-        out = subprocess.run(
-            [
-                "git",
-                "-c",
-                f"safe.directory={aiter_dir.resolve()}",
-                "-C",
-                str(aiter_dir),
-                "rev-parse",
-                "HEAD",
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        return out.stdout.strip()
-    except Exception:
-        pass
+    # An uninitialized gitlink is an ordinary directory. Running `git -C` from
+    # it walks up to the parent repository and returns the PR/source commit,
+    # which is not the AITER SHA.
+    if (aiter_dir / ".git").exists():
+        try:
+            out = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={aiter_dir.resolve()}",
+                    "-C",
+                    str(aiter_dir),
+                    "rev-parse",
+                    "HEAD",
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            return out.stdout.strip()
+        except Exception:
+            pass
     try:
         out = subprocess.run(
             [
@@ -200,6 +205,7 @@ def compute_cache_id(
             ";".join(normalize_archs(gpu_archs)),
             patch_hash,
             rocm_version,
+            str(ASSET_CONTRACT_VERSION),
         )
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
@@ -263,6 +269,7 @@ def build_manifest(
 
     return {
         "schema": SCHEMA_VERSION,
+        "asset_contract": ASSET_CONTRACT_VERSION,
         "tag": tag,
         "created_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "aiter_sha": aiter_sha,
@@ -309,6 +316,18 @@ def verify_manifest(
     """
     reasons: list[str] = []
     ok = True
+
+    if manifest.get("asset_contract") == ASSET_CONTRACT_VERSION:
+        reasons.append(
+            f"OK   asset_contract matches ({ASSET_CONTRACT_VERSION})"
+        )
+    else:
+        ok = False
+        reasons.append(
+            "FAIL asset_contract mismatch "
+            f"(manifest={manifest.get('asset_contract', '?')} "
+            f"current={ASSET_CONTRACT_VERSION})"
+        )
 
     m_aiter = manifest.get("aiter_sha", "")
     if m_aiter == current_aiter_sha and current_aiter_sha not in ("", "unknown"):
