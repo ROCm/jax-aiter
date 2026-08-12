@@ -37,6 +37,7 @@ on:
       - ci/setup_jax.sh
       - ci/jit_libs_manifest.py
       - ci/publish_jit_libs.sh
+      - .github/workflows/jit-libs.yml
       - Makefile
       - csrc/common/**
 
