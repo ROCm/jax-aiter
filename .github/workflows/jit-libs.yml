@@ -3,6 +3,8 @@ name: JIT libs (build + publish)
 # The only JIT-library producer. Hard inputs map to one immutable release:
 #   AITER SHA + gfx arch + ROCm version + JIT recipe/ABI hash.
 # Existing matching releases return from preflight without pulling an image.
+# Manifest-only corrections repackage verified blobs under a new contract ID;
+# they do not justify recompiling unchanged binaries.
 
 on:
   workflow_dispatch:
