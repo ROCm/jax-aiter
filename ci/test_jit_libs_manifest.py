@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import importlib.util
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -123,7 +124,27 @@ def test_wheel_asset_binding_matches_current_checkout():
     assets = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(assets)
 
-    aiter_sha = jlm.compute_aiter_sha(root)
+    # CPU CI intentionally does not clone the 2.9 GB submodule. Read the
+    # committed gitlink: `git -C third_party/aiter rev-parse HEAD` would walk up
+    # to the parent repo and return the PR merge SHA when that directory is
+    # uninitialized.
+    tree = subprocess.run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={root.resolve()}",
+            "-C",
+            str(root),
+            "ls-tree",
+            "HEAD",
+            "third_party/aiter",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert len(tree) >= 3 and tree[1] == "commit", tree
+    aiter_sha = tree[2]
     recipe_hash = jlm.compute_patch_hash(root)
     cache_id = jlm.compute_cache_id(
         aiter_sha=aiter_sha,
