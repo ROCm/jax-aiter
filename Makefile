@@ -90,7 +90,7 @@ ja_mods_nomha: $(JA_CORE_MODULES)
 	mkdir -p $@
 
 $(OUT_SO): build/jax_aiter_build/ csrc/common/mha_common_utils.cu
-	$(HIPCC) -shared $(UMBRELLA_CXXFLAGS) \
+	$(HIPCC) -shared $(UMBRELLA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) \
 		-I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
 		-I$(AITER_SRC_DIR)/3rdparty/composable_kernel/example/ck_tile/01_fmha \
 		csrc/common/mha_common_utils.cu \
