@@ -15,8 +15,8 @@ The trace ``Kernel_Name`` carries the tile (e.g. ``...BpreShuffle_128x512``);
 ``Grid_Size_Z`` equals the splitK grid (= splitK, since workgroup_z=1). This is
 the GPU-side ground truth the CPU-only env-plumbing test cannot give.
 
-Used by tests/test_gemm_fp4_a1_kernel_override.py (skips gracefully when
-rocprofv3 / GPU is unavailable) and as a standalone cross-check tool.
+Used by tests/test_gemm_fp4_kernel_selection.py when `JA_ROCPROF_BENCH` points
+at the external benchmark, and as a standalone cross-check tool.
 
 Exit code 0 = all checks passed; 2 = a dispatch mismatch; 3 = setup error.
 """
@@ -32,9 +32,10 @@ import shutil
 import statistics
 import subprocess
 import sys
+from pathlib import Path
 
-REPO = "/ruvaidya/aiter_proj"
-BENCH = f"{REPO}/scripts/rocprof_kernel_bench.py"
+REPO = Path(__file__).resolve().parents[1]
+BENCH = os.environ.get("JA_ROCPROF_BENCH", "")
 F4_RE = re.compile(r"f4gemm")
 TILE_RE = re.compile(r"BpreShuffle_(\d+x\d+)")
 FORCED_256 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
@@ -62,6 +63,11 @@ def _bench_env(env_mode: str) -> dict:
 def capture(shape_mnk: str, env_mode: str, out_dir: str,
             warmup: int = 3, iters: int = 20) -> dict:
     """Run one rocprofv3 kernel-trace capture; return the dominant f4gemm info."""
+    if not BENCH or not Path(BENCH).is_file():
+        return {
+            "ok": False,
+            "error": "set JA_ROCPROF_BENCH to rocprof_kernel_bench.py",
+        }
     os.makedirs(out_dir, exist_ok=True)
     for f in glob.glob(os.path.join(out_dir, "*")):
         os.remove(f)
@@ -72,7 +78,7 @@ def capture(shape_mnk: str, env_mode: str, out_dir: str,
         "--backend", "fp4_kern", "--warmup", str(warmup), "--iters", str(iters),
     ]
     proc = subprocess.run(cmd, env=_bench_env(env_mode),
-                          cwd=f"{REPO}/jax-aiter",
+                          cwd=str(REPO),
                           capture_output=True, text=True, timeout=420)
     csvs = glob.glob(os.path.join(out_dir, "*kernel_trace*.csv"))
     if not csvs:

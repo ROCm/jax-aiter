@@ -48,6 +48,7 @@ DISPATCH_128x512 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
 REPO = Path(__file__).resolve().parents[1]
 HANDLER = REPO / "csrc/ffi/gemm_fp4/gemm_fp4_ja.cu"
 VERIFY = REPO / "scripts/verify_fp4_dispatch_rocprof.py"
+ROCPROF_BENCH = os.environ.get("JA_ROCPROF_BENCH", "")
 
 # Per-shape oracle expected by the 20260615 study (M,N,K) -> (tile, splitK).
 ORACLE_TABLE = {
@@ -139,9 +140,14 @@ def _gpu_available():
         return False
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(shutil.which("rocprofv3") is None,
                     reason="rocprofv3 not on PATH (GPU/rocprof host required)")
 @pytest.mark.skipif(not VERIFY.exists(), reason="verify script missing")
+@pytest.mark.skipif(
+    not ROCPROF_BENCH or not Path(ROCPROF_BENCH).is_file(),
+    reason="set JA_ROCPROF_BENCH to the external rocprof benchmark script",
+)
 def test_force_kernel_dispatches_via_rocprof_trace(tmp_path):
     """Launch FP4 GEMMs under rocprofv3 --kernel-trace and assert the GPU ran
     the per-shape oracle kernel under AITER_FP4_DISPATCH=1, and the 256x256 pin
