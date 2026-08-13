@@ -48,11 +48,14 @@ python3 -m pip install \
   "jax==0.11.0" "jaxlib==0.11.0" \
   "jax-rocm7-plugin==0.11.0" "jax-rocm7-pjrt==0.11.0"
 
-WHEEL=jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl
+# The +full wheel is self-contained. The plain wheel is far smaller but then
+# needs `jax-aiter-fetch-mha` before flash attention works.
+# The '+' is percent-encoded as %2B in the download URL, not in the filename.
+BASE=https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2
+WHEEL='jax_aiter-0.1.0a2+full-cp312-cp312-manylinux_2_39_x86_64.whl'
 curl -fL -o "/tmp/$WHEEL" \
-  "https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/$WHEEL"
+  "$BASE/jax_aiter-0.1.0a2%2Bfull-cp312-cp312-manylinux_2_39_x86_64.whl"
 python3 -m pip install "/tmp/$WHEEL"
-jax-aiter-fetch-mha
 
 python3 - <<'PY'
 import jax

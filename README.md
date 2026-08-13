@@ -54,18 +54,22 @@ python3 -c "import jax; print(jax.devices())"
 
 ### 3. Install JAX-AITER
 
-Download the alpha2 wheel from the
-[GitHub release](https://github.com/ROCm/jax-aiter/releases/tag/v0.1.0-alpha2),
-then install it:
+Download a wheel from the
+[GitHub release](https://github.com/ROCm/jax-aiter/releases/tag/v0.1.0-alpha2).
+The `+full` wheel is recommended: it is complete on its own, with nothing to
+fetch afterwards.
 
 ```bash
 python3 -m pip install \
-  ./jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl
+  ./jax_aiter-0.1.0a2+full-cp312-cp312-manylinux_2_39_x86_64.whl
 ```
 
-The default wheel is `gfx950`-only and contains all APIs, FFI shims, and
-non-MHA runtime libraries. PyPI publication is intentionally not automated yet;
-the release notes will state when `pip install jax-aiter==0.1.0a2` is available.
+Both wheels are `gfx950`-only. The `+full` wheel is roughly 433 MB and bundles
+the MHA JIT libraries. The plain `0.1.0a2` wheel is roughly 30 MB and omits
+them, so it needs `jax-aiter-fetch-mha` before flash attention works — prefer
+it when download or image size matters. PyPI publication is intentionally not
+automated yet; the release notes will state when `pip install
+jax-aiter==0.1.0a2` is available.
 
 Verify the basic install:
 
@@ -83,9 +87,12 @@ PY
 
 ### 4. Add flash attention when needed
 
-The two MHA JIT libraries are omitted from the default wheel because they
-expand to multiple gigabytes. Download the matching, checksummed `gfx950`
-artifacts instead of compiling them:
+Skip this step if you installed the `+full` wheel; it already bundles the MHA
+JIT libraries.
+
+The plain wheel omits those two libraries because they expand to multiple
+gigabytes. Download the matching, checksummed `gfx950` artifacts instead of
+compiling them:
 
 ```bash
 jax-aiter-fetch-mha
@@ -122,7 +129,7 @@ y_fused, residual_out = rms_norm_with_add(
 y_silu = silu_and_mul(jnp.concatenate([gate_bf16, up_bf16], axis=-1))
 ```
 
-After `jax-aiter-fetch-mha`:
+With the `+full` wheel, or after `jax-aiter-fetch-mha` on the plain wheel:
 
 ```python
 from jax_aiter.mha import flash_attn_func, flash_attn_varlen
