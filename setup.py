@@ -218,8 +218,10 @@ class bdist_wheel(_bdist_wheel):
     def finalize_options(self):
         super().finalize_options()
         self.root_is_pure = False
-        # Release builds run in the project's manylinux_2_28 image and set this
-        # explicitly. Local developer builds retain wheel's normal linux tag.
+        # Release builds set this explicitly; it is the tag the wheel claims,
+        # which is not the same as the image that built it (the bundled AITER
+        # JIT libraries raise the real floor). Local developer builds retain
+        # wheel's normal linux tag.
         release_plat = os.environ.get("JA_WHEEL_PLAT_NAME", "").strip()
         if release_plat:
             self.plat_name = release_plat

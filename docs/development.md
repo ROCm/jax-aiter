@@ -103,11 +103,16 @@ Release wheels are built inside
 `ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14` with:
 
 ```bash
-export JA_WHEEL_PLAT_NAME=manylinux_2_28_x86_64
+export JA_WHEEL_PLAT_NAME=manylinux_2_39_x86_64
 ```
 
-The release workflow runs `auditwheel show`, checks wheel contents, then
-clean-room validates both variants on one MI355 before upload.
+The tag is `2_39` even though the image is `2_28`, because the bundled AITER JIT
+libraries come from `jit-libs.yml`, which builds them on Ubuntu 24.04; they need
+`GLIBCXX_3.4.31` no matter which image packages the wheel.
+
+The release workflow runs `auditwheel show`, asserts the platform tag is not
+weaker than the measured symbol floor, checks wheel contents, then clean-room
+validates both variants on one MI355 before upload.
 
 ## Performance and convergence
 

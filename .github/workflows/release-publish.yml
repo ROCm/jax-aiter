@@ -3,6 +3,13 @@ name: JAX-AITER Release Build + Validate
 # Build the gfx950 alpha2 wheels in the TheRock manylinux_2_28 image, validate
 # both variants on a real MI355, then attach them to the GitHub release.
 #
+# The wheels are tagged manylinux_2_39, not 2_28. Broad manylinux compatibility
+# is not a goal for alpha2: the bundled JIT libraries come from jit-libs.yml,
+# which builds them on Ubuntu 24.04, so they need GLIBCXX_3.4.31 regardless of
+# which image packages the wheel. Alpha2 targets ROCm 7.14 on Ubuntu 24.04
+# anyway, and an honest tag makes pip refuse an unusable install up front
+# instead of failing at import.
+#
 # This workflow NEVER builds JIT libraries; jit-libs.yml is their only producer.
 # It also does NOT upload to PyPI. That irreversible step stays manual until the
 # user explicitly approves the AMD-owned PyPI project/token arrangement.
@@ -32,7 +39,7 @@ env:
   GPU_ARCHS: gfx950
   ROCM_VERSION: "7.14.0"
   JA_WHEEL_ARCH: gfx950
-  JA_WHEEL_PLAT_NAME: manylinux_2_28_x86_64
+  JA_WHEEL_PLAT_NAME: manylinux_2_39_x86_64
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
 
 jobs:
@@ -105,6 +112,12 @@ jobs:
               numpy ml_dtypes scipy opt_einsum
             bash ci/setup_jax.sh --jax-only
             python3 -m pip install --break-system-packages pandas auditwheel
+            # build_wheel.sh runs pip wheel --no-build-isolation, so the PEP 517
+            # backend must already be importable, and this minimal image ships
+            # neither setuptools nor wheel. wheel is capped because setup.py
+            # imports wheel.bdist_wheel, scheduled upstream for removal.
+            python3 -m pip install --break-system-packages \
+              "setuptools>=64" "wheel<1.0"
           '
 
       - name: Build umbrella and FFI shims
@@ -131,10 +144,12 @@ jobs:
       - name: Audit wheel policy and contents
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
+            # No --max-minor: the ceiling comes from the tag on each wheel, so
+            # a future build-image bump fails here until the tag is corrected.
             python3 ci/check_manylinux_policy.py \
-              dist/jax_aiter-0.1.0a2-*.whl --max-minor 28
+              dist/jax_aiter-0.1.0a2-*.whl
             python3 ci/check_manylinux_policy.py \
-              dist/jax_aiter-0.1.0a2+full-*.whl --max-minor 28
+              dist/jax_aiter-0.1.0a2+full-*.whl
             python3 - <<"PY"
           from pathlib import Path
           from zipfile import ZipFile

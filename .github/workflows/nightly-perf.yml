@@ -10,7 +10,7 @@ on:
       wheel_url:
         description: "Default alpha2 wheel URL"
         type: string
-        default: "https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_28_x86_64.whl"
+        default: "https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl"
   schedule:
     - cron: '0 6 * * *'
 
@@ -25,7 +25,7 @@ permissions:
 env:
   IMAGE: ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14
   CONTAINER_NAME: ja_perf_fsdp4
-  WHEEL_URL: ${{ inputs.wheel_url || 'https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_28_x86_64.whl' }}
+  WHEEL_URL: ${{ inputs.wheel_url || 'https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl' }}
 
 jobs:
   mxfp4-fsdp4:
@@ -46,9 +46,9 @@ jobs:
       - name: Download alpha2 default wheel
         run: |
           mkdir -p dist
+          # Keep the published filename: pip reads the platform tag from it.
           curl -fL --retry 3 --retry-delay 2 \
-            -o dist/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_28_x86_64.whl \
-            "$WHEEL_URL"
+            -o "dist/$(basename "$WHEEL_URL")" "$WHEEL_URL"
 
       - name: Pull runtime image
         run: docker pull "$IMAGE"
@@ -68,9 +68,12 @@ jobs:
       - name: Install JAX, JAX-AITER, and MHA assets
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
             bash ci/setup_jax.sh --jax-only
-            python3 -m pip install --break-system-packages \
-              dist/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_28_x86_64.whl
+            shopt -s nullglob
+            wheels=(dist/jax_aiter-0.1.0a2-*.whl)
+            test "${#wheels[@]}" -eq 1
+            python3 -m pip install --break-system-packages "${wheels[0]}"
             cd /tmp
             jax-aiter-fetch-mha
             python3 -c "import jax; from jax_aiter.mha import flash_attn_func; print(jax.devices(), flash_attn_func)"

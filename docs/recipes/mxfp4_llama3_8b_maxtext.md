@@ -48,9 +48,10 @@ python3 -m pip install \
   "jax==0.11.0" "jaxlib==0.11.0" \
   "jax-rocm7-plugin==0.11.0" "jax-rocm7-pjrt==0.11.0"
 
-curl -fL -o /tmp/jax_aiter-0.1.0a2.whl \
-  https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_28_x86_64.whl
-python3 -m pip install /tmp/jax_aiter-0.1.0a2.whl
+WHEEL=jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl
+curl -fL -o "/tmp/$WHEEL" \
+  "https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/$WHEEL"
+python3 -m pip install "/tmp/$WHEEL"
 jax-aiter-fetch-mha
 
 python3 - <<'PY'

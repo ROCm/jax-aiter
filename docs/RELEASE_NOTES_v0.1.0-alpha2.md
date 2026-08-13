@@ -16,20 +16,27 @@ performance results will be published separately in the ROCm blog.
 
 ## Wheels
 
-Two manylinux wheels are attached to the GitHub release:
+Two wheels are attached to the GitHub release:
 
-- `jax_aiter-0.1.0a2-...manylinux_2_28_x86_64.whl`
+- `jax_aiter-0.1.0a2-...manylinux_2_39_x86_64.whl`
   - default installation;
   - all public APIs and thin FFI shims;
   - gfx950 HSA files only;
   - MHA JIT libraries downloaded on demand.
-- `jax_aiter-0.1.0a2+full-...manylinux_2_28_x86_64.whl`
+- `jax_aiter-0.1.0a2+full-...manylinux_2_39_x86_64.whl`
   - GitHub-only convenience artifact;
   - includes the MHA JIT libraries;
   - intended for environments that cannot download runtime assets later.
 
-The release workflow builds in the TheRock manylinux image, checks wheel policy
-and contents, then validates both variants on an MI355 before upload.
+The `manylinux_2_39` tag reports what the wheels actually require: the bundled
+AITER JIT libraries are built on Ubuntu 24.04 and need `GLIBCXX_3.4.31`. Broad
+manylinux compatibility is not an alpha2 goal, and the honest tag makes `pip`
+decline an unusable install rather than fail later at import. Alpha2 targets
+ROCm 7.14 on Ubuntu 24.04, which satisfies it.
+
+The release workflow builds in the TheRock manylinux image, verifies that the
+tag matches the measured symbol floor, checks wheel contents, then validates
+both variants on an MI355 before upload.
 
 ## Installation
 
@@ -45,7 +52,7 @@ Install the downloaded default wheel:
 
 ```bash
 python3 -m pip install \
-  ./jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_28_x86_64.whl
+  ./jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl
 ```
 
 Add flash attention when needed:

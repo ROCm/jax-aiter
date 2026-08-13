@@ -60,7 +60,7 @@ then install it:
 
 ```bash
 python3 -m pip install \
-  ./jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_28_x86_64.whl
+  ./jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl
 ```
 
 The default wheel is `gfx950`-only and contains all APIs, FFI shims, and
