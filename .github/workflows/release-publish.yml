@@ -120,14 +120,12 @@ jobs:
 
       - name: Package default/PyPI-shaped wheel
         run: |
-          docker exec -e PIP_EXTRA_ARGS=--break-system-packages \
-            "$CONTAINER_NAME" bash -lc \
+          docker exec "$CONTAINER_NAME" bash -lc \
             'bash scripts/build_wheel.sh --variant lite'
 
       - name: Build GitHub-only full wheel
         run: |
-          docker exec -e PIP_EXTRA_ARGS=--break-system-packages \
-            "$CONTAINER_NAME" bash -lc \
+          docker exec "$CONTAINER_NAME" bash -lc \
             'bash scripts/build_wheel.sh --variant full'
 
       - name: Audit wheel policy and contents
