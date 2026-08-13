@@ -16,17 +16,20 @@ performance results will be published separately in the ROCm blog.
 
 ## Wheels
 
-Two wheels are attached to the GitHub release:
+Two wheels are attached to the GitHub release. **Most users want the `+full`
+wheel**, which is complete on its own:
 
-- `jax_aiter-0.1.0a2-...manylinux_2_39_x86_64.whl`
-  - default installation;
-  - all public APIs and thin FFI shims;
-  - gfx950 HSA files only;
-  - MHA JIT libraries downloaded on demand.
-- `jax_aiter-0.1.0a2+full-...manylinux_2_39_x86_64.whl`
-  - GitHub-only convenience artifact;
-  - includes the MHA JIT libraries;
-  - intended for environments that cannot download runtime assets later.
+- `jax_aiter-0.1.0a2+full-...manylinux_2_39_x86_64.whl` — **recommended**
+  - everything in one download, including the MHA JIT libraries;
+  - nothing to fetch after installing;
+  - roughly 433 MB, about 2.5 GB installed.
+- `jax_aiter-0.1.0a2-...manylinux_2_39_x86_64.whl` — small alternative
+  - all public APIs, thin FFI shims, and gfx950 HSA files;
+  - omits the two multi-GB MHA JIT libraries, so it is roughly 30 MB;
+  - `jax-aiter-fetch-mha` downloads those libraries on first use;
+  - carries the plain version because it is the PyPI-shaped artifact, though
+    alpha2 is not published to PyPI. Prefer it when download size or image
+    size matters more than a self-contained install.
 
 The `manylinux_2_39` tag reports what the wheels actually require: the bundled
 AITER JIT libraries are built on Ubuntu 24.04 and need `GLIBCXX_3.4.31`. Broad
@@ -48,16 +51,19 @@ python3 -m pip install \
   "jax-rocm7-plugin==0.11.0" "jax-rocm7-pjrt==0.11.0"
 ```
 
-Install the downloaded default wheel:
+Install the recommended `+full` wheel, which needs no follow-up download:
+
+```bash
+python3 -m pip install \
+  ./jax_aiter-0.1.0a2+full-cp312-cp312-manylinux_2_39_x86_64.whl
+python3 -c "from jax_aiter.mha import flash_attn_func; print('MHA ready')"
+```
+
+If you took the small wheel instead, add flash attention separately:
 
 ```bash
 python3 -m pip install \
   ./jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl
-```
-
-Add flash attention when needed:
-
-```bash
 jax-aiter-fetch-mha
 python3 -c "from jax_aiter.mha import flash_attn_func; print('MHA ready')"
 ```
@@ -72,7 +78,7 @@ system `site-packages`.
 - JIT libraries rebuild only when the AITER pin, architecture, or JIT recipe
   changes; unrelated integration patches do not invalidate them.
 - PR and nightly tests are selected by `gpu`, `multigpu`, and `slow` markers.
-- The default wheel is gfx950-only and omits only the large MHA JIT libraries.
+- Both wheels are gfx950-only; the smaller one omits just the MHA JIT libraries.
 - HIP failures now print the HIP error, source file, and line before aborting.
 - Dead compatibility helpers, unbuildable registry entries, and the
   experimental unbuilt FP8 GEMM module were removed.
@@ -96,7 +102,7 @@ CPU CI.
 
 - Alpha2 supports `gfx950` only.
 - Python 3.12 is required.
-- The default wheel needs `jax-aiter-fetch-mha` before importing
-  `jax_aiter.mha`.
+- The smaller plain wheel needs `jax-aiter-fetch-mha` before importing
+  `jax_aiter.mha`. The recommended `+full` wheel does not.
 - PyPI publication is a separate, explicitly approved step. Until the release
   notes say otherwise, install the wheel from the GitHub release.
