@@ -79,6 +79,11 @@ jobs:
             -v "${{ github.workspace }}:/jax-aiter" \
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
+      - name: Install tooling and JAX
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
+
+      # After setup_jax.sh: the base image ships no jax, so importing it any
+      # earlier fails the job before a single test runs.
       - name: Environment
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
@@ -86,9 +91,6 @@ jobs:
             rocm-smi || true
             python3 -c "import jax; print(\"jax devices:\", jax.devices())"
           '
-
-      - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       - name: Build (umbrella + FFI shims + install)
         run: |
