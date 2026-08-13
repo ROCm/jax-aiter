@@ -36,6 +36,9 @@ import sys
 from pathlib import Path
 
 SCHEMA_VERSION = 1
+# Bump only when release/manifest semantics become incompatible. This belongs
+# in the immutable asset ID; implementation-only fixes do not change JIT bytes.
+ASSET_CONTRACT_VERSION = 2
 
 # The canonical 3 JIT libs (order = build order). Override with --libs.
 DEFAULT_LIBS = ("librmsnorm_fwd.so", "libmha_fwd.so", "libmha_bwd.so")
@@ -66,37 +69,89 @@ def sha256_file(path: str | os.PathLike, chunk: int = 8 * 1024 * 1024) -> str:
 
 
 def compute_patch_hash(repo_root: str | os.PathLike) -> str:
-    """sha256 of the concatenated ``scripts/*.patch`` (sorted), or ``"none"``.
+    """Hash repository-owned inputs that can change the JIT library bytes.
 
-    Returns a ``"sha256:<hex>"`` string. Patches are concatenated in sorted
-    filename order so the hash is deterministic regardless of glob ordering.
+    ``patch_hash`` is the schema-v1 field name, but hashing every
+    ``scripts/*.patch`` was wrong: editing the MaxText or XLA integration patch
+    invalidated multi-GB MHA binaries even though those files never enter their
+    build. Hash the JIT driver/config plus explicitly named ``aiter_jit_*.patch``
+    files instead. AITER source itself is keyed separately by ``aiter_sha``.
     """
-    scripts_dir = Path(repo_root) / "scripts"
-    patches = sorted(scripts_dir.glob("*.patch")) if scripts_dir.is_dir() else []
-    if not patches:
+    root = Path(repo_root)
+    inputs = [
+        root / "Makefile",
+        root / "jax_aiter" / "jit" / "build_jit.py",
+        root / "jax_aiter" / "jit" / "optCompilerConfig.json",
+        root / "ci" / "setup_jax.sh",
+    ]
+    common_dir = root / "csrc" / "common"
+    if common_dir.is_dir():
+        inputs.extend(path for path in common_dir.iterdir() if path.is_file())
+    scripts_dir = root / "scripts"
+    if scripts_dir.is_dir():
+        inputs.extend(sorted(scripts_dir.glob("aiter_jit_*.patch")))
+    inputs = [path for path in inputs if path.is_file()]
+    if not inputs:
         return "none"
+
     h = hashlib.sha256()
-    for p in patches:
-        # Include the basename so a rename alone changes the hash.
-        h.update(p.name.encode("utf-8"))
+    for path in sorted(inputs):
+        # Include a stable repository-relative path so a rename changes the
+        # hash without making it depend on the checkout's absolute location.
+        h.update(path.relative_to(root).as_posix().encode("utf-8"))
         h.update(b"\0")
-        with open(p, "rb") as f:
+        with open(path, "rb") as f:
             for block in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(block)
     return "sha256:" + h.hexdigest()
 
 
 def compute_aiter_sha(repo_root: str | os.PathLike) -> str:
-    """``git -C third_party/aiter rev-parse HEAD`` (or ``"unknown"``)."""
-    aiter_dir = Path(repo_root) / "third_party" / "aiter"
+    """Resolve the consumed AITER commit, even before submodule checkout."""
+    root = Path(repo_root)
+    aiter_dir = root / "third_party" / "aiter"
+    # An uninitialized gitlink is an ordinary directory. Running `git -C` from
+    # it walks up to the parent repository and returns the PR/source commit,
+    # which is not the AITER SHA.
+    if (aiter_dir / ".git").exists():
+        try:
+            out = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    f"safe.directory={aiter_dir.resolve()}",
+                    "-C",
+                    str(aiter_dir),
+                    "rev-parse",
+                    "HEAD",
+                ],
+                capture_output=True, text=True, check=True,
+            )
+            return out.stdout.strip()
+        except Exception:
+            pass
     try:
         out = subprocess.run(
-            ["git", "-C", str(aiter_dir), "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True,
+            [
+                "git",
+                "-c",
+                f"safe.directory={root.resolve()}",
+                "-C",
+                str(root),
+                "ls-tree",
+                "HEAD",
+                "third_party/aiter",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
         )
-        return out.stdout.strip()
+        fields = out.stdout.split()
+        if len(fields) >= 3 and fields[1] == "commit":
+            return fields[2]
     except Exception:
-        return "unknown"
+        pass
+    return "unknown"
 
 
 def detect_rocm_version() -> str:
@@ -138,6 +193,34 @@ def normalize_archs(archs: str | None) -> list[str]:
         if tok:
             out.append(tok)
     return sorted(set(out))
+
+
+def compute_cache_id(
+    *, aiter_sha: str, gpu_archs: str, patch_hash: str, rocm_version: str
+) -> str:
+    """Stable identifier for one immutable set of JIT build inputs."""
+    payload = "\0".join(
+        (
+            aiter_sha,
+            ";".join(normalize_archs(gpu_archs)),
+            patch_hash,
+            rocm_version,
+            str(ASSET_CONTRACT_VERSION),
+        )
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def compute_current_cache_id(
+    repo_root: str | os.PathLike, gpu_archs: str, rocm_version: str
+) -> str:
+    root = Path(repo_root)
+    return compute_cache_id(
+        aiter_sha=compute_aiter_sha(root),
+        gpu_archs=gpu_archs,
+        patch_hash=compute_patch_hash(root),
+        rocm_version=rocm_version,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -186,6 +269,7 @@ def build_manifest(
 
     return {
         "schema": SCHEMA_VERSION,
+        "asset_contract": ASSET_CONTRACT_VERSION,
         "tag": tag,
         "created_utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "aiter_sha": aiter_sha,
@@ -232,6 +316,18 @@ def verify_manifest(
     """
     reasons: list[str] = []
     ok = True
+
+    if manifest.get("asset_contract") == ASSET_CONTRACT_VERSION:
+        reasons.append(
+            f"OK   asset_contract matches ({ASSET_CONTRACT_VERSION})"
+        )
+    else:
+        ok = False
+        reasons.append(
+            "FAIL asset_contract mismatch "
+            f"(manifest={manifest.get('asset_contract', '?')} "
+            f"current={ASSET_CONTRACT_VERSION})"
+        )
 
     m_aiter = manifest.get("aiter_sha", "")
     if m_aiter == current_aiter_sha and current_aiter_sha not in ("", "unknown"):
@@ -304,6 +400,15 @@ def decompress_file(src: str | os.PathLike, dst: str | os.PathLike, compression:
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+def _cmd_cache_id(args: argparse.Namespace) -> int:
+    rocm_version = args.rocm_version or detect_rocm_version()
+    cache_id = compute_current_cache_id(
+        args.repo_root, args.gpu_archs, rocm_version
+    )
+    print(f"{args.prefix}-{cache_id}" if args.prefix else cache_id)
+    return 0
+
+
 def _cmd_emit(args: argparse.Namespace) -> int:
     repo_root = Path(args.repo_root).resolve()
     aiter_sha = args.aiter_sha or compute_aiter_sha(repo_root)
@@ -362,6 +467,13 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="AITER JIT-lib release manifest tool")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("cache-id", help="print immutable JIT input identifier")
+    c.add_argument("--repo-root", default=".")
+    c.add_argument("--gpu-archs", required=True)
+    c.add_argument("--rocm-version", default="")
+    c.add_argument("--prefix", default="")
+    c.set_defaults(func=_cmd_cache_id)
 
     e = sub.add_parser("emit", help="write manifest.json for compressed libs")
     e.add_argument("--repo-root", default=".")

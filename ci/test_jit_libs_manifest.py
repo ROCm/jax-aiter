@@ -15,6 +15,7 @@ from __future__ import annotations
 import gzip
 import importlib.util
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -84,6 +85,79 @@ def test_verify_matching_is_skip_build():
         )
         assert ok is True and decision == "skip-build", reasons
     print("PASS test_verify_matching_is_skip_build")
+
+
+def test_cache_id_is_stable_and_keyed():
+    one = jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs="gfx950;gfx942",
+        patch_hash=PATCH_HASH, rocm_version="7.14.0"
+    )
+    reordered = jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs="gfx942,gfx950",
+        patch_hash=PATCH_HASH, rocm_version="7.14.0"
+    )
+    assert one == reordered and len(one) == 16
+    assert one != jlm.compute_cache_id(
+        aiter_sha=OTHER_SHA, gpu_archs=ARCHS, patch_hash=PATCH_HASH,
+        rocm_version="7.14.0"
+    )
+    assert one != jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs="gfx950", patch_hash=PATCH_HASH,
+        rocm_version="7.14.0"
+    )
+    assert one != jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs=ARCHS, patch_hash=OTHER_PATCH,
+        rocm_version="7.14.0"
+    )
+    assert one != jlm.compute_cache_id(
+        aiter_sha=AITER_SHA, gpu_archs=ARCHS, patch_hash=PATCH_HASH,
+        rocm_version="7.15.0"
+    )
+    print("PASS test_cache_id_is_stable_and_keyed")
+
+
+def test_wheel_asset_binding_matches_current_checkout():
+    root = _HERE.parent
+    spec = importlib.util.spec_from_file_location(
+        "jit_assets", root / "jax_aiter" / "jit_assets.py"
+    )
+    assets = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(assets)
+
+    # CPU CI intentionally does not clone the 2.9 GB submodule. Read the
+    # committed gitlink: `git -C third_party/aiter rev-parse HEAD` would walk up
+    # to the parent repo and return the PR merge SHA when that directory is
+    # uninitialized.
+    tree = subprocess.run(
+        [
+            "git",
+            "-c",
+            f"safe.directory={root.resolve()}",
+            "-C",
+            str(root),
+            "ls-tree",
+            "HEAD",
+            "third_party/aiter",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert len(tree) >= 3 and tree[1] == "commit", tree
+    aiter_sha = tree[2]
+    recipe_hash = jlm.compute_patch_hash(root)
+    cache_id = jlm.compute_cache_id(
+        aiter_sha=aiter_sha,
+        gpu_archs=assets.GPU_ARCHS,
+        patch_hash=recipe_hash,
+        rocm_version=assets.ROCM_VERSION,
+    )
+    assert assets.AITER_SHA == aiter_sha
+    assert assets.ASSET_CONTRACT_VERSION == jlm.ASSET_CONTRACT_VERSION
+    assert assets.JIT_RECIPE_HASH == recipe_hash
+    assert assets.CACHE_ID == cache_id
+    assert assets.RELEASE_TAG == f"jit-libs-{cache_id}"
+    print("PASS test_wheel_asset_binding_matches_current_checkout")
 
 
 def test_verify_mismatched_aiter_sha_is_rebuild():
@@ -160,21 +234,36 @@ def test_verify_rocm_advisory_by_default_strict_optional():
     print("PASS test_verify_rocm_advisory_by_default_strict_optional")
 
 
-def test_normalize_archs_and_patch_hash_none():
+def test_normalize_archs_and_jit_input_hash():
     assert jlm.normalize_archs("gfx950;gfx942") == ["gfx942", "gfx950"]
     assert jlm.normalize_archs("gfx942, gfx950") == ["gfx942", "gfx950"]
     assert jlm.normalize_archs("") == []
     with tempfile.TemporaryDirectory() as td:
-        # No scripts/ dir -> "none".
+        root = Path(td)
+        # No JIT recipe files -> "none".
         assert jlm.compute_patch_hash(td) == "none"
-        # A patch present -> deterministic sha256: prefix.
-        sd = Path(td) / "scripts"
-        sd.mkdir()
-        (sd / "a.patch").write_text("--- patch ---\n")
+
+        jit = root / "jax_aiter" / "jit"
+        jit.mkdir(parents=True)
+        (jit / "build_jit.py").write_text("recipe = 1\n")
+        (jit / "optCompilerConfig.json").write_text("{}\n")
         h1 = jlm.compute_patch_hash(td)
+        assert h1.startswith("sha256:")
+        assert h1 == jlm.compute_patch_hash(td)
+
+        # Unrelated integration patches must not invalidate multi-GB JIT libs.
+        sd = root / "scripts"
+        sd.mkdir()
+        (sd / "maxtext_aiter_fp4.patch").write_text("--- unrelated ---\n")
+        assert jlm.compute_patch_hash(td) == h1
+
+        # JIT recipe and explicitly named JIT patches are hard cache inputs.
+        (jit / "optCompilerConfig.json").write_text('{"changed": true}\n')
         h2 = jlm.compute_patch_hash(td)
-        assert h1.startswith("sha256:") and h1 == h2
-    print("PASS test_normalize_archs_and_patch_hash_none")
+        assert h2 != h1
+        (sd / "aiter_jit_example.patch").write_text("--- jit patch ---\n")
+        assert jlm.compute_patch_hash(td) != h2
+    print("PASS test_normalize_archs_and_jit_input_hash")
 
 
 def _run_all():

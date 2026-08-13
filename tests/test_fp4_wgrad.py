@@ -56,6 +56,7 @@ def test_fp4_backward_shapes_finite():
     assert jnp.all(jnp.isfinite(dw))
 
 
+@pytest.mark.multigpu
 @pytest.mark.skipif(len(jax.devices()) < 2,
                     reason="wgrad sharding test needs >= 2 devices")
 def test_fp4_wgrad_under_fsdp_mesh():
@@ -102,6 +103,7 @@ def test_fp4_wgrad_under_fsdp_mesh():
     assert has_reduction, "Expected wgrad to emit an FSDP-axis reduction in HLO"
 
 
+@pytest.mark.multigpu
 @pytest.mark.skipif(len(jax.devices()) < 2,
                     reason="keyed wgrad sharding test needs >= 2 devices")
 def test_keyed_column_sr_wgrad_under_fsdp_mesh(monkeypatch):

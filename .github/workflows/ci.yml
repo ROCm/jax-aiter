@@ -1,106 +1,146 @@
 name: JAX-AITER CI
 
+# Per-PR checks, split so the GPU pool is held for as little as possible.
+#
+#   cpu  -> build-only-jax-aiter    (no GPU: CI tooling tests, patch check)
+#   gpu  -> linux-jax-aiter-mi355-1 (the PR test tier on one GPU)
+#
+# The 4- and 8-GPU runners are deliberately untouched here; they are heavily
+# contended and belong to the nightly jobs.
+#
+# The JIT libraries are FETCHED, never built: jit-libs.yml is the only producer.
+# JA_SKIP_JIT_BUILD makes a cache miss fail in seconds rather than silently
+# starting a multi-hour build on a shared runner.
+
 on:
   workflow_dispatch:
   pull_request:
-    branches:
-      - main
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
-  IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
-  GPU_ARCHS: "gfx942;gfx950"
+  GPU_ARCHS: gfx950
+  ROCM_VERSION: "7.14.0"
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
-  # Prebuilt JIT-lib release the fetch step pulls the .so's from.
-  JIT_LIBS_RELEASE_TAG: v0.1.0-alpha
 
 jobs:
-  build-and-test:
-    runs-on: [self-hosted, Linux]
-
-    env:
-      CONTAINER_NAME: rv_aiter_ci
-
+  cpu:
+    name: cpu checks
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 15
     steps:
-      - name: Fix permissions from previous Docker run
+      - name: Fix permissions from a previous container run
         run: |
           if [ -d "${{ github.workspace }}" ]; then
-            sudo chown -R $(id -u):$(id -g) "${{ github.workspace }}" || true
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - name: Checkout repository with submodules
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: CI tooling unit tests
+        # These have never run in CI, despite covering the cache logic that
+        # decides whether to spend hours rebuilding the JIT libs. Both files
+        # carry a _run_all() entry point, so they need no pytest on the runner.
+        run: |
+          python3 ci/test_jit_libs_manifest.py
+          python3 ci/perf/test_parse_perf_log.py
+          python3 ci/check_manylinux_policy.py --selftest
+
+      - name: MaxText patch still applies
+        run: |
+          set -euo pipefail
+          base=14aa40b3af3aae793c72bb886533b4e8790ee6fa
+          target=ccd72e63e57193c6f1d51b06bd2e7f52ce895404
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          git -C "$work" init -q
+          git -C "$work" remote add origin https://github.com/ROCm/maxtext.git
+          git -C "$work" fetch -q --depth=1 origin "$target"
+          target_tree="$(git -C "$work" rev-parse FETCH_HEAD)"
+          git -C "$work" fetch -q --depth=1 origin "$base"
+          git -C "$work" checkout -q --detach FETCH_HEAD
+          git -C "$work" apply --check \
+            "${{ github.workspace }}/scripts/maxtext_aiter_fp4.patch"
+          git -C "$work" apply \
+            "${{ github.workspace }}/scripts/maxtext_aiter_fp4.patch"
+          # Intent-to-add makes `git diff` include files created by the patch.
+          git -C "$work" add -N .
+          git -C "$work" diff --quiet --ignore-space-at-eol "$target_tree" --
+          echo "MaxText patch applies to $base and exactly reproduces $target"
+
+  gpu:
+    name: gpu tests (1x MI355)
+    runs-on: linux-jax-aiter-mi355-1
+    timeout-minutes: 60
+    env:
+      CONTAINER_NAME: ja_ci_pr
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
-          fetch-depth: 0
+          # Depth 1 is enough: the only git call is `rev-parse HEAD` on the
+          # AITER submodule, for the JIT-lib cache key. Full history costs
+          # minutes here because the submodules are 4.5 GB.
+          fetch-depth: 1
 
-      - name: Create aiter_build directory
-        run: mkdir -p build/aiter_build
-
-      # Download the prebuilt MHA JIT libs from the release + verify them against
-      # this checkout (aiter SHA + scripts/*.patch hash + GPU archs). On a match
-      # the libs are decompressed into build/aiter_build/ and `rebuild=false`;
-      # on any mismatch/missing asset `rebuild=true` and ci/build.sh rebuilds.
-      - name: Fetch prebuilt JIT libs (verify-or-rebuild)
+      - name: Fetch prebuilt JIT libs
         id: fetch_jit
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_RELEASE_TAG: ${{ env.JIT_LIBS_RELEASE_TAG }}
           GH_REPO: ${{ github.repository }}
-          GPU_ARCHS: ${{ env.GPU_ARCHS }}
-        run: bash ci/fetch_jit_libs.sh
+        run: |
+          mkdir -p build/aiter_build
+          bash ci/fetch_jit_libs.sh
 
-      - name: Pull container image
+      - name: Fail if the JIT libs are missing
+        # Building them here would occupy a shared GPU runner for hours.
+        if: steps.fetch_jit.outputs.rebuild == 'true'
+        run: |
+          echo "::error::No JIT libs matched this AITER pin / arch / JIT recipe." >&2
+          echo "Run the 'JIT libs (build + publish)' workflow, then re-run this job." >&2
+          exit 1
+
+      - name: Pull image
         run: docker pull "$IMAGE"
 
-      - name: Launch build container
+      - name: Launch container
         run: |
-          set -euxo pipefail
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           docker run -d --name "$CONTAINER_NAME" \
-            --network=host \
-            --device=/dev/kfd \
-            --device=/dev/dri \
-            --ipc=host \
-            --shm-size=16G \
-            --group-add=video \
-            --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
-            -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
-            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
-            -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
+            --network=host --device=/dev/kfd --device=/dev/dri \
+            --ipc=host --shm-size=16G --group-add=video \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS -e AITER_ASM_DIR \
             -e HIP_VISIBLE_DEVICES=0 \
             -v "${{ github.workspace }}:/jax-aiter" \
-            -w "/jax-aiter" \
-            "$IMAGE" tail -f /dev/null
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
 
-      - name: Install tooling and JAX runtime
+      - name: Install tooling and JAX
         run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
-      - name: Build (umbrella + JIT[fallback] + FFI + install)
+      - name: Build (umbrella + FFI shims + install)
         run: |
-          docker exec \
-            -e JA_DO_JIT_BUILD="${{ steps.fetch_jit.outputs.rebuild }}" \
-            "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
+          docker exec -e JA_SKIP_JIT_BUILD=true "$CONTAINER_NAME" \
+            bash -lc 'bash ci/build.sh'
 
-      - name: Test (smoke + unit subset, 1 GPU)
-        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/test.sh'
-
-      - name: Build summary
-        if: always()
+      - name: Test (PR tier)
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            echo "=== Build Artifacts ==="
-            echo "Umbrella:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
-            echo "AITER JIT:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None"
-            echo "FFI modules:"; ls -lh build/jax_aiter_build/*.so 2>/dev/null || echo "None"
-          ' || true
+          docker exec -e JA_TEST_TIER=pr "$CONTAINER_NAME" \
+            bash -lc 'bash ci/test.sh'
 
       - name: Cleanup
         if: always()

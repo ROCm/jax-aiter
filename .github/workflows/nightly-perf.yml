@@ -1,147 +1,121 @@
-name: JAX-AITER Nightly Perf (MXFP4 8B)
+name: JAX-AITER Nightly MXFP4 Regression
 
-# Nightly MXFP4 8B FP4 end-to-end throughput leg on all 8 GPUs (FSDP=8).
-#
-# LITE + MHA-INDEPENDENT + ZERO JIT LIBS: this leg uses TE attention
-# (attention=cudnn_flash_te, aiter_attention=False) and MaxText-native RMSNorm,
-# so neither jax-aiter MHA nor jax-aiter RMSNorm is ever exercised. The MXFP4
-# FP4 recipe (quantization=aiter_fp4) needs ONLY the FP4 GEMM + MXFP4 cast +
-# BF16 GEMM FFI shims, which are ALL produced by `make` + `make ja_mods_nomha`
-# (incl. the f4gemm / bf16gemm hsa/codegen.py steps). It therefore builds ZERO
-# JIT libs (JA_SKIP_JIT_BUILD=true -> build_jit.py skipped) and installs the
-# LITE wheel. It does NOT build/download the multi-GB libmha_*.so or
-# librmsnorm_fwd.so, and is fully decoupled from the prebuilt-.so release-asset
-# hosting used by ci.yml / nightly-ci.yml.
-#
-# RECORD mode for now (no --gate). After the first green run:
-#   1. download the perf-8b-fp4 artifact, copy perf_8b_fp4.json ->
-#      ci/perf/baseline_8b_fp4.json, and commit it;
-#   2. add `--gate` to the "Parse perf log" step below to turn on the
-#      >5%-below-baseline throughput hard-gate (loss stays soft-warn only).
+# One canonical FSDP4 process on the 4-GPU pool. This is a regression detector,
+# not the FSDP8 publication operating point. Record-only until the first
+# TheRock 7.14 / JAX 0.11 baseline is reviewed and committed.
+
 on:
   workflow_dispatch:
+    inputs:
+      wheel_url:
+        description: "Default alpha2 wheel URL"
+        type: string
+        default: "https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl"
   schedule:
-    - cron: '0 6 * * *'   # after nightly-ci (01:00)
+    - cron: '0 6 * * *'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false   # don't kill an in-flight benchmark
+  group: nightly-mxfp4-fsdp4
+  # Do not cancel a process after spending the compilation/warm-up cost.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
-  IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
-  JA_ROOT_DIR: /jax-aiter
-  AITER_SYMBOL_VISIBLE: 1
-  GPU_ARCHS: "gfx942;gfx950"
-  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
-  # Host-side idle-GPU gate (relocated out of jax-aiter). Override per-runner.
-  WAIT_FOR_IDLE_GPU_SCRIPT: /home/ruvaidya/aiter_proj/scripts/wait_for_idle_gpu.sh
+  IMAGE: ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14
+  CONTAINER_NAME: ja_perf_fsdp4
+  WHEEL_URL: ${{ inputs.wheel_url || 'https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl' }}
 
 jobs:
-  perf-8b-fp4:
-    runs-on: [self-hosted, Linux]
-
-    env:
-      CONTAINER_NAME: rv_aiter_perf
-
+  mxfp4-fsdp4:
+    name: MXFP4 Llama 3.1 8B (4x MI355)
+    runs-on: linux-jax-aiter-mi355-4
+    timeout-minutes: 180
     steps:
-      - name: Fix permissions from previous Docker run
+      - name: Fix permissions from a previous container run
         run: |
           if [ -d "${{ github.workspace }}" ]; then
-            sudo chown -R $(id -u):$(id -g) "${{ github.workspace }}" || true
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - name: Checkout repository with submodules
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
-      - name: Wait for idle GPU (shared-node gate)
+      - name: Download alpha2 default wheel
         run: |
-          set -uo pipefail
-          S="${WAIT_FOR_IDLE_GPU_SCRIPT:-}"
-          if [ -n "$S" ] && [ -x "$S" ] && command -v rocm-smi >/dev/null 2>&1; then
-            echo "Gating on $S"
-            bash "$S"
-          else
-            echo "WARN: GPU idle gate skipped ('$S' not executable or rocm-smi missing)."
-          fi
+          mkdir -p dist
+          # Keep the published filename: pip reads the platform tag from it.
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "dist/$(basename "$WHEEL_URL")" "$WHEEL_URL"
 
-      - name: Pull container image
+      - name: Pull runtime image
         run: docker pull "$IMAGE"
 
-      - name: Launch perf container (all 8 GPUs)
+      - name: Launch isolated 4-GPU container
         run: |
-          set -euxo pipefail
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           docker run -d --name "$CONTAINER_NAME" \
-            --network=host \
-            --device=/dev/kfd \
-            --device=/dev/dri \
-            --ipc=host \
-            --shm-size=16G \
-            --group-add=video \
-            --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
-            -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
-            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
-            -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
+            --network=host --device=/dev/kfd --device=/dev/dri \
+            --ipc=host --shm-size=64G --group-add=video \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e GPU_ARCHS=gfx950 -e AITER_SYMBOL_VISIBLE=1 \
+            -e HIP_VISIBLE_DEVICES=0,1,2,3 \
             -v "${{ github.workspace }}:/jax-aiter" \
-            -w "/jax-aiter" \
-            "$IMAGE" tail -f /dev/null
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
 
-      - name: Install tooling and JAX runtime
-        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
-
-      # LITE build: core (non-MHA) FFI shims + lite wheel ONLY -- ZERO JIT libs.
-      # JA_SKIP_JIT_BUILD=true skips build_jit.py entirely; the FP4 GEMM + MXFP4
-      # cast + BF16 GEMM shims come from `make` + `make ja_mods_nomha`. No
-      # libmha_*.so / librmsnorm_fwd.so build, no release-asset download.
-      - name: Build jax-aiter (LITE -- core shims only, NO JIT libs)
+      - name: Install JAX, JAX-AITER, and MHA assets
         run: |
-          docker exec \
-            -e JA_SKIP_JIT_BUILD=true \
-            -e JA_MODS_TARGET=ja_mods_nomha \
-            -e JA_WHEEL_VARIANT=lite \
-            "$CONTAINER_NAME" bash -lc 'bash ci/build.sh'
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            bash ci/setup_jax.sh --jax-only
+            shopt -s nullglob
+            wheels=(dist/jax_aiter-0.1.0a2-*.whl)
+            test "${#wheels[@]}" -eq 1
+            python3 -m pip install --break-system-packages "${wheels[0]}"
+            cd /tmp
+            jax-aiter-fetch-mha
+            python3 -c "import jax; from jax_aiter.mha import flash_attn_func; print(jax.devices(), flash_attn_func)"
+          '
 
-      - name: Run 8B FP4 perf leg (5 warmup + 50 timed steps)
+      - name: Run canonical MXFP4 FSDP4 process
         run: |
           docker exec \
             -e PERF_OUT_DIR=/jax-aiter/ci_perf_out \
             -e MAXTEXT_DIR=/maxtext_perf \
             "$CONTAINER_NAME" bash -lc 'bash ci/perf/run_8b_fp4.sh'
 
-      - name: Parse perf log (record mode)
+      - name: Hand perf output back to the runner user
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            python3 ci/perf/parse_perf_log.py \
-              --log ci_perf_out/8b_fp4/train.log \
-              --out-json ci_perf_out/perf_8b_fp4.json \
-              --label 8b_fp4 \
-              --tail-n 10 \
-              --step-summary ci_perf_out/perf_8b_fp4_summary.md
-          ' || echo "parse step skipped/failed (record-only; see train.log)"
+          if [ -d "${{ github.workspace }}/ci_perf_out" ]; then
+            sudo chown -R "$(id -u):$(id -g)" \
+              "${{ github.workspace }}/ci_perf_out"
+          fi
 
-      - name: Write GitHub step summary
+      - name: Parse tail-10 (record-only)
+        if: always()
+        run: |
+          python3 ci/perf/parse_perf_log.py \
+            --log ci_perf_out/mxfp4/train.log \
+            --out-json ci_perf_out/perf_8b_fp4.json \
+            --label 8b_fp4 --tail-n 10 \
+            --step-summary ci_perf_out/perf_8b_fp4_summary.md
+
+      - name: Write step summary
         if: always()
         run: |
           if [ -f ci_perf_out/perf_8b_fp4_summary.md ]; then
             cat ci_perf_out/perf_8b_fp4_summary.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "No perf summary produced (training may have failed)." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload perf artifacts
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: perf-8b-fp4
+          name: perf-8b-fp4-fsdp4
           path: |
-            ci_perf_out/8b_fp4/train.log
-            ci_perf_out/8b_fp4/warmup.log
+            ci_perf_out/mxfp4/train.log
             ci_perf_out/perf_8b_fp4.json
             ci_perf_out/perf_8b_fp4_summary.md
           if-no-files-found: warn

@@ -29,13 +29,6 @@ SYMBOL_TO_MODULE_MAP = {
     "RmsnormFwdJA": "rmsnorm_fwd_ja.so",
     "SiluAndMulJA": "silu_and_mul_ja.so",
     "GemmFwdJA": "gemm_fwd_ja.so",
-    "GemmBwdMaskedJA": "gemm_bwd_masked_ja.so",
-    "GemmBwdFusedJA": "gemm_bwd_fused_ja.so",
-    "GemmDbTiledJA": "gemm_db_tiled_ja.so",
-    "GemmFp8Mi350FwdJA": "gemm_fp8_mi350_ja.so",
-    "GemmFp8CkJA": "gemm_fp8_ck_ja.so",
-    "FlatmmFp8FwdJA": "flatmm_fp8_ja.so",
-    "GemmI8FwdJA": "gemm_i8_ja.so",
     "GemmFp4FwdJA": "gemm_fp4_ja.so",
     "CastMxfp4JA": "cast_mxfp4_ja.so",
     "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so",
@@ -87,17 +80,21 @@ def load_thin_modules():
     if not _umbrella_handle:
         raise RuntimeError("Umbrella library must be loaded first")
 
-    build_root = ja_config.get_lib_root()
-    aiter_dir = build_root / "aiter_build"
-    ja_dir = build_root / "jax_aiter_build"
+    # The default wheel packages thin FFI shims but downloads the multi-GB JIT
+    # libraries into a writable user cache. These directories can therefore
+    # have different roots.
+    aiter_dir = ja_config.get_aiter_lib_dir()
+    ja_dir = ja_config.get_jax_aiter_lib_dir()
 
-    def _load_modules(dir_path):
+    def _load_modules(dir_path, skip_names=frozenset()):
         loaded = []
         if not dir_path.exists():
             return loaded
 
         for module_so in sorted(dir_path.glob("*.so")):
             if module_so.name == "libjax_aiter.so":
+                continue
+            if module_so.name in skip_names or module_so.name in _module_handles:
                 continue
             try:
                 module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
@@ -113,8 +110,16 @@ def load_thin_modules():
     if aiter_loaded:
         logger.info(f"Loaded aiter_build modules: {aiter_loaded}")
 
-    # Then load jax_aiter_build modules
-    ja_loaded = _load_modules(ja_dir)
+    # Then load jax_aiter_build modules. The default wheel contains the MHA
+    # shims but downloads their backing JIT libraries later; do not dlopen the
+    # shims until their symbols can resolve.
+    aiter_available = set(_module_handles)
+    skip_ja = set()
+    if "libmha_fwd.so" not in aiter_available:
+        skip_ja.add("mha_fwd_ja.so")
+    if "libmha_bwd.so" not in aiter_available:
+        skip_ja.add("mha_bwd_ja.so")
+    ja_loaded = _load_modules(ja_dir, skip_ja)
     if ja_loaded:
         logger.info(f"Loaded jax_aiter_build modules: {ja_loaded}")
 
@@ -154,6 +159,13 @@ def register_ffi_target(target_name: str, platform: str = "ROCM"):
         load_umbrella_library()
         load_thin_modules()
 
+    # A caller can fetch optional MHA libraries in the same Python process
+    # after core ops initialized the registry. Retry loading when this target's
+    # module was previously unavailable; already-loaded modules are skipped.
+    module_name = SYMBOL_TO_MODULE_MAP[target_name]
+    if module_name not in _module_handles:
+        load_thin_modules()
+
     logger.info(f"Registering FFI target: {target_name}")
 
     try:
@@ -173,14 +185,6 @@ def register_ffi_target(target_name: str, platform: str = "ROCM"):
 
         if target_name == "GemmFwdJA":
             _preload_gemm_kernels(module_name)
-        elif target_name == "GemmBwdMaskedJA":
-            _preload_bwd_masked_kernels(module_name)
-        elif target_name == "GemmBwdFusedJA":
-            _preload_bwd_fused_kernels(module_name)
-        elif target_name == "GemmDbTiledJA":
-            _preload_db_tiled_kernels(module_name)
-        elif target_name == "GemmFp8Mi350FwdJA":
-            _preload_fp8_kernels(module_name)
 
     except Exception as e:
         logger.error(f"Failed to register FFI target '{target_name}': {e}")
@@ -198,58 +202,6 @@ def _preload_gemm_kernels(module_name: str):
             preload_fn()
     except Exception as e:
         logger.warning(f"Failed to preload GEMM kernels: {e}")
-
-
-def _preload_bwd_masked_kernels(module_name: str):
-    """Pre-load BF16 GEMM kernels for masked backward on all visible devices."""
-    try:
-        handle = _module_handles.get(module_name)
-        if handle is None:
-            return
-        preload_fn = getattr(handle, "gemm_bwd_masked_ja_preload_kernels", None)
-        if preload_fn is not None:
-            preload_fn()
-    except Exception as e:
-        logger.warning(f"Failed to preload masked backward GEMM kernels: {e}")
-
-
-def _preload_db_tiled_kernels(module_name: str):
-    """Pre-load BF16 GEMM kernels for tiled dB on all visible devices."""
-    try:
-        handle = _module_handles.get(module_name)
-        if handle is None:
-            return
-        preload_fn = getattr(handle, "gemm_db_tiled_ja_preload_kernels", None)
-        if preload_fn is not None:
-            preload_fn()
-    except Exception as e:
-        logger.warning(f"Failed to preload tiled dB kernels: {e}")
-
-
-def _preload_bwd_fused_kernels(module_name: str):
-    """Pre-load BF16 GEMM kernels for fused backward on all visible devices."""
-    try:
-        handle = _module_handles.get(module_name)
-        if handle is None:
-            return
-        preload_fn = getattr(handle, "gemm_bwd_fused_ja_preload_kernels", None)
-        if preload_fn is not None:
-            preload_fn()
-    except Exception as e:
-        logger.warning(f"Failed to preload fused backward GEMM kernels: {e}")
-
-
-def _preload_fp8_kernels(module_name: str):
-    """Pre-load FP8 GEMM kernels on all visible devices."""
-    try:
-        handle = _module_handles.get(module_name)
-        if handle is None:
-            return
-        preload_fn = getattr(handle, "gemm_fp8_mi350_ja_preload_kernels", None)
-        if preload_fn is not None:
-            preload_fn()
-    except Exception as e:
-        logger.warning(f"Failed to preload FP8 kernels: {e}")
 
 
 def get_available_symbols() -> List[str]:

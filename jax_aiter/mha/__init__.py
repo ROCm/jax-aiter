@@ -11,12 +11,11 @@ Public API:
     flash_attn_func: Batch flash attention with custom_vjp
     flash_attn_varlen: Variable-length flash attention with custom_vjp
 
-Lite-variant guard: the lite wheel ships without the MHA kernels (the
-multi-GB ``libmha_fwd.so``/``libmha_bwd.so`` JIT libs and their
-``mha_*_ja.so`` FFI shims are dropped). If those libs are absent we raise a
-clear ``ModuleNotFoundError`` here at import time instead of surfacing a
-cryptic FFI "Module not loaded" RuntimeError deep inside the first
-``flash_attn_func`` call.
+Default-wheel guard: the wheel includes the thin ``mha_*_ja.so`` FFI shims but
+omits the multi-GB ``libmha_fwd.so``/``libmha_bwd.so`` JIT libraries. Users add
+those with ``jax-aiter-fetch-mha``. If they are absent we raise a clear
+``ModuleNotFoundError`` here instead of surfacing a cryptic FFI
+"Module not loaded" RuntimeError deep inside the first ``flash_attn_func`` call.
 """
 
 from ..ja_compat import config as _ja_config
@@ -26,22 +25,33 @@ def _mha_libs_present() -> bool:
     """True iff both the MHA JIT lib and its FFI shim are on disk.
 
     Works for the dev layout (``$JA_ROOT_DIR/build/...``) and the installed
-    wheel layout (``jax_aiter/_lib/...``); both are resolved by
-    ``ja_compat.config.get_lib_root()``.
+    wheel layout, where downloaded JIT libraries live in a versioned user cache
+    and thin FFI shims stay under ``jax_aiter/_lib``.
     """
     try:
-        lib_root = _ja_config.get_lib_root()
-        aiter_lib = lib_root / "aiter_build" / "libmha_fwd.so"
-        ja_shim = lib_root / "jax_aiter_build" / "mha_fwd_ja.so"
-        return bool(aiter_lib.exists() and ja_shim.exists())
+        aiter_dir = _ja_config.get_aiter_lib_dir()
+        ja_dir = _ja_config.get_jax_aiter_lib_dir()
+        return bool(
+            (aiter_dir / "libmha_fwd.so").is_file()
+            and (aiter_dir / "libmha_bwd.so").is_file()
+            and (ja_dir / "mha_fwd_ja.so").is_file()
+            and (ja_dir / "mha_bwd_ja.so").is_file()
+        )
     except Exception:
         return False
 
 
 if not _mha_libs_present():
     raise ModuleNotFoundError(
-        "jax_aiter was built as the 'lite' variant without MHA kernels; "
-        "install the 'full' variant to use flash attention."
+        "jax_aiter is installed without the flash-attention libraries.\n"
+        "\n"
+        "They are ~2.6 GB, so the default wheel omits them. Download the\n"
+        "prebuilt ones (a minute or two, versus a 2-3 hour source build):\n"
+        "\n"
+        "    jax-aiter-fetch-mha\n"
+        "\n"
+        "Everything else -- MXFP4/FP4 GEMM, BF16 GEMM, MXFP4 cast, RMSNorm,\n"
+        "SiLU-and-Mul -- works without them."
     )
 
 from .mha import (

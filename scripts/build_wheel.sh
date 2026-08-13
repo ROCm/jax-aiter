@@ -6,9 +6,10 @@
 # JIT libs in build/aiter_build/. This is a pure STAGING operation: it never
 # invokes build_jit.py and never rebuilds the multi-GB MHA libs.
 #
-#   lite  -> drops libmha_fwd.so / libmha_bwd.so + their mha_*_ja.so shims
-#            (and the stale moe_fwd_ja.so); carries a +lite local version tag.
-#   full  -> ships everything (default of setup.py's JA_WHEEL_VARIANT).
+#   lite  -> default/PyPI wheel: keeps the thin MHA shims but drops the two
+#            multi-GB JIT libs (and stale moe_fwd_ja.so). Users complete it with
+#            `jax-aiter-fetch-mha`. Carries the public/base version.
+#   full  -> GitHub-only convenience artifact with everything; carries +full.
 #
 # HARD GUARANTEE: build/aiter_build/*.so is snapshotted (sha256) before the
 # build and re-checked after. If it changed, the script aborts non-zero --
@@ -32,8 +33,8 @@ usage() {
   cat >&2 <<'EOF'
 usage: scripts/build_wheel.sh [--variant {lite|full}] [-h|--help]
 
-  --variant lite   (default) drop MHA libs + shims; +lite local version tag
-  --variant full   ship everything (no +lite tag)
+  --variant lite   (default/PyPI) keep MHA shims, drop only MHA JIT libs
+  --variant full   (GitHub asset) ship everything; +full local version tag
 
 Reuses build/aiter_build/*.so as-is (never rebuilds MHA). Aborts if those
 libs change. Env override: PIP_EXTRA_ARGS (e.g. --break-system-packages).
@@ -98,14 +99,11 @@ fi
 # Step 6: intentionally SKIP build_jit.py -- all AITER JIT libs are reused
 # from build/aiter_build/ as-is (rebuilding MHA would cost hours).
 
-# Step 7: build the thin FFI shims (incremental; hipcc no-ops if up-to-date).
-if [[ "$VARIANT" == "lite" ]]; then
-  echo "[build_wheel] make ja_mods_nomha (core shims only)"
-  make ja_mods_nomha
-else
-  echo "[build_wheel] make ja_mods (core + MHA shims)"
-  make ja_mods
-fi
+# Step 7: build every thin FFI shim (incremental; hipcc no-ops if up-to-date).
+# The lite wheel keeps the MHA shims: fetching only libmha_{fwd,bwd}.so must be
+# enough to make attention importable without rebuilding the wheel.
+echo "[build_wheel] make ja_mods (core + MHA shims)"
+make ja_mods
 
 # Step 8: stale-artifact guard -- moe_fwd_ja.so has no source, must not ship.
 rm -f build/jax_aiter_build/moe_fwd_ja.so
@@ -130,8 +128,14 @@ echo "[build_wheel] sha256 guard OK -- build/aiter_build/*.so unchanged"
 # Step 11: report the wheel + total wall time.
 echo "[build_wheel] wheel(s) in dist/:"
 if [[ "$VARIANT" == "lite" ]]; then
-  ls -lh dist/jax_aiter-*+lite-*.whl 2>/dev/null || ls -lh dist/
+  python3 - <<'PY'
+from pathlib import Path
+
+for wheel in sorted(Path("dist").glob("jax_aiter-*.whl")):
+    if "+full" not in wheel.name:
+        print(f"{wheel.stat().st_size / (1024 * 1024):.1f} MiB  {wheel}")
+PY
 else
-  ls -lh dist/
+  ls -lh dist/jax_aiter-*+full-*.whl 2>/dev/null || ls -lh dist/
 fi
 echo "[build_wheel] DONE (variant=$VARIANT) in ${SECONDS}s wall time"

@@ -8,7 +8,7 @@
 # SIBLING container and runs the variant's smoke test(s). This proves a
 # downstream user can install and run the wheel with no source tree.
 #
-#   lite -> FP4 GEMM smoke (smoke_fp4_gemm.py).
+#   lite -> FP4 GEMM smoke; then MHA must fail with the fetch command named.
 #   full -> FP4 GEMM smoke + MHA flash-attn fwd/bwd smoke (smoke_mha.py),
 #           proving the bundled libmha_fwd/bwd.so load + run from the wheel.
 #
@@ -43,10 +43,20 @@ fi
 # Resolve the wheel to test (explicit path wins; else newest matching dist/).
 if [[ -z "$WHEEL" ]]; then
   if [[ "$VARIANT" == "lite" ]]; then
-    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*+lite-*.whl 2>/dev/null | head -n1 || true)"
+    WHEEL="$(python3 - "$REPO/dist" <<'PY'
+from pathlib import Path
+import sys
+
+wheels = sorted(
+    (p for p in Path(sys.argv[1]).glob("jax_aiter-*.whl") if "+full" not in p.name),
+    key=lambda p: p.stat().st_mtime,
+    reverse=True,
+)
+print(wheels[0] if wheels else "")
+PY
+)"
   else
-    # full = the non-+lite wheel.
-    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*-cp312-*.whl 2>/dev/null | grep -v '+lite' | head -n1 || true)"
+    WHEEL="$(ls -t "$REPO"/dist/jax_aiter-*+full-*.whl 2>/dev/null | head -n1 || true)"
   fi
 fi
 if [[ -z "$WHEEL" || ! -f "$WHEEL" ]]; then
@@ -63,7 +73,10 @@ docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO/docker/validation"
 
 # Smoke command per variant.
 if [[ "$VARIANT" == "lite" ]]; then
-  SMOKE="python /test/smoke_fp4_gemm.py"
+  SMOKE="python /test/smoke_fp4_gemm.py && \
+    python /test/check_mha_guard.py && \
+    jax-aiter-fetch-mha && \
+    python /test/smoke_mha.py"
 else
   SMOKE="python /test/smoke_fp4_gemm.py && python /test/smoke_mha.py"
 fi
@@ -72,9 +85,14 @@ fi
 echo "[validate_wheel] docker run smoke ($VARIANT)"
 docker run --rm \
   --device=/dev/kfd --device=/dev/dri --group-add video \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp/ja-home -e XDG_CACHE_HOME=/tmp/ja-home/.cache \
+  -e GPU_ARCHS=gfx950 \
   -v "$REPO/dist:/dist:ro" \
   -v "$REPO/docker/validation:/test:ro" \
   "$IMAGE_TAG" \
-  bash -lc "pip install --break-system-packages /dist/$WHEEL_BASE && $SMOKE"
+  bash -lc "mkdir -p /tmp/ja-home /tmp/ja-install && \
+    python -m pip install --target /tmp/ja-install --no-deps /dist/$WHEEL_BASE && \
+    export PYTHONPATH=/tmp/ja-install PATH=/tmp/ja-install/bin:\$PATH && $SMOKE"
 
 echo "[validate_wheel] PASS ($VARIANT)"

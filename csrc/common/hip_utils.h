@@ -3,13 +3,19 @@
 
 #pragma once
 #include "logging.h"
+#include <cstdio>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
 
 namespace jax_aiter {
 
 inline void hipCheck(hipError_t err, const char *file, int line) {
   if (err != hipSuccess) {
-    JA_LOG("HIP error at %s:%d: %s", file, line, hipGetErrorString(err));
+    // Reported unconditionally, not through JA_LOG: no build path defines
+    // JAX_AITER_DEBUG, so routing this through it aborted with no message at all.
+    std::fprintf(stderr, "[jax-aiter] HIP error at %s:%d: %s\n", file, line,
+                 hipGetErrorString(err));
+    std::fflush(stderr);
     std::abort();
   }
 }

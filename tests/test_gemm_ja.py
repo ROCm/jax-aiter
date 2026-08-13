@@ -125,9 +125,15 @@ def test_gemm_fwd_accuracy(M, N, K, dtype):
     assert_close(out, ref, dtype, f"fwd {M}x{N}x{K}", K=K)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("M,N,K,dtype", LLAMA70B_CONFIGS)
 def test_gemm_fwd_llama70b(M, N, K, dtype):
-    """Forward accuracy for Llama3-70B projection shapes."""
+    """Forward accuracy for Llama3-70B projection shapes.
+
+    Nightly only: these run up to M=32768 x N=28672 x K=8192, which is roughly
+    7.7 GFLOP of reference float32 per case on top of the kernel itself.
+    test_gemm_fwd_accuracy covers the same code path at PR-sized shapes.
+    """
     a, b = make_ab(M, N, K, dtype, seed=7)
     out = gemm(a, b)
     ref = gemm_ref(a, b)

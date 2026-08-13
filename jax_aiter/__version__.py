@@ -3,8 +3,9 @@
 """Single source of truth for the jax_aiter package version.
 
 `setup.py` parses ``__version__`` from this file (without importing the
-package) and appends a ``+lite`` local-version tag for the lite wheel
-variant. Keep this as a plain string literal so the parse stays trivial.
+package). The default/PyPI wheel uses this public version; the oversized
+GitHub-only artifact appends ``+full``. Keep this as a plain string literal so
+the parse stays trivial.
 """
 
-__version__ = "0.1.0a0"
+__version__ = "0.1.0a2"

@@ -1,0 +1,243 @@
+name: JIT libs (build + publish)
+
+# The only JIT-library producer. Hard inputs map to one immutable release:
+#   AITER SHA + gfx arch + ROCm version + JIT recipe/ABI hash.
+# Existing matching releases return from preflight without pulling an image.
+# Manifest-only corrections repackage verified blobs under a new contract ID;
+# they do not justify recompiling unchanged binaries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_archs:
+        description: Semicolon-separated arch list
+        type: string
+        default: gfx950
+  workflow_call:
+    inputs:
+      gpu_archs:
+        type: string
+        default: gfx950
+  push:
+    branches: [main, feature/alpha2-overhaul]
+    paths:
+      - third_party/aiter
+      - scripts/aiter_jit_*.patch
+      - jax_aiter/jit/**
+      - ci/setup_jax.sh
+      - ci/jit_libs_manifest.py
+      - ci/publish_jit_libs.sh
+      - .github/workflows/jit-libs.yml
+      - Makefile
+      - csrc/common/**
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jit-libs
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+  GPU_ARCHS: ${{ inputs.gpu_archs || 'gfx950' }}
+  ROCM_VERSION: "7.14.0"
+
+jobs:
+  preflight:
+    name: resolve immutable JIT identity
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 20
+    outputs:
+      tag: ${{ steps.cache.outputs.tag }}
+      exists: ${{ steps.existing.outputs.exists }}
+      source_sha: ${{ steps.cache.outputs.source_sha }}
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Compute immutable asset tag
+        id: cache
+        run: |
+          tag="$(python3 ci/jit_libs_manifest.py cache-id \
+            --repo-root . --gpu-archs "$GPU_ARCHS" \
+            --rocm-version "$ROCM_VERSION" --prefix jit-libs)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "immutable JIT release: $tag"
+
+      - name: Reuse an existing immutable release
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.cache.outputs.tag }}"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            work="$(mktemp -d)"
+            trap 'rm -rf "$work"' EXIT
+            gh release download "$tag" --repo "${{ github.repository }}" \
+              --pattern manifest.json --dir "$work"
+            GITHUB_OUTPUT="" python3 ci/jit_libs_manifest.py verify \
+              --repo-root . --manifest "$work/manifest.json" \
+              --gpu-archs "$GPU_ARCHS" --rocm-version "$ROCM_VERSION" \
+              --strict-rocm
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "matching immutable assets already exist"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: build ${{ matrix.module }}
+    needs: preflight
+    if: needs.preflight.outputs.exists != 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - module: librmsnorm_fwd
+            runner: build-only-jax-aiter
+            timeout: 180
+          - module: libmha_fwd
+            runner: linux-jax-aiter-mi355-1
+            timeout: 720
+          - module: libmha_bwd
+            runner: linux-jax-aiter-mi355-4
+            timeout: 720
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      CONTAINER_NAME: ja_jit_${{ matrix.module }}_${{ github.run_id }}
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Launch GPU-less build container
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host --ipc=host --shm-size=16G \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS \
+            -e AITER_ASM_DIR -e ROCM_VERSION \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
+
+      - name: Install tooling and JAX
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
+
+      - name: Build required umbrella library
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            make
+            test -s build/jax_aiter_build/libjax_aiter.so
+          '
+
+      - name: Build ${{ matrix.module }}
+        # Do not pass --verbose: it produced a 92 MB log and added substantial
+        # output overhead to the previous monolithic build.
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc \
+            'python3 jax_aiter/jit/build_jit.py --module "${{ matrix.module }}"'
+
+      - name: Verify and hand output to runner
+        run: |
+          test -s "build/aiter_build/${{ matrix.module }}.so"
+          sudo chown "$(id -u):$(id -g)" \
+            "build/aiter_build/${{ matrix.module }}.so"
+          ls -lh "build/aiter_build/${{ matrix.module }}.so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jit-raw-${{ matrix.module }}
+          path: build/aiter_build/${{ matrix.module }}.so
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
+
+  publish:
+    name: publish immutable JIT release
+    needs: [preflight, build]
+    if: needs.preflight.outputs.exists != 'true' && needs.build.result == 'success'
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 180
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: jit-raw-*
+          path: build/aiter_build
+          merge-multiple: true
+
+      - name: Verify complete module set
+        run: |
+          test -s build/aiter_build/librmsnorm_fwd.so
+          test -s build/aiter_build/libmha_fwd.so
+          test -s build/aiter_build/libmha_bwd.so
+          ls -lh build/aiter_build/*.so
+
+      - name: Stage compressed assets and manifest
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          bash ci/publish_jit_libs.sh \
+            --tag "${{ needs.preflight.outputs.tag }}" --no-upload
+
+      - name: Create immutable release at the source commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ needs.preflight.outputs.tag }}"
+          gh release create "$tag" \
+            --repo "${{ github.repository }}" \
+            --target "${{ needs.preflight.outputs.source_sha }}" \
+            --title "AITER JIT libraries $tag" \
+            --prerelease \
+            --notes "Immutable prebuilt AITER JIT libraries. Identity: AITER SHA + gfx architecture + ROCm version + JIT recipe/ABI hash."
+
+      - name: Upload immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ needs.preflight.outputs.tag }}"
+          shopt -s nullglob
+          assets=(build/jit_libs_dist/*)
+          test "${#assets[@]}" -gt 1
+          gh release upload "$tag" --repo "${{ github.repository }}" \
+            "${assets[@]}"
