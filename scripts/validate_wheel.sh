@@ -81,13 +81,32 @@ else
   SMOKE="python /test/smoke_fp4_gemm.py && python /test/smoke_mha.py"
 fi
 
+# This container runs as a non-root user on purpose, which means it can only
+# open the GPU device nodes if that user is in the groups owning them. Group
+# NAMES resolve against the container's /etc/group, which need not agree with
+# the host, so pass the host's numeric GIDs. Without them /dev/dri is mounted
+# yet hipInit still reports HIP_ERROR_NoDevice, and whether it works depends on
+# which groups happen to own the device nodes on a given runner.
+mapfile -t DEV_GIDS < <(
+  for dev in /dev/kfd /dev/dri/renderD*; do
+    [[ -e "$dev" ]] || continue
+    stat -c '%g' "$dev"
+  done | sort -u
+)
+GROUP_ARGS=(--group-add video)
+for gid in "${DEV_GIDS[@]}"; do
+  GROUP_ARGS+=(--group-add "$gid")
+done
+echo "[validate_wheel] device groups: ${GROUP_ARGS[*]}"
+
 # Run the smoke test(s) in a fresh sibling container with GPU access.
+# One GPU is enough for these smokes, and it matches the 1x validation job.
 echo "[validate_wheel] docker run smoke ($VARIANT)"
 docker run --rm \
-  --device=/dev/kfd --device=/dev/dri --group-add video \
+  --device=/dev/kfd --device=/dev/dri "${GROUP_ARGS[@]}" \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp/ja-home -e XDG_CACHE_HOME=/tmp/ja-home/.cache \
-  -e GPU_ARCHS=gfx950 \
+  -e GPU_ARCHS=gfx950 -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
   -v "$REPO/dist:/dist:ro" \
   -v "$REPO/docker/validation:/test:ro" \
   "$IMAGE_TAG" \
