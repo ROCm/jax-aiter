@@ -99,13 +99,12 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
-            # The manylinux image is intentionally minimal. --jax-only uses
-            # --no-deps so first provide JAX's runtime requirements.
+            # The manylinux image is minimal. --jax-only uses --no-deps, so
+            # provide the JAX runtime requirements first.
             python3 -m pip install --break-system-packages \
               numpy ml_dtypes scipy opt_einsum
             bash ci/setup_jax.sh --jax-only
-            python3 -m pip install --break-system-packages \
-              cmake ninja pyyaml psutil wheel auditwheel
+            python3 -m pip install --break-system-packages auditwheel
           '
 
       - name: Build default/PyPI-shaped wheel

@@ -41,7 +41,7 @@ def external_libraries(auditwheel_output: str) -> set[str]:
 
 def check(wheel: Path, max_minor: int) -> int:
     proc = subprocess.run(
-        ["auditwheel", "show", str(wheel)],
+        [sys.executable, "-m", "auditwheel", "show", str(wheel)],
         text=True,
         capture_output=True,
     )
