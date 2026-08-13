@@ -104,7 +104,7 @@ jobs:
             python3 -m pip install --break-system-packages \
               numpy ml_dtypes scipy opt_einsum
             bash ci/setup_jax.sh --jax-only
-            python3 -m pip install --break-system-packages auditwheel
+            python3 -m pip install --break-system-packages pandas auditwheel
           '
 
       - name: Build umbrella and FFI shims
