@@ -20,7 +20,7 @@ on:
 
 concurrency:
   group: release-${{ inputs.tag }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -107,7 +107,18 @@ jobs:
             python3 -m pip install --break-system-packages auditwheel
           '
 
-      - name: Build default/PyPI-shaped wheel
+      - name: Build umbrella and FFI shims
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            make
+            make ja_mods
+            test -s build/jax_aiter_build/libjax_aiter.so
+            test -s build/jax_aiter_build/mha_fwd_ja.so
+            test -s build/jax_aiter_build/mha_bwd_ja.so
+          '
+
+      - name: Package default/PyPI-shaped wheel
         run: |
           docker exec -e PIP_EXTRA_ARGS=--break-system-packages \
             "$CONTAINER_NAME" bash -lc \
@@ -157,7 +168,7 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker rm -f "$CONTAINER_NAME" || true
+        run: timeout --kill-after=10s 60s docker rm -f "$CONTAINER_NAME" || true
 
   validate-and-publish:
     name: validate on 1x MI355 + publish
