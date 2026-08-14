@@ -11,9 +11,18 @@
 #
 # TheRock 7.14 GA ships ROCm through the rocm-sdk pip packages (no /opt/rocm)
 # but no importable JAX stack. Install the same four PyPI distributions CI uses.
-# Runtime-only base: validation installs and runs a wheel; it never invokes a
-# compiler. The dev image adds a multi-GB LLVM layer for no benefit here.
-FROM ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14
+#
+# Base choice is about transfer cost, not content. The runtime-only
+# jax-base-ubu24 image would be the natural fit -- validation never invokes a
+# compiler -- but its 3.39 GB ROCm layer has a different digest from the
+# jax-dev-ubu24 one, and only this image ever pulls it. That left a cold runner
+# spending over an hour fetching it, which timed out three release attempts.
+# jax-dev-ubu24 is pulled by ci.yml on every PR, so the same mi355 nodes almost
+# always have its layers cached and docker reuses them by digest. The extra LLVM
+# layer is unused here; nothing in the smoke tests compiles, and the clean-room
+# guarantees that matter are unchanged: no AITER source, no MaxText, no build of
+# this repo, and the wheel is pip-installed as a non-root user.
+FROM ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
 
 ARG JAX_VERSION=0.11.0
 

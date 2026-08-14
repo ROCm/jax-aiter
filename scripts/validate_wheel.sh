@@ -21,8 +21,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG="jax-aiter-validate:clean"
 DOCKERFILE="$REPO/docker/validation/Dockerfile.lite"
+IMAGE_TAG="$(bash "$REPO/ci/validation_image_id.sh")"
 
 VARIANT="lite"
 WHEEL=""
@@ -67,9 +67,20 @@ fi
 WHEEL_BASE="$(basename "$WHEEL")"
 echo "[validate_wheel] variant=$VARIANT wheel=$WHEEL_BASE"
 
-# Build the clean validation image (cached across runs).
-echo "[validate_wheel] docker build -> $IMAGE_TAG"
-docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO/docker/validation"
+# Prefer the published image. Rebuilding it here means fetching the base image
+# and reinstalling the JAX stack on every run, which is what made this step
+# exceed the job timeout on runners that had not cached the base layers.
+# validation-image.yml publishes one image per Dockerfile revision; fall back to
+# a local build so a developer without registry access, or a recipe edit that
+# has not been published yet, still works.
+if docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+  echo "[validate_wheel] image already local -> $IMAGE_TAG"
+elif docker pull "$IMAGE_TAG"; then
+  echo "[validate_wheel] pulled $IMAGE_TAG"
+else
+  echo "[validate_wheel] pull failed; building locally -> $IMAGE_TAG"
+  docker build -t "$IMAGE_TAG" -f "$DOCKERFILE" "$REPO/docker/validation"
+fi
 
 # Smoke command per variant.
 if [[ "$VARIANT" == "lite" ]]; then

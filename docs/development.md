@@ -40,6 +40,20 @@ Do not run `make clean` casually. It removes multi-hour JIT outputs.
 `make clean-stage` removes wheel staging without deleting
 `build/aiter_build`.
 
+## Clean-room validation image
+
+`.github/workflows/validation-image.yml` publishes the image that
+`scripts/validate_wheel.sh` installs wheels into, as
+`ghcr.io/rocm/jax-aiter-validate:v<recipe-hash>`. The tag comes from
+`ci/validation_image_id.sh`, which hashes
+`docker/validation/Dockerfile.lite`, so editing the recipe yields a new tag and
+the next push republishes rather than validating against a stale environment.
+
+`validate_wheel.sh` pulls that image and falls back to a local `docker build`
+when the pull fails, so a developer without registry access still works.
+Rebuilding it on every release run meant refetching a 3.39 GB ROCm base layer
+each time, which exceeded the job timeout on runners that had not cached it.
+
 ## JIT-library producer
 
 `.github/workflows/jit-libs.yml` is the only CI job allowed to build the AITER

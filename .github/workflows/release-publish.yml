@@ -31,6 +31,8 @@ concurrency:
 
 permissions:
   contents: write
+  # Pull the published clean-room validation image.
+  packages: read
 
 env:
   BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14
@@ -204,6 +206,13 @@ jobs:
         with:
           name: jax-aiter-alpha2-wheels
           path: dist
+
+      - name: Log in to ghcr.io
+        # validate_wheel.sh pulls the prebuilt clean-room image instead of
+        # rebuilding it; without this it would silently fall back to a build.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Validate default wheel in a clean TheRock container
         run: |
