@@ -166,7 +166,7 @@ def load_standalone_module(module_name: str):
 
     raise FileNotFoundError(
         f"Standalone module not found: {module_name} in "
-        f"{[str(d) for d in search_dirs]}. Run `make ja_kv` first."
+        f"{[str(d) for d in search_dirs]}. Run `make -f Makefile.kv ja_kv` first."
     )
 
 
