@@ -215,6 +215,9 @@ jobs:
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Validate default wheel in a clean TheRock container
+        # Bound the step rather than letting a stall eat the whole job budget:
+        # a hung download once ran 87 minutes here and reported nothing useful.
+        timeout-minutes: 40
         run: |
           wheel="$(python3 - <<'PY'
           from pathlib import Path
@@ -224,6 +227,7 @@ jobs:
           bash scripts/validate_wheel.sh --variant lite "$wheel"
 
       - name: Validate full wheel in a clean TheRock container
+        timeout-minutes: 40
         run: |
           wheel="$(python3 - <<'PY'
           from pathlib import Path
