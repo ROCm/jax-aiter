@@ -137,6 +137,44 @@ def load_thin_modules():
         logger.info(f"Loaded jax_aiter_build modules: {ja_loaded}")
 
 
+def _standalone_search_dirs():
+    """Directories a standalone module may live in.
+
+    The same resolution load_thin_modules uses, rather than joining onto the
+    build root directly: the default wheel packages the thin shims and downloads
+    the JIT libraries into a writable cache, so the two can have different roots.
+    """
+    return (
+        ja_config.get_jax_aiter_lib_dir(),
+        ja_config.get_aiter_lib_dir(),
+    )
+
+
+def find_standalone_module(module_name: str):
+    """Return the path to a standalone module, or None if it is not built."""
+    for directory in _standalone_search_dirs():
+        candidate = directory / module_name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def standalone_symbol_available(target_name: str) -> bool:
+    """Whether a standalone target's module is present and loadable.
+
+    Lets callers and tests probe for an optional shim without triggering the
+    FileNotFoundError that registration would raise. The paged-KV shims are
+    built by a separate make target, so they can legitimately be absent from an
+    otherwise complete tree.
+    """
+    if target_name not in STANDALONE_SYMBOLS:
+        return False
+    module_name = SYMBOL_TO_MODULE_MAP.get(target_name)
+    if not module_name:
+        return False
+    return module_name in _module_handles or find_standalone_module(module_name) is not None
+
+
 def load_standalone_module(module_name: str):
     """Load a single self-contained module without the umbrella library.
 
@@ -147,27 +185,16 @@ def load_standalone_module(module_name: str):
     if module_name in _module_handles:
         return
 
-    # Go through the same directory resolution as load_thin_modules rather than
-    # joining onto the build root directly: the default wheel packages the thin
-    # shims and downloads the JIT libraries into a writable cache, so the two
-    # can have different roots.
-    search_dirs = (
-        ja_config.get_jax_aiter_lib_dir(),
-        ja_config.get_aiter_lib_dir(),
-    )
-    for directory in search_dirs:
-        candidate = directory / module_name
-        if candidate.exists():
-            _module_handles[module_name] = ctypes.CDLL(
-                str(candidate), mode=ctypes.RTLD_GLOBAL
-            )
-            logger.info(f"Loaded standalone module: {module_name}")
-            return
+    path = find_standalone_module(module_name)
+    if path is None:
+        raise FileNotFoundError(
+            f"Standalone module not found: {module_name} in "
+            f"{[str(d) for d in _standalone_search_dirs()]}. "
+            f"Run `make -f Makefile.kv ja_kv` first."
+        )
 
-    raise FileNotFoundError(
-        f"Standalone module not found: {module_name} in "
-        f"{[str(d) for d in search_dirs]}. Run `make -f Makefile.kv ja_kv` first."
-    )
+    _module_handles[module_name] = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
+    logger.info(f"Loaded standalone module: {module_name}")
 
 
 def resolve_symbol(target_name: str) -> int:

@@ -18,9 +18,18 @@ import pytest
 import jax
 import jax.numpy as jnp
 
+from jax_aiter.ffi.registry import standalone_symbol_available
 from jax_aiter.kv.abi import AiterPagedAttentionAbiV1
 from jax_aiter.kv.aliasing import assert_flat_live_memory, assert_in_place_mutation
 from jax_aiter.ops.append_kv import APPEND_KV_ALIASES, TARGET, append_kv
+
+# The paged-KV shims are built by their own make target, so a tree built with
+# plain `make ja_mods` legitimately does not have them. Skip rather than error,
+# and name the target in the reason so a missing build is obvious.
+pytestmark = pytest.mark.skipif(
+    not standalone_symbol_available(TARGET),
+    reason=f"{TARGET} FFI module not built (run 'make -f Makefile.kv ja_kv')",
+)
 
 TOKENS_PER_PAGE = 16
 NUM_PAGES = 64
