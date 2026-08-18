@@ -37,6 +37,7 @@ SYMBOL_TO_MODULE_MAP = {
     "KvAliasProbeJA": "kv_alias_probe_ja.so",
     "AppendKvJA": "append_kv_ja.so",
     "PagedAttentionJA": "paged_attention_ja.so",
+    "PagedPrefillJA": "paged_prefill_ja.so",
 }
 
 # Symbols whose module resolves no CK or umbrella symbols and so can be loaded
@@ -49,6 +50,7 @@ STANDALONE_SYMBOLS = {
     "KvAliasProbeJA",
     "AppendKvJA",
     "PagedAttentionJA",
+    "PagedPrefillJA",
 }
 
 
