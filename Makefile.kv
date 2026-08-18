@@ -39,10 +39,18 @@ KV_INCLUDES := $(KV_PROBE_INCLUDES) $(KV_DEFINES) \
                -I$(AITER_SRC_DIR)/csrc/include/ck_tile \
                -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include
 
+# Paged attention binds the prebuilt kernel by dlopen rather than linking
+# aiter's cpp_itfs dispatch layer, so it needs nothing beyond libdl: no fmt, no
+# openssl, and no aiter sources compiled in. See the comment at the top of
+# csrc/ffi/kv/paged_attention_ja.cu for why the dispatch layer is unusable.
+PA_INCLUDES := $(KV_PROBE_INCLUDES)
+PA_LDFLAGS  := -ldl
+
 JA_KV_PROBE_MODULES := $(JA_BUILD_DIR)/kv_alias_probe_ja.so
 
 JA_KV_MODULES := $(JA_KV_PROBE_MODULES) \
-                 $(JA_BUILD_DIR)/append_kv_ja.so
+                 $(JA_BUILD_DIR)/append_kv_ja.so \
+                 $(JA_BUILD_DIR)/paged_attention_ja.so
 
 .PHONY: ja_kv ja_kv_probe
 
@@ -60,6 +68,12 @@ $(JA_BUILD_DIR)/append_kv_ja.so: csrc/ffi/kv/append_kv_ja.cu \
                                  $(AITER_SRC_DIR)/csrc/kernels/cache_kernels.cu | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(KV_INCLUDES) \
 		csrc/ffi/kv/append_kv_ja.cu $(AITER_SRC_DIR)/csrc/kernels/cache_kernels.cu -o $@
+
+# The kernel itself is compiled ahead of time and resolved by dlopen at run
+# time; see scripts/prebuild_pa_ragged.py.
+$(JA_BUILD_DIR)/paged_attention_ja.so: csrc/ffi/kv/paged_attention_ja.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(PA_INCLUDES) \
+		$< $(PA_LDFLAGS) -o $@
 
 # `include Makefile` above would otherwise make its `all` target the default.
 .DEFAULT_GOAL := ja_kv

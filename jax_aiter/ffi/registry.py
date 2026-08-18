@@ -36,6 +36,7 @@ SYMBOL_TO_MODULE_MAP = {
     "CastMxfp4DualKeyedSrJA": "cast_mxfp4_ja.so",
     "KvAliasProbeJA": "kv_alias_probe_ja.so",
     "AppendKvJA": "append_kv_ja.so",
+    "PagedAttentionJA": "paged_attention_ja.so",
 }
 
 # Symbols whose module resolves no CK or umbrella symbols and so can be loaded
@@ -47,6 +48,7 @@ SYMBOL_TO_MODULE_MAP = {
 STANDALONE_SYMBOLS = {
     "KvAliasProbeJA",
     "AppendKvJA",
+    "PagedAttentionJA",
 }
 
 
