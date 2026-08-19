@@ -143,6 +143,46 @@ def test_fetch_rejects_corrupt_blob_without_partial_install(tmp_path, monkeypatc
     assert not (dest / "libmha_fwd.so").exists()
 
 
+def test_download_retries_transient_failures_then_succeeds(tmp_path, monkeypatch):
+    """A stalled connection must be retried, not waited on indefinitely."""
+    payload = b"recovered"
+    source = tmp_path / "asset.bin"
+    source.write_bytes(payload)
+    attempts = []
+    real_urlopen = fetch_mha.urllib.request.urlopen
+
+    def flaky(url, *args, **kwargs):
+        attempts.append(kwargs.get("timeout"))
+        if len(attempts) < 3:
+            raise TimeoutError("read timed out")
+        return real_urlopen(url, *args, **kwargs)
+
+    monkeypatch.setattr(fetch_mha.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(fetch_mha.time, "sleep", lambda _s: None)
+
+    dest = tmp_path / "out.bin"
+    fetch_mha._download(source.as_uri(), dest, quiet=True)
+
+    assert dest.read_bytes() == payload
+    assert len(attempts) == 3
+    # Every attempt must bound the socket, or a stall hangs forever.
+    assert all(t == fetch_mha.TIMEOUT_S for t in attempts)
+
+
+def test_download_gives_up_with_actionable_message(tmp_path, monkeypatch):
+    def always_stall(url, *args, **kwargs):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(fetch_mha.urllib.request, "urlopen", always_stall)
+    monkeypatch.setattr(fetch_mha.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(fetch_mha, "RETRIES", 2)
+
+    dest = tmp_path / "out.bin"
+    with pytest.raises(SystemExit, match=r"(?s)after 2 attempts.*JA_FETCH_TIMEOUT_S"):
+        fetch_mha._download("https://example.invalid/asset.bin", dest, quiet=True)
+    assert not dest.exists()
+
+
 def test_failed_force_refresh_preserves_complete_active_generation(
     tmp_path, monkeypatch
 ):

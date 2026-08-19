@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -40,6 +41,12 @@ from .jit_assets import (
 DEFAULT_REPO = "ROCm/jax-aiter"
 MANIFEST_NAME = "manifest.json"
 
+# urlopen without a timeout blocks forever, so a connection that stalls midway
+# leaves the command hanging with no output and no recovery. Bound each socket
+# operation and retry, since these assets are fetched over the public internet.
+TIMEOUT_S = float(os.environ.get("JA_FETCH_TIMEOUT_S", "60"))
+RETRIES = max(1, int(os.environ.get("JA_FETCH_RETRIES", "4")))
+
 
 def _release_url(repo: str, tag: str, asset: str, base_url: str | None = None) -> str:
     if base_url:
@@ -48,16 +55,37 @@ def _release_url(repo: str, tag: str, asset: str, base_url: str | None = None) -
 
 
 def _download(url: str, dest: Path, *, quiet: bool = False) -> None:
+    asset = url.rsplit("/", 1)[-1]
     if not quiet:
-        print(f"  fetching {url.rsplit('/', 1)[-1]}", flush=True)
-    try:
-        with urllib.request.urlopen(url) as response, open(dest, "wb") as out:
-            shutil.copyfileobj(response, out, length=8 * 1024 * 1024)
-    except urllib.error.HTTPError as exc:
-        raise SystemExit(
-            f"error: could not download {url} ({exc.code} {exc.reason}).\n"
-            f"       Check that release '{DEFAULT_TAG}' exists and has this asset."
-        ) from exc
+        print(f"  fetching {asset}", flush=True)
+    for attempt in range(1, RETRIES + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=TIMEOUT_S) as response, open(
+                dest, "wb"
+            ) as out:
+                shutil.copyfileobj(response, out, length=8 * 1024 * 1024)
+            return
+        except urllib.error.HTTPError as exc:
+            # A status code is a definite answer; retrying will not change it.
+            raise SystemExit(
+                f"error: could not download {url} ({exc.code} {exc.reason}).\n"
+                f"       Check that release '{DEFAULT_TAG}' exists and has this asset."
+            ) from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            dest.unlink(missing_ok=True)
+            if attempt == RETRIES:
+                raise SystemExit(
+                    f"error: could not download {url} after {RETRIES} attempts "
+                    f"({TIMEOUT_S:g}s timeout each): {exc}\n"
+                    f"       Set JA_FETCH_TIMEOUT_S / JA_FETCH_RETRIES to adjust."
+                ) from exc
+            backoff = 2 ** (attempt - 1)
+            print(
+                f"  {asset}: attempt {attempt}/{RETRIES} failed ({exc}); "
+                f"retrying in {backoff}s",
+                flush=True,
+            )
+            time.sleep(backoff)
 
 
 def _sha256(path: Path) -> str:
