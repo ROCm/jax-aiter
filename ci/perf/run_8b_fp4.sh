@@ -13,8 +13,8 @@ JA_ROOT_DIR="${JA_ROOT_DIR:-/jax-aiter}"
 PERF_OUT_DIR="${PERF_OUT_DIR:-$JA_ROOT_DIR/ci_perf_out}"
 MAXTEXT_DIR="${MAXTEXT_DIR:-/maxtext_perf}"
 MAXTEXT_REPO="${MAXTEXT_REPO:-https://github.com/ROCm/maxtext.git}"
-MAXTEXT_BRANCH="${MAXTEXT_BRANCH:-aiter-fp4-integration}"
-MAXTEXT_COMMIT="${MAXTEXT_COMMIT:-ccd72e63e57193c6f1d51b06bd2e7f52ce895404}"
+MAXTEXT_BRANCH="${MAXTEXT_BRANCH:-feature/jax-aiter-mxfp4-v26.6}"
+MAXTEXT_COMMIT="${MAXTEXT_COMMIT:-b437942a5f33704f8438deb948488ad08164285c}"
 MAXTEXT_REQUIREMENTS="${MAXTEXT_REQUIREMENTS:-src/dependencies/requirements/requirements_decoupled_rocm_jax_0_10_0.txt}"
 
 echo "[ci/perf] MaxText: $MAXTEXT_REPO $MAXTEXT_BRANCH @ $MAXTEXT_COMMIT"
@@ -71,10 +71,15 @@ export JAX_AITER_ROOT="$JA_ROOT_DIR"
 export MAXTEXT_ROOT="$MAXTEXT_DIR"
 export JAX_AITER_RUNTIME=installed
 export ICI_FSDP_PARALLELISM=4
+export RECIPE_PROFILE=ci_regression
+export PER_DEVICE_BATCH=4
 export GLOBAL_BATCH_SIZE=16
 export HIP_VISIBLE_DEVICES=0,1,2,3
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.97
-export MODEL_CONTROLS=llama31_mlperf
+export WEIGHT_DTYPE=float32 MU_DTYPE=float32
+export AUTOTUNE_LEVEL=5
+export REMAT_POLICY=minimal_flash_save_fp4col
+export JA_FP4_REMAT_SAVE_COL=both
 
 cd "$JA_ROOT_DIR"
 bash scripts/recipes/run_nvfp4_match_8b.sh \
