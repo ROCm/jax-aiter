@@ -7,7 +7,7 @@ The supported alpha2 build environment is:
 ```text
 ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
 Python 3.12
-JAX / jaxlib / ROCm plugin / PJRT 0.11.0
+JAX / jaxlib 0.11.0; ROCm plugin / PJRT 0.11.0.post1
 GPU_ARCHS=gfx950
 ```
 

@@ -34,7 +34,7 @@ JA_ROOT_DIR="${JA_ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # Overridable so a bump is a workflow input, not a script edit.
 JAX_VERSION="${JA_JAX_VERSION:-0.11.0}"
-ROCM_PLUGIN_VERSION="${JA_ROCM_PLUGIN_VERSION:-0.11.0}"
+ROCM_PLUGIN_VERSION="${JA_ROCM_PLUGIN_VERSION:-0.11.0.post1}"
 
 install_jax_stack() {
   # ${FORCE} is empty in default mode and "--force-reinstall --no-deps" in
