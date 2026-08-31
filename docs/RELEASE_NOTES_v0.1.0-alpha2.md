@@ -105,5 +105,9 @@ commit above directly.
 - Python 3.12 is required.
 - The smaller plain wheel needs `jax-aiter-fetch-mha` before importing
   `jax_aiter.mha`. The recommended `+full` wheel does not.
+- The paged-KV modules under `jax_aiter.kv` ship as source only. The release
+  build does not produce their FFI libraries, so importing them raises a
+  `RuntimeError` naming `make -f Makefile.kv ja_kv`. They are not part of the
+  validated alpha2 surface; build them from a checkout to use them.
 - PyPI publication is a separate, explicitly approved step. Until the release
   notes say otherwise, install the wheel from the GitHub release.
