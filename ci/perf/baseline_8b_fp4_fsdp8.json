@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Baseline for the nightly 8-GPU MXFP4 gate. Only mean_tflops_per_device and",
+    "mean_loss are read by ci/perf/parse_perf_log.py; every other key is",
+    "provenance for whoever has to decide whether a red night is real.",
+    "",
+    "PROVISIONAL. This value came from a SOURCE build in the dev image on",
+    "smci355-ccs-aus-m15-29. The nightly measures a manylinux WHEEL on",
+    "smci355-ccs-aus-n15-13. Those differ in two ways that were never measured",
+    "together: a different clang (the manylinux image produces libmha_fwd/bwd",
+    "and librmsnorm_fwd 10-14% smaller than the dev image), and different",
+    "hardware. Leave `gate: false` on the workflow until several nights have",
+    "recorded where the wheel actually lands on that box, then replace the",
+    "numbers below with the median of those nights and turn the gate on.",
+    "",
+    "Do NOT compare a ci_regression (FSDP4, batch 4, global 16) number against",
+    "this file. That profile's own baseline is ~1784.68 and reading it against",
+    "1840 shows a 3% regression that does not exist."
+  ],
+  "label": "8b_fp4_fsdp8",
+  "recipe_profile": "blog_batch9",
+  "ici_fsdp_parallelism": 8,
+  "per_device_batch": 9,
+  "global_batch_size": 72,
+  "measurement_window": "completed_steps_40_49",
+
+  "mean_tflops_per_device": 1840.6644,
+  "mean_seconds": 2.0617,
+  "mean_loss": 4.7325,
+
+  "provenance": {
+    "status": "provisional-source-build",
+    "run": "docs/runs/llama3_8b/analysis/20260824_8b_mxfp4_fp8_bf16_perf_b9_fsdp8_097_s50/mxfp4/train.log",
+    "recorded": "2026-08-24",
+    "n": 1,
+    "build": "source, ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14, clang 22",
+    "host": "smci355-ccs-aus-m15-29 (container rv_rock)",
+    "owner": ".cursor/memory_bank/areas/analysis.md",
+    "note": "Frozen blog MXFP4 figure. Three further source runs of the same recipe gave 1837.1388 / 1838.1214 / 1840.0823 (mean 1839.00, sd 0.09%), so run-to-run spread on a quiet box is well under the 5% gate threshold."
+  }
+}
