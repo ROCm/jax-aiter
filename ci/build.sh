@@ -15,7 +15,7 @@
 #      JA_SKIP_JIT_BUILD short-circuits this step entirely (perf/lite path that
 #      needs ZERO JIT libs -- see below).
 #   3. make ja_mods[_nomha]          -- the FFI shim modules
-#   4. pip install .                 -- the jax-aiter wheel
+#   4. python3 -m pip install .      -- the jax-aiter wheel
 #
 # Env:
 #   JA_SKIP_JIT_BUILD "true"/"1"/"yes" SKIPS build_jit.py entirely (takes
@@ -91,6 +91,9 @@ make "$JA_MODS_TARGET"
 ls -lh build/jax_aiter_build/*.so
 
 # 4. install jax-aiter (variant gates which *.so are staged into the wheel).
-JA_WHEEL_VARIANT="$JA_WHEEL_VARIANT" pip install --break-system-packages .
+# `python3 -m pip`, never bare `pip`: the CI image ships a second, newer
+# Python whose `pip` shadows the 3.12 one that setup_jax.sh installed into,
+# and setup.py is `python_requires ==3.12.*`.
+JA_WHEEL_VARIANT="$JA_WHEEL_VARIANT" python3 -m pip install --break-system-packages .
 
 echo "[ci/build] build + install complete (variant=$JA_WHEEL_VARIANT, mods=$JA_MODS_TARGET)."
