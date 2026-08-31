@@ -99,7 +99,8 @@ ls -lh build/jax_aiter_build/*.so
 #     That is an argument about which FILE the rules live in -- it was never a
 #     reason not to BUILD them here. Skipping the target is why tests/test_*kv*
 #     and tests/test_paged_* silently skipped in every CI run to date. The cold
-#     build is ~110 s and the tests ~6 s, against a 12 h JIT budget.
+#     build is 31 s wall (-j, see below) and the tests ~6 s, against a 12 h JIT
+#     budget.
 #     The lite path skips it: that variant exists to be small.
 skip_kv=0
 case "${JA_SKIP_KV_BUILD:-}" in
@@ -112,7 +113,12 @@ fi
 if [[ "$skip_kv" == "1" ]]; then
   echo "[ci/build] skipping the paged-KV shims (lite path or JA_SKIP_KV_BUILD)."
 else
-  make -f Makefile.kv ja_kv
+  # -j is mandatory, not a nicety: the filtered ck_tile set is 257 translation
+  # units and a measured cold build costs 87 CPU-minutes -- serially that is
+  # past the 60 min gpu-job timeout on its own. Parallel it is 31 s wall on 256
+  # cores. paged_prefill re-enters make and the jobserver is handed down, so
+  # this one -j covers the inner build too.
+  make -f Makefile.kv ja_kv -j"$(nproc)"
   ls -lh build/jax_aiter_build/*kv*.so build/jax_aiter_build/paged_*.so
 fi
 
