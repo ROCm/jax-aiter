@@ -90,7 +90,10 @@ fi
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   git ca-certificates curl build-essential pkg-config zstd
-python3 -m pip install --break-system-packages cmake ninja pyyaml psutil pandas
+# jinja2 is aiter's codegen templating engine (third_party/aiter/csrc/cpp_itfs/utils.py:8).
+# ci/build.sh step 3c drives that codegen via scripts/prebuild_pa_ragged.py, so without it
+# the paged-attention prebuild dies with ModuleNotFoundError after the shims have compiled.
+python3 -m pip install --break-system-packages cmake ninja pyyaml psutil pandas jinja2
 
 # JAX must be installed before the build (Makefile needs jax.ffi.include_dir()).
 install_jax_stack
