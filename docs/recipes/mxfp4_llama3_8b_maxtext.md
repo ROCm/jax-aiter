@@ -14,14 +14,20 @@ MLPerf RCP validation.
 | Container | `ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14` |
 | Container digest | `sha256:a13556927770aa13c07bbb8bd1bd052d91cd3cdc254953d836158261d9a214a2` |
 | JAX / `jaxlib` | `0.11.0` from PyPI |
-| ROCm plugin / PJRT | `0.11.0` from PyPI |
-| JAX-AITER | `v0.1.0-alpha2` |
+| ROCm plugin / PJRT | `0.11.0.post1` from PyPI |
+| JAX-AITER | `v0.1.0-alpha2` (`35b7175c763153ddb5da50c47d33dec436d5f191`) |
 | AITER consumed by JAX-AITER | `31350226161346314b3d8882c8085bd31dce6a34` |
-| ROCm/MaxText | `aiter-fp4-integration @ ccd72e63e57193c6f1d51b06bd2e7f52ce895404` |
-| MaxText patch base | `14aa40b3af3aae793c72bb886533b4e8790ee6fa` |
+| ROCm/MaxText | `feature/jax-aiter-mxfp4-v26.6 @ b437942a5f33704f8438deb948488ad08164285c` |
+| Flax | `0.12.8` |
+| Transformer Engine packages | `2.17.0+rocm7.14.0.50a84ad` |
+| MLPerf logging | `4.1.58` |
 
 Record the dataset and tokenizer checksums for any result you retain. This
 repository does not redistribute C4.
+
+The alpha2 release commit and the blog's measured JAX-AITER commit
+`3fcc5521afc968ab7fae4a2c0e06a59b16a4fa51` have identical Git trees. The
+release commit is the stable public identity.
 
 ## Start the container
 
@@ -46,7 +52,7 @@ TheRock packages ROCm through `rocm-sdk`; `/opt/rocm` is intentionally absent.
 ```bash
 python3 -m pip install \
   "jax==0.11.0" "jaxlib==0.11.0" \
-  "jax-rocm7-plugin==0.11.0" "jax-rocm7-pjrt==0.11.0"
+  "jax-rocm7-plugin==0.11.0.post1" "jax-rocm7-pjrt==0.11.0.post1"
 
 # The +full wheel is self-contained. The plain wheel is far smaller but then
 # needs `jax-aiter-fetch-mha` before flash attention works.
@@ -55,7 +61,7 @@ BASE=https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2
 WHEEL='jax_aiter-0.1.0a2+full-cp312-cp312-manylinux_2_39_x86_64.whl'
 curl -fL -o "/tmp/$WHEEL" \
   "$BASE/jax_aiter-0.1.0a2%2Bfull-cp312-cp312-manylinux_2_39_x86_64.whl"
-python3 -m pip install "/tmp/$WHEEL"
+python3 -m pip install --no-deps "/tmp/$WHEEL"
 
 python3 - <<'PY'
 import jax
@@ -76,11 +82,9 @@ Clone JAX-AITER for the recipe launchers and MaxText at the exact tested commit:
 
 ```bash
 cd /workspace
-git clone --branch v0.1.0-alpha2 \
-  https://github.com/ROCm/jax-aiter.git
-git clone --branch aiter-fp4-integration \
-  https://github.com/ROCm/maxtext.git
-git -C maxtext checkout ccd72e63e57193c6f1d51b06bd2e7f52ce895404
+git clone https://github.com/ROCm/jax-aiter.git
+git clone https://github.com/ROCm/maxtext.git
+git -C maxtext checkout b437942a5f33704f8438deb948488ad08164285c
 ```
 
 Install the decoupled MaxText dependencies without downgrading JAX to the
@@ -106,27 +110,32 @@ dest.write_text("\n".join(lines) + "\n")
 print(dest)
 PY
 python3 -m pip install -r /tmp/maxtext-rocm-requirements.txt
+python3 -m pip install "flax==0.12.8" "mlperf-logging==4.1.58"
 python3 -m pip install --no-deps -e .
 
 python3 -c "import jax, maxtext; print('jax', jax.__version__, 'maxtext import OK')"
 ```
 
-### Patch route
+## Install the pinned Transformer Engine packages
 
-If a branch checkout is unsuitable, the JAX-AITER repository carries a patch
-whose post-image matches `ccd72e63` (whitespace-only blank lines are
-normalized):
+The FP8 and BF16 reference legs use Transformer Engine MHA. Install the exact
+public artifacts used by the reported cohort and verify their hashes:
 
 ```bash
-git clone https://github.com/ROCm/maxtext.git /workspace/maxtext-patched
-git -C /workspace/maxtext-patched checkout \
-  14aa40b3af3aae793c72bb886533b4e8790ee6fa
-git -C /workspace/maxtext-patched apply \
-  /workspace/jax-aiter/scripts/maxtext_aiter_fp4.patch
+TE_CORE=/tmp/transformer_engine_rocm7.whl
+TE_JAX=/tmp/transformer_engine_rocm_jax.tar.gz
+curl -fL -o "$TE_CORE" \
+  'https://rocm.frameworks-devreleases.amd.com/whl-multi-arch-staging/transformer-engine-rocm7/transformer_engine_rocm7-2.17.0%2Brocm7.14.0.50a84ad-cp312-cp312-manylinux_2_28_x86_64.whl'
+curl -fL -o "$TE_JAX" \
+  'https://rocm.frameworks-devreleases.amd.com/whl-multi-arch-staging/transformer-engine-rocm-jax/transformer_engine_rocm_jax-2.17.0%2Brocm7.14.0.50a84ad.tar.gz'
+printf '%s  %s\n' \
+  1104fa964c91280235a6e9330a2f9ee6ed78e733be4efa14c23150f8c7c53b07 "$TE_CORE" \
+  322c1b6d3fbca7a4be26fc8f5b8473449c77a747a62893fcc5ce62fbd10f85b8 "$TE_JAX" \
+  | sha256sum --check
+python3 -m pip install --no-deps "$TE_CORE" "$TE_JAX"
+export LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_libraries/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+python3 -c "import transformer_engine.jax; print('Transformer Engine JAX import: OK')"
 ```
-
-CPU CI checks both that the patch applies and that its post-image matches the
-pinned branch commit while ignoring end-of-line whitespace.
 
 ## Record the environment
 
@@ -137,6 +146,7 @@ import importlib.metadata as metadata
 for name in (
     "jax", "jaxlib", "jax-rocm7-plugin", "jax-rocm7-pjrt",
     "jax-aiter", "maxtext", "mlperf-logging",
+    "transformer-engine-rocm7", "transformer-engine-rocm-jax",
 ):
     try:
         print(f"{name}=={metadata.version(name)}")
@@ -147,6 +157,7 @@ PY
 rocm-sdk version
 git -C /workspace/jax-aiter rev-parse HEAD
 git -C /workspace/maxtext rev-parse HEAD
+sha256sum /workspace/jax-aiter/scripts/recipes/run_nvfp4_match_8b.sh
 ```
 
 ## Resolve the recipe without launching training
@@ -160,59 +171,61 @@ export JAX_AITER_ROOT=/workspace/jax-aiter
 export MAXTEXT_ROOT=/workspace/maxtext
 
 cd "$JAX_AITER_ROOT"
-RECIPE_DRY_RUN=1 MODEL_CONTROLS=llama31_mlperf \
-  bash scripts/recipes/run_nvfp4_match_8b.sh \
+RECIPE_DRY_RUN=1 bash scripts/recipes/run_nvfp4_match_8b.sh \
   mxfp4 /workspace/results/dry-run 50
+RECIPE_DRY_RUN=1 bash scripts/recipes/run_nvfp4_match_8b.sh \
+  fp8 /workspace/results/dry-run 50
+RECIPE_DRY_RUN=1 bash scripts/recipes/run_nvfp4_match_8b.sh \
+  bf16 /workspace/results/dry-run 50
 bash tests/test_publication_perf_runner.sh
 ```
 
-The resolved banner must show:
+All three resolved banners must show:
 
 - `model_name=llama3.1-8b`
-- `quantization=aiter_fp4`
-- `attention=aiter_flash`
 - FSDP8 and Shardy
 - `scan_layers=False`
-- per-device batch 4 and global batch 32
+- per-device batch 9 and global batch 72
 - sequence length 8192
-- FP32 weight and optimizer state
+- BF16 weight and optimizer state
 - memory fraction `.97`
 
-`quantization=aiter_fp4` automatically routes supported dense 8B configurations
-to direct JAX-AITER attention. An explicit alternate attention mode with
-`aiter_attention=False` is the rollback path.
+The MXFP4 banner must additionally show `quantization=aiter_fp4`,
+`attention=aiter_flash`, `minimal_flash_save_fp4_wtcol`, iota embedding off,
+the 64 MiB pipelined scheduler, the explicit MLPerf-aligned Llama 3.1 model
+controls, and JAX-AITER enabled. Plain FP8 must show `quantization=fp8`,
+`cudnn_flash_te`, `minimal_flash`, iota embedding on, the UTD scheduler, and
+MaxText's pinned model defaults. BF16 differs from plain FP8 only where the
+article says it does: no quantization and `remat_policy=minimal`.
 
-## Run one MXFP4 process
+## Run the three performance processes
 
-The runner requires exactly 50 steps and refuses to reuse an output directory:
+The runner requires exactly 50 steps, refuses to reuse an output directory,
+records source/package provenance, and validates the complete finite step
+sequence plus the mean of completed steps 40–49. Run each command separately
+on an otherwise idle node:
 
 ```bash
 cd "$JAX_AITER_ROOT"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.97
-export PERF_ROOT=/workspace/results/llama3_8b_mxfp4_50
+export JAX_AITER_RUNTIME=installed
+export PERF_ROOT=/workspace/results/llama3_8b_blog_50
 
-MODEL_CONTROLS=llama31_mlperf \
-  bash scripts/recipes/run_nvfp4_match_8b.sh \
-  mxfp4 "$PERF_ROOT" 50
-```
-
-The repository's nightly regression leg uses the same recipe at FSDP4 because
-the 8-GPU CI pool is heavily contended. It is a CI operating point, not the
-8-GPU publication recipe above.
-
-Optional comparison modes remain available to reproduce a matched study:
-
-```bash
 bash scripts/recipes/run_nvfp4_match_8b.sh \
-  te_fp8_currentscaling "$PERF_ROOT" 50
+  mxfp4 "$PERF_ROOT" 50
+bash scripts/recipes/run_nvfp4_match_8b.sh \
+  fp8 "$PERF_ROOT" 50
 bash scripts/recipes/run_nvfp4_match_8b.sh \
   bf16 "$PERF_ROOT" 50
 ```
 
-Those two modes use TransformerEngine attention and require a compatible ROCm
-TransformerEngine wheel. The pinned MaxText checkout contains
-`.github/workflows/utils/install_te_rocm_wheel.py` for that optional setup.
-Do not mix their outputs with the MXFP4 directory.
+The FP8 and BF16 modes require the two pinned ROCm Transformer Engine packages.
+The output for each leg contains `train.log`, `provenance.txt`, and
+`parsed_tail.json`. Do not combine outputs from retries or a different source
+or package stack.
+
+The repository's CI leg explicitly overrides batch, state dtype, and remat for
+its smaller FSDP4 regression point. It is not a publication result.
 
 ## Run convergence
 

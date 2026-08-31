@@ -52,7 +52,7 @@ def main() -> int:
     print(f"func_name: {name}")
     print(f"lib      : {lib_path}  exists={os.path.exists(lib_path)}")
     if not os.path.exists(lib_path):
-        print("not built; run scripts/prebuild_pa_ragged.py first", file=sys.stderr)
+        print("not built; run 'make -f Makefile.kv ja_kv' first", file=sys.stderr)
         return 1
 
     rng = np.random.default_rng(0)

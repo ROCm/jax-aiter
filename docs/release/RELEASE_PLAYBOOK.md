@@ -10,7 +10,7 @@ in workflows and scripts rather than being duplicated here.
 - Python: 3.12
 - ROCm: TheRock 7.14 GA
 - GPU: gfx950 / MI355X only
-- JAX / `jaxlib` / ROCm plugin / PJRT: 0.11.0
+- JAX / `jaxlib`: 0.11.0; ROCm plugin / PJRT: 0.11.0.post1
 - Default wheel: public version; MHA JIT libraries fetched on demand
 - Full wheel: `+full`; GitHub release only
 - No performance or speedup claims in README, recipes, or release notes

@@ -17,8 +17,8 @@
 //     buffer dimensions rather than assumed, because the packed pool layouts are
 //     stride-driven and a wrong stride is silent.
 //
-// The descriptor also carries the dtype, which is how index buffers such as
-// slot_mapping reach aiter as int32 without a widening pass.
+// The descriptor carries dtype, but reshape_and_cache_flash still reads
+// slot_mapping as int64_t*. AppendKvJA widens int32 slots before that call.
 
 #pragma once
 

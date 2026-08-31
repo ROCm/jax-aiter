@@ -17,7 +17,7 @@ Alpha2 targets one tested stack:
 | ROCm | TheRock 7.14 GA |
 | Python | 3.12 |
 | JAX / `jaxlib` | 0.11.0 |
-| ROCm plugin / PJRT | 0.11.0 |
+| ROCm plugin / PJRT | 0.11.0.post1 |
 
 `gfx942` is not included in alpha2 because no available CI runner can test it.
 
@@ -47,7 +47,7 @@ come from PyPI and use the TheRock `jax_plugins.xla_rocm7` backend:
 ```bash
 python3 -m pip install \
   "jax==0.11.0" "jaxlib==0.11.0" \
-  "jax-rocm7-plugin==0.11.0" "jax-rocm7-pjrt==0.11.0"
+  "jax-rocm7-plugin==0.11.0.post1" "jax-rocm7-pjrt==0.11.0.post1"
 
 python3 -c "import jax; print(jax.devices())"
 ```

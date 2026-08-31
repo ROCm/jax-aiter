@@ -7,8 +7,17 @@ The supported alpha2 build environment is:
 ```text
 ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
 Python 3.12
-JAX / jaxlib / ROCm plugin / PJRT 0.11.0
+JAX / jaxlib 0.11.0; ROCm plugin / PJRT 0.11.0.post1
 GPU_ARCHS=gfx950
+```
+
+`ci/setup_jax.sh` still defaults `ROCM_PLUGIN_VERSION` to `0.11.0`. That
+default is deliberate: the script is a `compute_patch_hash()` input, so
+editing it rekeys the immutable JIT library identity for a version that
+cannot change their bytes. Pass the override instead, as CI does:
+
+```bash
+JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh
 ```
 
 TheRock has no `/opt/rocm`. The Makefile uses `/opt/rocm` in legacy images and

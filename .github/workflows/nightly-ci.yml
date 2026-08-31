@@ -80,7 +80,7 @@ jobs:
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
+        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
 
       # After setup_jax.sh: the base image ships no jax, so importing it any
       # earlier fails the job before a single test runs.

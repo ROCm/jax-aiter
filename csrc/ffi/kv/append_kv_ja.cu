@@ -36,6 +36,13 @@ namespace ffi = xla::ffi;
 
 namespace jax_aiter {
 
+__global__ void WidenI32ToI64(const int32_t *in, int64_t *out, int64_t n) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = static_cast<int64_t>(in[i]);
+  }
+}
+
 ffi::Error AppendKv_Bridge(hipStream_t stream, int32_t device_ordinal,
                            ffi::AnyBuffer k_new, ffi::AnyBuffer v_new,
                            ffi::AnyBuffer slot_mapping, ffi::AnyBuffer k_scale,
@@ -76,9 +83,11 @@ ffi::Error AppendKv_Bridge(hipStream_t stream, int32_t device_ordinal,
                       "AppendKvJA: k_new and k_pool dtype must match "
                       "(quantised pools are out of scope at M1)");
   }
-  // int32 is what the control plane produces and what JAX emits without x64;
-  // int64 is accepted too so a caller sharing vLLM-shaped metadata needs no
-  // conversion. aiter picks the width off the descriptor dtype either way.
+  // int32 is what the control plane and JAX (without x64) produce; int64 is
+  // accepted so a caller sharing vLLM-shaped metadata needs no conversion.
+  // aiter::reshape_and_cache_flash always loads slot_mapping as int64_t*, so
+  // int32 inputs are widened on device below. Passing int32 through as-is
+  // reads adjacent slots as one index and aborts the GPU.
   if (slot_mapping.element_type() != ffi::DataType::S32 &&
       slot_mapping.element_type() != ffi::DataType::S64) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -126,13 +135,49 @@ ffi::Error AppendKv_Bridge(hipStream_t stream, int32_t device_ordinal,
       e.failure())
     return e;
 
-  // Passed straight through as int32: aiter derives the index width from the
-  // descriptor's dtype, so no widening pass is needed.
-  if (auto e = MakeAiterTensor(slot_mapping, device_id, &t_slots, "slot_mapping");
-      e.failure())
+  int64_t *slots_i64 = nullptr;
+  if (slot_mapping.element_type() == ffi::DataType::S32) {
+    hipError_t merr = hipMallocAsync(
+        reinterpret_cast<void **>(&slots_i64),
+        sizeof(int64_t) * static_cast<size_t>(num_tokens), stream);
+    if (merr != hipSuccess) {
+      return ffi::Error(ffi::ErrorCode::kInternal,
+                        std::string("AppendKvJA: hipMallocAsync for int64 slots: ") +
+                            hipGetErrorString(merr));
+    }
+    const int threads = 256;
+    const int blocks =
+        static_cast<int>((num_tokens + threads - 1) / threads);
+    WidenI32ToI64<<<blocks, threads, 0, stream>>>(
+        static_cast<const int32_t *>(slot_mapping.untyped_data()), slots_i64,
+        num_tokens);
+    hipError_t werr = hipGetLastError();
+    if (werr != hipSuccess) {
+      hipFreeAsync(slots_i64, stream);
+      return ffi::Error(ffi::ErrorCode::kInternal,
+                        std::string("AppendKvJA: int32->int64 widen launch: ") +
+                            hipGetErrorString(werr));
+    }
+    if (auto e = MakeAiterTensor(slots_i64, slot_mapping.dimensions(),
+                                 ffi::DataType::S64, device_id, &t_slots,
+                                 "slot_mapping");
+        e.failure()) {
+      hipFreeAsync(slots_i64, stream);
+      return e;
+    }
+  } else if (auto e =
+                 MakeAiterTensor(slot_mapping, device_id, &t_slots, "slot_mapping");
+             e.failure()) {
     return e;
-  if (auto e = MakeAiterTensor(k_scale, device_id, &t_kscale, "k_scale"); e.failure()) return e;
-  if (auto e = MakeAiterTensor(v_scale, device_id, &t_vscale, "v_scale"); e.failure()) return e;
+  }
+  if (auto e = MakeAiterTensor(k_scale, device_id, &t_kscale, "k_scale"); e.failure()) {
+    if (slots_i64) hipFreeAsync(slots_i64, stream);
+    return e;
+  }
+  if (auto e = MakeAiterTensor(v_scale, device_id, &t_vscale, "v_scale"); e.failure()) {
+    if (slots_i64) hipFreeAsync(slots_i64, stream);
+    return e;
+  }
 
   // aiter reads its stream from thread-local state, so install XLA's for the
   // duration of the call or the write races the surrounding graph.
@@ -143,6 +188,9 @@ ffi::Error AppendKv_Bridge(hipStream_t stream, int32_t device_ordinal,
                                  t_slots, dtype_str, t_kscale, t_vscale);
 
   hipError_t err = hipGetLastError();
+  if (slots_i64) {
+    hipFreeAsync(slots_i64, stream);
+  }
   if (err != hipSuccess) {
     return ffi::Error(ffi::ErrorCode::kInternal,
                       std::string("AppendKvJA: reshape_and_cache_flash failed: ") +

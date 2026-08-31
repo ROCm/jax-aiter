@@ -48,7 +48,7 @@ Install the ROCm JAX stack:
 ```bash
 python3 -m pip install \
   "jax==0.11.0" "jaxlib==0.11.0" \
-  "jax-rocm7-plugin==0.11.0" "jax-rocm7-pjrt==0.11.0"
+  "jax-rocm7-plugin==0.11.0.post1" "jax-rocm7-pjrt==0.11.0.post1"
 ```
 
 Install the recommended `+full` wheel, which needs no follow-up download:
@@ -91,12 +91,13 @@ The MXFP4 and direct-MHA recipe is documented at
 Its MaxText source is pinned to:
 
 ```text
-ROCm/maxtext aiter-fp4-integration
-ccd72e63e57193c6f1d51b06bd2e7f52ce895404
+ROCm/maxtext feature/jax-aiter-mxfp4-v26.6
+b437942a5f33704f8438deb948488ad08164285c
 ```
 
-The repository also carries a patch against that exact revision, checked by
-CPU CI.
+The older standalone patch remains checked by CPU CI for its original
+`aiter-fp4-integration` post-image; the blog recipe uses the public branch
+commit above directly.
 
 ## Limitations
 
@@ -104,5 +105,12 @@ CPU CI.
 - Python 3.12 is required.
 - The smaller plain wheel needs `jax-aiter-fetch-mha` before importing
   `jax_aiter.mha`. The recommended `+full` wheel does not.
+- The paged-KV modules under `jax_aiter.kv` ship as source only. The release
+  build runs `make ja_mods`, never `make -f Makefile.kv ja_kv`, so the wheel
+  carries their Python but none of their FFI libraries. `import jax_aiter.kv`
+  therefore succeeds and gives no warning; the first call that reaches a paged
+  kernel raises `FileNotFoundError: Standalone module not found:
+  append_kv_ja.so ... Run 'make -f Makefile.kv ja_kv' first.` They are not part
+  of the validated alpha2 surface; build them from a checkout to use them.
 - PyPI publication is a separate, explicitly approved step. Until the release
   notes say otherwise, install the wheel from the GitHub release.

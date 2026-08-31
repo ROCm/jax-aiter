@@ -211,6 +211,8 @@ def test_both_pools_are_aliased_in_place(dtype):
 
 def test_live_memory_flat_over_long_decode_run():
     """No per-step replacement allocation for either pool."""
+    if jax.local_devices()[0].memory_stats() is None:
+        pytest.skip("jax.Device.memory_stats() is None on this JAX/ROCm")
     dtype = jnp.bfloat16
     num_kv_heads = 8
     k_pool, v_pool = _pools(num_kv_heads, dtype)

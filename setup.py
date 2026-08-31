@@ -259,8 +259,8 @@ setup(
     install_requires=[
         "jax==0.11.0",
         "jaxlib==0.11.0",
-        "jax-rocm7-plugin==0.11.0",
-        "jax-rocm7-pjrt==0.11.0",
+        "jax-rocm7-plugin==0.11.0.post1",
+        "jax-rocm7-pjrt==0.11.0.post1",
         "zstandard",
     ],
     extras_require={
