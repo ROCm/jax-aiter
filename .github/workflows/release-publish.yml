@@ -146,6 +146,10 @@ jobs:
       - name: Audit wheel policy and contents
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
+            # set -e is load-bearing: without it a non-zero exit from either
+            # check_manylinux_policy.py call is discarded and the audit passes
+            # vacuously, which is the whole point of this step.
+            set -euo pipefail
             # No --max-minor: the ceiling comes from the tag on each wheel, so
             # a future build-image bump fails here until the tag is corrected.
             python3 ci/check_manylinux_policy.py \

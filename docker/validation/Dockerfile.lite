@@ -25,14 +25,19 @@
 FROM ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
 
 ARG JAX_VERSION=0.11.0
+# The ROCm plugin/pjrt pair is versioned independently of jax/jaxlib and must
+# match setup.py install_requires exactly. The wheel is installed --no-deps in
+# validate_wheel.sh, so a mismatch here would silently validate a runtime no
+# user can actually get from `pip install jax_aiter`.
+ARG ROCM_PLUGIN_VERSION=0.11.0.post1
 
 # Install upstream JAX/JAXlib plus the ROCm PJRT/plugin backend from PyPI.
 # The build-time import check fails fast if the stack is broken.
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
       "jax==${JAX_VERSION}" \
       "jaxlib==${JAX_VERSION}" \
-      "jax-rocm7-plugin==${JAX_VERSION}" \
-      "jax-rocm7-pjrt==${JAX_VERSION}" \
+      "jax-rocm7-plugin==${ROCM_PLUGIN_VERSION}" \
+      "jax-rocm7-pjrt==${ROCM_PLUGIN_VERSION}" \
       "zstandard" \
  && python3 -c "import jax, jaxlib, jax_rocm7_plugin, jax_plugins.xla_rocm7; print('[validation base] jax', jax.__version__, 'jaxlib', jaxlib.__version__)"
 
