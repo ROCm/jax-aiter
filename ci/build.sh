@@ -132,6 +132,13 @@ else
   #     head 128, block 16), and a cold build of all 6 is ~24 s. AITER_ROOT_DIR
   #     is left unset deliberately: it is the only value the C++ and Python cache
   #     spellings agree on, and ci/test.sh runs in this same container.
+  # aiter's codegen imports jinja2 (third_party/aiter/csrc/cpp_itfs/utils.py:8) and
+  # the CI image does not ship it. Install it HERE and not in ci/setup_jax.sh:
+  # setup_jax.sh is a hashed compute_patch_hash() input (ci/jit_libs_manifest.py:85),
+  # so a one-line edit there rekeys CACHE_ID and orphans the multi-GB prebuilt MHA
+  # libs -- which is exactly what it did on the first attempt. ci/build.sh is not
+  # hashed, so this is free.
+  python3 -m pip install --break-system-packages --quiet jinja2
   python3 scripts/prebuild_pa_ragged.py
 fi
 
