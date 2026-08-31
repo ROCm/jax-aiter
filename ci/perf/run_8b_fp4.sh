@@ -50,7 +50,7 @@ rm -f "$REQ_FILTERED"
 python3 -m pip install --break-system-packages --no-deps -e "$MAXTEXT_DIR"
 
 # Restore and prove the exact runtime after dependency resolution.
-bash "$JA_ROOT_DIR/ci/setup_jax.sh" --jax-only
+JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash "$JA_ROOT_DIR/ci/setup_jax.sh" --jax-only
 (
   cd /tmp
   env -u JA_ROOT_DIR -u AITER_ASM_DIR python3 - <<'PY'

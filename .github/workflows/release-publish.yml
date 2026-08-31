@@ -112,7 +112,7 @@ jobs:
             # provide the JAX runtime requirements first.
             python3 -m pip install --break-system-packages \
               numpy ml_dtypes scipy opt_einsum
-            bash ci/setup_jax.sh --jax-only
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
             python3 -m pip install --break-system-packages pandas auditwheel
             # build_wheel.sh runs pip wheel --no-build-isolation, so the PEP 517
             # backend must already be importable, and this minimal image ships

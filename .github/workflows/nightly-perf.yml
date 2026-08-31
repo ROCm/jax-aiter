@@ -69,7 +69,7 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
-            bash ci/setup_jax.sh --jax-only
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
             shopt -s nullglob
             wheels=(dist/jax_aiter-0.1.0a2-*.whl)
             test "${#wheels[@]}" -eq 1
