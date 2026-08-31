@@ -16,6 +16,7 @@
 #      needs ZERO JIT libs -- see below).
 #   3. make ja_mods[_nomha]          -- the FFI shim modules
 #   3b. make -f Makefile.kv ja_kv    -- the paged-KV shims (full path only)
+#   3c. prebuild_pa_ragged.py        -- AOT paged-attention kernels they dlopen
 #   4. python3 -m pip install .      -- the jax-aiter wheel
 #
 # Env:
@@ -36,7 +37,8 @@
 #                     MHA) or "ja_mods_nomha" (LITE: core shims only).
 #   JA_WHEEL_VARIANT  "full" (default) or "lite" -- passed to the pip install
 #                     so a lite build never expects the MHA libs/shims.
-#   JA_SKIP_KV_BUILD  "true"/"1"/"yes" skips the paged-KV shims.
+#   JA_SKIP_KV_BUILD  "true"/"1"/"yes" skips the paged-KV shims and their
+#                     prebuilt paged-attention kernels.
 set -euxo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -120,6 +122,17 @@ else
   # this one -j covers the inner build too.
   make -f Makefile.kv ja_kv -j"$(nproc)"
   ls -lh build/jax_aiter_build/*kv*.so build/jax_aiter_build/paged_*.so
+
+  # 3c. paged_attention_ja.so resolves aiter's paged-attention kernel by dlopen
+  #     from $HOME/.aiter/build and REFUSES to compile it on demand -- doing so
+  #     would mean spawning a Python subprocess from inside an FFI handler. So
+  #     the .so alone is not enough: without this, tests/test_paged_attention_ja
+  #     fails with "kernel configuration ... is not built". The script's default
+  #     set is by definition the one those tests exercise (bf16/fp16 x MHA/GQA/MQA,
+  #     head 128, block 16), and a cold build of all 6 is ~24 s. AITER_ROOT_DIR
+  #     is left unset deliberately: it is the only value the C++ and Python cache
+  #     spellings agree on, and ci/test.sh runs in this same container.
+  python3 scripts/prebuild_pa_ragged.py
 fi
 
 # 4. install jax-aiter (variant gates which *.so are staged into the wheel).
