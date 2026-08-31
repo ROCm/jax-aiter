@@ -15,6 +15,7 @@
 #      JA_SKIP_JIT_BUILD short-circuits this step entirely (perf/lite path that
 #      needs ZERO JIT libs -- see below).
 #   3. make ja_mods[_nomha]          -- the FFI shim modules
+#   3b. make -f Makefile.kv ja_kv    -- the paged-KV shims (full path only)
 #   4. python3 -m pip install .      -- the jax-aiter wheel
 #
 # Env:
@@ -35,6 +36,7 @@
 #                     MHA) or "ja_mods_nomha" (LITE: core shims only).
 #   JA_WHEEL_VARIANT  "full" (default) or "lite" -- passed to the pip install
 #                     so a lite build never expects the MHA libs/shims.
+#   JA_SKIP_KV_BUILD  "true"/"1"/"yes" skips the paged-KV shims.
 set -euxo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -89,6 +91,30 @@ ls -lh build/aiter_build/*.so 2>/dev/null \
 # 3. FFI modules (ja_mods = core + MHA; ja_mods_nomha = lite core-only).
 make "$JA_MODS_TARGET"
 ls -lh build/jax_aiter_build/*.so
+
+# 3b. Paged-KV shims. They live in Makefile.kv rather than Makefile because
+#     Makefile is one of the four compute_patch_hash() inputs behind CACHE_ID:
+#     editing it rekeys the immutable JIT identity and orphans the multi-GB
+#     prebuilt MHA libraries, so a one-line KV change would cost a 12 h rebuild.
+#     That is an argument about which FILE the rules live in -- it was never a
+#     reason not to BUILD them here. Skipping the target is why tests/test_*kv*
+#     and tests/test_paged_* silently skipped in every CI run to date. The cold
+#     build is ~110 s and the tests ~6 s, against a 12 h JIT budget.
+#     The lite path skips it: that variant exists to be small.
+skip_kv=0
+case "${JA_SKIP_KV_BUILD:-}" in
+  1|true|TRUE|yes|YES) skip_kv=1 ;;
+esac
+if [[ "$JA_MODS_TARGET" == "ja_mods_nomha" ]]; then
+  skip_kv=1
+fi
+
+if [[ "$skip_kv" == "1" ]]; then
+  echo "[ci/build] skipping the paged-KV shims (lite path or JA_SKIP_KV_BUILD)."
+else
+  make -f Makefile.kv ja_kv
+  ls -lh build/jax_aiter_build/*kv*.so build/jax_aiter_build/paged_*.so
+fi
 
 # 4. install jax-aiter (variant gates which *.so are staged into the wheel).
 # `python3 -m pip`, never bare `pip`: the CI image ships a second, newer
