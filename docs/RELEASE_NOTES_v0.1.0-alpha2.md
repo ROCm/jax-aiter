@@ -10,7 +10,7 @@ performance results will be published separately in the ROCm blog.
 
 - ROCm: TheRock 7.14 GA
 - JAX / `jaxlib`: 0.11.0 from PyPI
-- `jax-rocm7-plugin` / `jax-rocm7-pjrt`: 0.11.0 from PyPI
+- `jax-rocm7-plugin` / `jax-rocm7-pjrt`: 0.11.0.post1 from PyPI
 - AITER pin: `31350226161346314b3d8882c8085bd31dce6a34`
 - GPU architecture: `gfx950`
 
@@ -87,7 +87,7 @@ system `site-packages`.
 ## MaxText recipe
 
 The MXFP4 and direct-MHA recipe is documented at
-[`docs/recipes/mxfp4_llama3_8b_maxtext.md`](recipes/mxfp4_llama3_8b_maxtext.md).
+[`docs/recipes/mxfp4_llama3_8b_maxtext.md`](https://github.com/ROCm/jax-aiter/blob/v0.1.0-alpha2/docs/recipes/mxfp4_llama3_8b_maxtext.md).
 Its MaxText source is pinned to:
 
 ```text
