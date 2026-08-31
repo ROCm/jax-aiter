@@ -515,8 +515,15 @@ jobs:
   promote:
     name: promote the pin to main
     needs: [bump, perf, tests]
+    # `github.ref` is load-bearing, not belt-and-braces. Without it, dispatching
+    # this workflow from a feature branch with promote=true would fast-forward
+    # main onto that branch's HEAD -- merging the whole branch by side door,
+    # since the merge-base check below only proves main is an ANCESTOR, which
+    # any branch cut from main satisfies. Scheduled runs always carry
+    # refs/heads/main, so this costs the nightly nothing.
     if: >-
-      needs.bump.outputs.moved == 'true'
+      github.ref == 'refs/heads/main'
+      && needs.bump.outputs.moved == 'true'
       && needs.perf.result == 'success'
       && needs.tests.result == 'success'
       && (github.event_name == 'schedule' || inputs.promote)
