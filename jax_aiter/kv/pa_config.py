@@ -2,10 +2,10 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Naming and sizing for aiter's ahead-of-time compiled paged-attention kernels.
 
-Single source of truth shared by ``scripts/prebuild_pa_ragged.py``, which builds
-the kernels, and ``jax_aiter.ops.paged_attention``, which calls them. If these
-two ever disagreed the prebuild would produce a library in a folder the handler
-never looks in, so they must derive the name from the same code.
+Single source of truth shared by ``scripts/gen_pa_ragged.py``, which renders and
+names the kernels, and ``jax_aiter.ops.paged_attention``, which calls them. If
+these two ever disagreed the build would emit a symbol under a name the handler
+never asks for, so they must derive the name from the same code.
 
 Why we call the generated symbol directly rather than aiter's C++ wrapper:
 ``aiter::paged_attention_ragged`` forwards to the generated function through an

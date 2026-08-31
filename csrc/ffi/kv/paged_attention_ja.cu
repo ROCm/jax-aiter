@@ -9,7 +9,7 @@
 // it consumes the pools and returns attention output, so the data dependence on
 // append_kv's aliased result orders the read after the write.
 //
-// Why this dlopens a generated symbol instead of calling aiter's C++ wrapper.
+// Why this calls a generated symbol directly instead of aiter's C++ wrapper.
 //
 // aiter::paged_attention_ragged looks like the natural entry point, but it
 // forwards to the generated kernel through an unchecked varargs call whose
@@ -20,26 +20,40 @@
 // `num_heads % num_kv_heads == 0`. Only aiter's Python path matches the
 // template, which is presumably why the drift went unnoticed.
 //
-// So the handler resolves the generated `extern "C"` entry itself. That also
-// means none of aiter's dispatch layer is linked, which removes its fmt and
-// openssl dependencies and makes it structurally impossible for a cache miss to
-// turn into a Python subprocess launched from inside a kernel launch: a missing
-// configuration is a clear error naming the prebuild command.
+// So the handler calls the generated `extern "C"` entry itself. That also means
+// none of aiter's dispatch layer is linked, which removes its fmt and openssl
+// dependencies.
+//
+// Those entries are compiled into this module ahead of time. scripts/
+// gen_pa_ragged.py renders aiter's own pa_ragged.cpp.jinja once per
+// configuration and emits pa_dispatch_generated.h, which Makefile.kv compiles
+// alongside this file; JA_PA_KERNEL_LIST below expands into a static table.
+//
+// This used to dlopen $HOME/.aiter/build/<name>/lib.so, built by a separate
+// scripts/prebuild_pa_ragged.py step driving aiter's Python JIT. That was
+// aiter's packaging convention rather than anything the kernel required -- the
+// generated source holds no kernel logic, only an extern "C" wrapper
+// instantiating two templates from pa_ragged.cuh with literal constants. It
+// cost a CI prebuild step, a jinja2 install, and a cache directory outside the
+// wheel that made the module unshippable; and because aiter links the result
+// with a bare `hipcc -shared`, the library carried no RUNPATH and would not
+// load at all in a container that had not been hand-taught where ROCm lives.
+// Compiling the kernels in makes a missing configuration a link-time fact
+// rather than a run-time one.
 //
 // The signature below is transcribed from csrc/cpp_itfs/pa/pa_ragged.cpp.jinja.
-// scripts/prebuild_pa_ragged.py guards it: it hashes that template's extern "C"
-// block and refuses to build if it no longer matches what this file expects.
+// scripts/gen_pa_ragged.py guards it: it hashes that template's extern "C"
+// block and refuses to generate if it no longer matches what this file expects.
+// That guard matters more now that the aiter pin moves nightly -- a reordered
+// argument would put scalars in pointer slots with nothing failing to compile.
 
 #include <hip/hip_runtime.h>
 
-#include <dlfcn.h>
-
 #include <cstdint>
-#include <cstdlib>
-#include <filesystem>
-#include <mutex>
 #include <string>
 #include <unordered_map>
+
+#include "pa_dispatch_generated.h"
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
@@ -61,60 +75,34 @@ using PagedAttentionFn = void (*)(
     const int max_num_partitions, const int q_stride, const int kv_block_stride,
     const int kv_head_stride, const int kv_seq_stride, void *stream);
 
-// Mirrors get_root_dir() in aiter's cpp_itfs/utils.h, which appends ".aiter" to
-// AITER_ROOT_DIR, or to HOME when it is unset. aiter's *Python* side does not
-// append it, so the two agree only when the variable is unset; the prebuild
-// script handles that asymmetry.
-std::filesystem::path AiterRootDir() {
-  const char *root = std::getenv("AITER_ROOT_DIR");
-  if (!root) root = std::getenv("HOME");
-  if (!root) root = "/root";
-  return std::filesystem::path(root) / ".aiter";
+// The ahead-of-time compiled entries, keyed by the same md5 configuration name
+// jax_aiter.kv.pa_config.func_name computes and the FFI passes as an attribute.
+// Built once on first use; the table is read-only afterwards.
+const std::unordered_map<std::string, PagedAttentionFn> &KernelTable() {
+#define JA_PA_ENTRY(name_str, sym) {name_str, &sym},
+  static const std::unordered_map<std::string, PagedAttentionFn> table = {
+      JA_PA_KERNEL_LIST(JA_PA_ENTRY)};
+#undef JA_PA_ENTRY
+  return table;
 }
 
-// Resolved kernels, keyed by configuration name. dlopen is refcounted and the
-// libraries live for the process, so this only avoids repeated lookups.
-std::mutex g_cache_mu;
-std::unordered_map<std::string, PagedAttentionFn> g_cache;
-
 ffi::Error ResolveKernel(const std::string &name, PagedAttentionFn *out) {
-  std::lock_guard<std::mutex> lock(g_cache_mu);
-  auto it = g_cache.find(name);
-  if (it != g_cache.end()) {
-    *out = it->second;
-    return ffi::Error::Success();
-  }
-
-  const std::filesystem::path lib = AiterRootDir() / "build" / name / "lib.so";
-  if (!std::filesystem::exists(lib)) {
+  const auto &table = KernelTable();
+  auto it = table.find(name);
+  if (it == table.end()) {
+    std::string known;
+    for (const auto &kv : table) {
+      known += "\n  " + kv.first;
+    }
     return ffi::Error(
         ffi::ErrorCode::kFailedPrecondition,
         "PagedAttentionJA: kernel configuration '" + name +
-            "' is not built (looked for " + lib.string() +
-            "). Run scripts/prebuild_pa_ragged.py for this shape. Building it "
-            "here would mean launching a Python subprocess from inside a kernel "
-            "launch, which this handler deliberately refuses to do.");
+            "' is not compiled into this module. Add it to default_configs() in "
+            "scripts/gen_pa_ragged.py and rebuild "
+            "(make -f Makefile.kv ja_kv). Compiled configurations:" + known);
   }
 
-  void *handle = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (!handle) {
-    const char *err = dlerror();
-    return ffi::Error(ffi::ErrorCode::kInternal,
-                      "PagedAttentionJA: dlopen failed for " + lib.string() +
-                          ": " + (err ? err : "unknown"));
-  }
-
-  dlerror(); // clear
-  auto fn = reinterpret_cast<PagedAttentionFn>(dlsym(handle, name.c_str()));
-  const char *sym_err = dlerror();
-  if (sym_err || !fn) {
-    return ffi::Error(ffi::ErrorCode::kInternal,
-                      "PagedAttentionJA: symbol '" + name + "' not found in " +
-                          lib.string() + ": " + (sym_err ? sym_err : "null"));
-  }
-
-  g_cache.emplace(name, fn);
-  *out = fn;
+  *out = it->second;
   return ffi::Error::Success();
 }
 

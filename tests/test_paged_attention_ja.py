@@ -11,9 +11,10 @@ Unlike M1, this is an arithmetic kernel, so the comparison is a tolerance rather
 than exact equality. Coverage spans MHA and GQA head ratios, sequences that end
 mid-page, and page maps that are deliberately non-contiguous.
 
-These tests need the kernel configuration to have been compiled ahead of time:
+The kernel configurations are compiled into paged_attention_ja.so, so these
+need nothing beyond the module itself:
 
-    python3 scripts/prebuild_pa_ragged.py --head-size 128 --block-size 16
+    make -f Makefile.kv ja_kv
 """
 
 import math
@@ -199,20 +200,24 @@ def test_decode_long_sequence_spans_many_pages():
     _assert_close(got, want, jnp.bfloat16, "long")
 
 
-def test_missing_prebuild_is_an_actionable_error():
-    """A config that was never prebuilt must fail loudly, not shell out.
+def test_uncompiled_config_is_an_actionable_error():
+    """A config that was never compiled in must fail loudly, not shell out.
 
-    gqa_ratio 3 is not in the prebuilt set, so this exercises the path where
-    aiter would otherwise try to spawn a Python interpreter from inside the
-    kernel launch.
+    gqa_ratio 3 is not in gen_pa_ragged.py's default set, so this exercises the
+    path where aiter would otherwise try to spawn a Python interpreter from
+    inside the kernel launch.
+
+    The kernels are compiled into paged_attention_ja.so, so unlike the previous
+    dlopen design there is no cache that could make this succeed by accident:
+    the set is fixed at link time. Hence no else-branch -- not raising is a
+    failure.
     """
-    try:
-        got, _ = _run([16], num_heads=6, num_kv_heads=2, dtype=jnp.bfloat16, seed=17)
-    except Exception as exc:  # noqa: BLE001 - the message is what is under test
-        msg = str(exc).lower()
-        assert "prebuild" in msg or "not built" in msg or "lib.so" in msg, (
-            f"expected an actionable prebuild message, got: {exc!r}"
-        )
-    else:
-        # If it ran, the config was already cached, which is also acceptable.
-        assert got.shape == (1, 6, HEAD_DIM)
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011 - XLA's own error type
+        _run([16], num_heads=6, num_kv_heads=2, dtype=jnp.bfloat16, seed=17)
+
+    msg = str(excinfo.value)
+    # Name the script that fixes it, and show what IS available -- the whole
+    # point of the message is that the reader should not have to go digging.
+    assert "gen_pa_ragged.py" in msg, f"message must name the generator: {msg}"
+    assert "not compiled into this module" in msg, msg
+    assert "pa_ragged_" in msg, f"message must list the compiled configs: {msg}"

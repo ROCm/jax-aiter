@@ -16,9 +16,11 @@ The op is pure. It consumes the pools and returns attention output, so the data
 dependence on ``append_kv``'s aliased result is what orders the read after the
 write.
 
-The kernel configuration must have been compiled ahead of time by
-``scripts/prebuild_pa_ragged.py``; the handler refuses to run rather than let
-aiter fall back to shelling out to Python from inside a kernel launch.
+The kernel configurations are compiled into ``paged_attention_ja.so`` by
+``Makefile.kv`` (sources rendered by ``scripts/gen_pa_ragged.py``), so the set
+is fixed at link time. An unlisted configuration is a clear error naming the
+generator, rather than aiter shelling out to Python from inside a kernel
+launch.
 """
 
 from __future__ import annotations

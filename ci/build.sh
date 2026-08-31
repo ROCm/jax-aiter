@@ -16,7 +16,6 @@
 #      needs ZERO JIT libs -- see below).
 #   3. make ja_mods[_nomha]          -- the FFI shim modules
 #   3b. make -f Makefile.kv ja_kv    -- the paged-KV shims (full path only)
-#   3c. prebuild_pa_ragged.py        -- AOT paged-attention kernels they dlopen
 #   4. python3 -m pip install .      -- the jax-aiter wheel
 #
 # Env:
@@ -37,8 +36,7 @@
 #                     MHA) or "ja_mods_nomha" (LITE: core shims only).
 #   JA_WHEEL_VARIANT  "full" (default) or "lite" -- passed to the pip install
 #                     so a lite build never expects the MHA libs/shims.
-#   JA_SKIP_KV_BUILD  "true"/"1"/"yes" skips the paged-KV shims and their
-#                     prebuilt paged-attention kernels.
+#   JA_SKIP_KV_BUILD  "true"/"1"/"yes" skips the paged-KV shims.
 set -euxo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -95,14 +93,15 @@ make "$JA_MODS_TARGET"
 ls -lh build/jax_aiter_build/*.so
 
 # 3b. Paged-KV shims. They live in Makefile.kv rather than Makefile because
-#     Makefile is one of the four compute_patch_hash() inputs behind CACHE_ID:
-#     editing it rekeys the immutable JIT identity and orphans the multi-GB
-#     prebuilt MHA libraries, so a one-line KV change would cost a 12 h rebuild.
-#     That is an argument about which FILE the rules live in -- it was never a
+#     Makefile is a compute_patch_hash() input behind CACHE_ID, so editing it
+#     rekeys the JIT identity and orphans the prebuilt MHA libraries. Note the
+#     limit of that argument: aiter_sha is ALSO a CACHE_ID input, so once the
+#     pin moves nightly the libs are rebuilt nightly regardless. The split only
+#     buys something on a stable release pin, where a KV-only edit would
+#     otherwise force a rebuild that nothing else needed.
+#     Either way it was an argument about which FILE the rules live in, never a
 #     reason not to BUILD them here. Skipping the target is why tests/test_*kv*
-#     and tests/test_paged_* silently skipped in every CI run to date. The cold
-#     build is 31 s wall (-j, see below) and the tests ~6 s, against a 12 h JIT
-#     budget.
+#     and tests/test_paged_* silently skipped in every CI run to date.
 #     The lite path skips it: that variant exists to be small.
 skip_kv=0
 case "${JA_SKIP_KV_BUILD:-}" in
@@ -120,26 +119,16 @@ else
   # past the 60 min gpu-job timeout on its own. Parallel it is 31 s wall on 256
   # cores. paged_prefill re-enters make and the jobserver is handed down, so
   # this one -j covers the inner build too.
+  #
+  # The paged-attention kernels are compiled INTO paged_attention_ja.so by this
+  # target (scripts/gen_pa_ragged.py renders aiter's own template, ~4 s for 6
+  # configurations). There is deliberately no separate prebuild step and no
+  # $HOME/.aiter cache: an earlier design dlopened aiter's Python-JIT output at
+  # run time, which needed a jinja2 install, left the kernels outside the wheel,
+  # and produced a RUNPATH-less library that would not load in a container that
+  # had not been hand-taught where ROCm lives -- which is exactly how it failed.
   make -f Makefile.kv ja_kv -j"$(nproc)"
   ls -lh build/jax_aiter_build/*kv*.so build/jax_aiter_build/paged_*.so
-
-  # 3c. paged_attention_ja.so resolves aiter's paged-attention kernel by dlopen
-  #     from $HOME/.aiter/build and REFUSES to compile it on demand -- doing so
-  #     would mean spawning a Python subprocess from inside an FFI handler. So
-  #     the .so alone is not enough: without this, tests/test_paged_attention_ja
-  #     fails with "kernel configuration ... is not built". The script's default
-  #     set is by definition the one those tests exercise (bf16/fp16 x MHA/GQA/MQA,
-  #     head 128, block 16), and a cold build of all 6 is ~24 s. AITER_ROOT_DIR
-  #     is left unset deliberately: it is the only value the C++ and Python cache
-  #     spellings agree on, and ci/test.sh runs in this same container.
-  # aiter's codegen imports jinja2 (third_party/aiter/csrc/cpp_itfs/utils.py:8) and
-  # the CI image does not ship it. Install it HERE and not in ci/setup_jax.sh:
-  # setup_jax.sh is a hashed compute_patch_hash() input (ci/jit_libs_manifest.py:85),
-  # so a one-line edit there rekeys CACHE_ID and orphans the multi-GB prebuilt MHA
-  # libs -- which is exactly what it did on the first attempt. ci/build.sh is not
-  # hashed, so this is free.
-  python3 -m pip install --break-system-packages --quiet jinja2
-  python3 scripts/prebuild_pa_ragged.py
 fi
 
 # 4. install jax-aiter (variant gates which *.so are staged into the wheel).
