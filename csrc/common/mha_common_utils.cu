@@ -161,11 +161,11 @@ prepare_rng_state_for_fwd(hipStream_t stream, float dropout_p, int dev_idx,
                           xla::ffi::Result<xla::ffi::AnyBuffer> &rng_state,
                           RngStatePointers &out_ptrs) {
 
-  // Ensure rng_state buffer is valid (16 bytes = two uint64 seed/offset values).
-  if (rng_state->size_bytes() < 2 * sizeof(uint64_t)) {
+  // Ensure rng_state buffer is valid
+  if (rng_state->size_bytes() < 2 * sizeof(int64_t)) {
     return xla::ffi::Error(
         xla::ffi::ErrorCode::kInvalidArgument,
-        "rng_state result buffer must have at least 16 bytes");
+        "rng_state result buffer must have at least 2 int64s");
   }
 
   uint64_t *rng_state_ptr =

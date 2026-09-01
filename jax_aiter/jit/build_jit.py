@@ -108,9 +108,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
             "torch_exclude": True,
             "hip_clang_path": None,
             "blob_gen_cmd": "",
-            "third_party": [],
-            "hipify": True,
-            "flags_extra_hip_per_source": {},
         }
 
         # Convert string expressions to actual values using eval.
@@ -525,9 +522,6 @@ def build_module(core_module, module_name, verbose=False):
             build_args.get("torch_exclude", False),
             third_party=build_args.get("third_party", []),
             hipify=build_args.get("hipify", True),
-            flags_extra_hip_per_source=build_args.get(
-                "flags_extra_hip_per_source", {}
-            ),
         )
         logger.info(f"Successfully built {module_name}")
 

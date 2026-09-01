@@ -23,11 +23,6 @@
 namespace jax_aiter {
 namespace mha_utils {
 
-inline bool dtype_is_fp8(xla::ffi::DataType dtype) {
-  return dtype == xla::ffi::DataType::F8E4M3FN ||
-         dtype == xla::ffi::DataType::F8E4M3FNUZ;
-}
-
 inline std::string dtype_to_string(xla::ffi::DataType dtype) {
   switch (dtype) {
   case xla::ffi::DataType::F16:
@@ -36,9 +31,6 @@ inline std::string dtype_to_string(xla::ffi::DataType dtype) {
     return "bf16";
   case xla::ffi::DataType::F32:
     return "fp32";
-  case xla::ffi::DataType::F8E4M3FN:
-  case xla::ffi::DataType::F8E4M3FNUZ:
-    return "fp8bf16";
   default:
     throw std::runtime_error("Unsupported dtype for MHA");
   }
@@ -52,8 +44,6 @@ inline size_t dtype_size(xla::ffi::DataType dtype) {
   case xla::ffi::DataType::F32:
     return 4;
   case xla::ffi::DataType::U8:
-  case xla::ffi::DataType::F8E4M3FN:
-  case xla::ffi::DataType::F8E4M3FNUZ:
     return 1;
   case xla::ffi::DataType::S32:
     return 4;

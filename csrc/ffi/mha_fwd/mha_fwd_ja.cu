@@ -131,7 +131,8 @@ MhaFwdUnified_Bridge(
   }
 
   auto q_dtype = q.element_type();
-  const bool is_fp8 = mha_utils::dtype_is_fp8(q_dtype);
+  const bool is_fp8 = q_dtype == ffi::DataType::F8E4M3FN ||
+                      q_dtype == ffi::DataType::F8E4M3FNUZ;
 
   if (!is_fp8 && q_dtype != ffi::DataType::F16 && q_dtype != ffi::DataType::BF16) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
@@ -175,7 +176,8 @@ MhaFwdUnified_Bridge(
                       "return_dropout_randval requires dropout_p > 0");
   }
 
-  std::string dtype_str = mha_utils::dtype_to_string(q_dtype);
+  std::string dtype_str =
+      is_fp8 ? "fp8bf16" : mha_utils::dtype_to_string(q_dtype);
 
   // Descale pointers for FP8. Shape [1] -> per-tensor; [batch, nheads_k] -> per-head.
   const void *q_descale_ptr = nullptr;
