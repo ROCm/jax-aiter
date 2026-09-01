@@ -395,7 +395,12 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
+            # Full mode, NOT --jax-only. --jax-only implies --no-deps and exists
+            # to RESTORE our jax pins *after* MaxText has pulled its own -- which
+            # run_8b_fp4.sh already does for itself at the right moment. Running
+            # it here, first, in a bare runtime container leaves numpy uninstalled
+            # and setup_jax's own verify step dies importing jax.
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh
             shopt -s nullglob
             wheels=(dist/jax_aiter-*+full-*.whl)
             test "${#wheels[@]}" -eq 1
@@ -405,6 +410,7 @@ jobs:
           '
 
       - name: Run the blog_batch9 MXFP4 process
+        id: recipe
         run: |
           docker exec \
             -e PERF_OUT_DIR=/jax-aiter/ci_perf_out \
@@ -420,7 +426,10 @@ jobs:
           fi
 
       - name: Parse tail-10 and apply the gate
-        if: always()
+        # Only meaningful if the recipe actually produced a train.log. Without
+        # this the step fails with "log not found" on top of whatever really
+        # broke, and the run summary reports the wrong root cause.
+        if: steps.recipe.outcome == 'success'
         run: |
           # tail-10 over a 50-step run is completed_steps_40_49, the same
           # measurement window the recipe and the published numbers use.
