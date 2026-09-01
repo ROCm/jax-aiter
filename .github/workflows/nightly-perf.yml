@@ -1,37 +1,94 @@
-name: JAX-AITER Nightly MXFP4 Regression
+name: JAX-AITER Nightly (AITER bump + 8x MI355 MXFP4)
 
-# One canonical FSDP4 process on the 4-GPU pool. This is a regression detector,
-# not the FSDP8 publication operating point. Record-only until the first
-# TheRock 7.14 / JAX 0.11 baseline is reviewed and committed.
+# Nightly integration of the newest AITER against the published MXFP4 operating
+# point, on the ONE box whose throughput is comparable night to night.
+#
+# Shape:
+#   bump    -> move third_party/aiter + jit_assets.py to AITER origin/main,
+#              commit onto a throwaway branch (never straight to main)
+#   jit     -> build all three JIT libs FRESH at the new pin (3-way matrix,
+#              ~1h50m wall; a pin move rotates CACHE_ID so this cannot be
+#              skipped -- that cost is inherent to bumping nightly)
+#   wheel   -> publish the immutable JIT release, then build the manylinux
+#              wheel in the SAME image release-publish.yml uses
+#   perf    -> install THAT wheel on 8 GPUs, run the blog_batch9 recipe
+#   tests   -> full suite at the new pin, in parallel with perf
+#   promote -> only if perf AND tests both pass, fast-forward main to the bump
+#
+# Why the perf job installs the wheel rather than building in place: it is the
+# artifact users actually receive, and until this workflow existed every
+# throughput number on record came from a dev-image source build. A baseline is
+# only worth gating on if it was taken on the shipped binary.
+#
+# Note what "the wheel" is, because the two images are easy to mix up. The
+# attention/rmsnorm JIT libs (librmsnorm_fwd, libmha_fwd, libmha_bwd) are built
+# by the `jit` job in the DEV image and downloaded here as artifacts; the
+# manylinux image contributes only the umbrella libjax_aiter.so and the FFI
+# shims, plus auditwheel and the wheel tags. So dev-vs-manylinux clang does NOT
+# apply to the attention kernels -- they are byte-identical to a dev build.
+# (Measured 2026-08-31 on m15-29, hardware held constant: the +full wheel ran
+# 1822.2915 vs the 1840.6644 source figure, -1.00%, N=1 each.)
+#
+# Runner labels are load-bearing only for hardware class, not for a fixed host.
+# All four pools this repo uses (build-only-jax-aiter, linux-jax-aiter-mi355-1
+# / -4 / -8) are org-managed ARC ephemeral pools -- verified from runner names
+# in runs 33458425029 and 33474028161. An earlier version of this comment
+# claimed the 8-GPU label pinned to smci355-ccs-aus-n15-13; it does not. Two
+# consecutive nights can therefore land on different nodes of the same pool,
+# which is exactly what a throughput gate has to absorb, and is one more reason
+# the gate stays opt-in until several nights are on record.
 
 on:
   workflow_dispatch:
     inputs:
-      wheel_url:
-        description: "Default alpha2 wheel URL"
+      aiter_ref:
+        description: "AITER ref to bump onto"
         type: string
-        default: "https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl"
+        default: main
+      gate:
+        description: "Fail the perf job below the baseline floor"
+        type: boolean
+        default: false
+      promote:
+        description: "Fast-forward main when everything is green"
+        type: boolean
+        default: true
   schedule:
-    - cron: '0 6 * * *'
+    # 04:00 UTC: after nightly-ci.yml (01:00) has finished with the 4-GPU pool,
+    # and well clear of the working day on the shared box.
+    - cron: '0 4 * * *'
 
 concurrency:
-  group: nightly-mxfp4-fsdp4
-  # Do not cancel a process after spending the compilation/warm-up cost.
+  group: nightly-mxfp4-8gpu
+  # Never cancel: a run that reaches the perf job has already spent ~2h of
+  # compile, and the 8-GPU box is a single shared resource.
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 env:
-  IMAGE: ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14
-  CONTAINER_NAME: ja_perf_fsdp4
-  WHEEL_URL: ${{ inputs.wheel_url || 'https://github.com/ROCm/jax-aiter/releases/download/v0.1.0-alpha2/jax_aiter-0.1.0a2-cp312-cp312-manylinux_2_39_x86_64.whl' }}
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  GPU_ARCHS: gfx950
+  ROCM_VERSION: "7.14.0"
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+  JA_WHEEL_PLAT_NAME: manylinux_2_39_x86_64
+  BUMP_BRANCH: nightly/aiter-auto-bump
 
 jobs:
-  mxfp4-fsdp4:
-    name: MXFP4 Llama 3.1 8B (4x MI355)
-    runs-on: linux-jax-aiter-mi355-4
-    timeout-minutes: 180
+  bump:
+    name: bump AITER pin
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 30
+    outputs:
+      aiter_sha: ${{ steps.bump.outputs.aiter_sha }}
+      previous_sha: ${{ steps.bump.outputs.previous_sha }}
+      moved: ${{ steps.bump.outputs.moved }}
+      branch_sha: ${{ steps.push.outputs.branch_sha }}
+      jit_tag: ${{ steps.cache.outputs.tag }}
     steps:
       - name: Fix permissions from a previous container run
         run: |
@@ -41,19 +98,285 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
+          submodules: recursive
+          # A shallow superproject cannot be pushed from, and the bump commit
+          # has to land on a real branch for the downstream jobs to check out.
+          fetch-depth: 0
+
+      - name: Move the pin to AITER tip
+        id: bump
+        run: |
+          bash ci/bump_aiter_pin.sh --ref "${{ inputs.aiter_ref || 'main' }}"
+
+      - name: Publish the candidate branch
+        id: push
+        run: |
+          # Force-push: the branch is a scratch pointer at tonight's candidate,
+          # not history anyone builds on. It exists so every downstream job
+          # checks out one identical tree, and so a rejected pin stays
+          # inspectable instead of vanishing with the runner.
+          git push --force origin "HEAD:refs/heads/$BUMP_BRANCH"
+          echo "branch_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the JIT identity for this pin
+        id: cache
+        run: |
+          tag="$(python3 ci/jit_libs_manifest.py cache-id \
+            --repo-root . --gpu-archs "$GPU_ARCHS" \
+            --rocm-version "$ROCM_VERSION" --prefix jit-libs)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "JIT identity for this pin: $tag"
+
+      - name: Summary
+        run: |
+          {
+            echo "### AITER pin"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| previous | \`${{ steps.bump.outputs.previous_sha }}\` |"
+            echo "| candidate | \`${{ steps.bump.outputs.aiter_sha }}\` |"
+            echo "| moved | ${{ steps.bump.outputs.moved }} |"
+            echo "| JIT identity | \`${{ steps.cache.outputs.tag }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  jit:
+    name: build ${{ matrix.module }} (fresh)
+    needs: bump
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          # Measured cold-build costs: rmsnorm ~7 min, mha_fwd ~49 min,
+          # mha_bwd ~81 min. The longest chain sets the wall time, so the two
+          # expensive modules each get their own runner.
+          - module: librmsnorm_fwd
+            runner: build-only-jax-aiter
+            timeout: 180
+          - module: libmha_fwd
+            runner: linux-jax-aiter-mi355-1
+            timeout: 720
+          - module: libmha_bwd
+            runner: linux-jax-aiter-mi355-4
+            timeout: 720
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    env:
+      CONTAINER_NAME: ja_nightly_jit_${{ matrix.module }}_${{ github.run_id }}
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.bump.outputs.branch_sha }}
+          submodules: recursive
           fetch-depth: 1
 
-      - name: Download alpha2 default wheel
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Launch GPU-less build container
         run: |
-          mkdir -p dist
-          # Keep the published filename: pip reads the platform tag from it.
-          curl -fL --retry 3 --retry-delay 2 \
-            -o "dist/$(basename "$WHEEL_URL")" "$WHEEL_URL"
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host --ipc=host --shm-size=16G \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS \
+            -e AITER_ASM_DIR -e ROCM_VERSION \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
+
+      - name: Install tooling and JAX
+        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+
+      - name: Build umbrella library
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            make
+            test -s build/jax_aiter_build/libjax_aiter.so
+          '
+
+      - name: Build ${{ matrix.module }}
+        # Do not pass --verbose: it produced a 92 MB log on the monolithic build.
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc \
+            'python3 jax_aiter/jit/build_jit.py --module "${{ matrix.module }}"'
+
+      - name: Verify and hand output to runner
+        run: |
+          test -s "build/aiter_build/${{ matrix.module }}.so"
+          sudo chown "$(id -u):$(id -g)" "build/aiter_build/${{ matrix.module }}.so"
+          ls -lh "build/aiter_build/${{ matrix.module }}.so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-jit-${{ matrix.module }}
+          path: build/aiter_build/${{ matrix.module }}.so
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 1
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
+
+  wheel:
+    name: publish JIT libs + build manylinux wheel
+    needs: [bump, jit]
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 180
+    env:
+      CONTAINER_NAME: ja_nightly_wheel_${{ github.run_id }}
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.bump.outputs.branch_sha }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nightly-jit-*
+          path: build/aiter_build
+          merge-multiple: true
+
+      - name: Verify complete module set
+        run: |
+          test -s build/aiter_build/librmsnorm_fwd.so
+          test -s build/aiter_build/libmha_fwd.so
+          test -s build/aiter_build/libmha_bwd.so
+          ls -lh build/aiter_build/*.so
+
+      # Published BEFORE the gates run, deliberately. The release is a
+      # content-addressed build cache keyed by the pin, not an endorsement of
+      # it: if tonight's pin is rejected nothing references this tag and it is
+      # inert. If the pin is promoted, the libs are already in place, so the
+      # next PR run fetches instead of paying the 1h50m rebuild.
+      - name: Publish the immutable JIT release for this pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.bump.outputs.jit_tag }}"
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            echo "immutable release $tag already exists; reusing it"
+          else
+            bash ci/publish_jit_libs.sh --tag "$tag" --no-upload
+            gh release create "$tag" \
+              --repo "$GH_REPO" \
+              --target "${{ needs.bump.outputs.branch_sha }}" \
+              --title "AITER JIT libraries $tag" \
+              --prerelease \
+              --notes "Immutable prebuilt AITER JIT libraries. Identity: AITER SHA + gfx architecture + ROCm version + JIT recipe/ABI hash. Produced by the nightly AITER bump."
+            shopt -s nullglob
+            assets=(build/jit_libs_dist/*)
+            test "${#assets[@]}" -gt 1
+            gh release upload "$tag" --repo "$GH_REPO" "${assets[@]}"
+          fi
+
+      - name: Pull manylinux build image
+        run: docker pull "$BUILD_IMAGE"
+
+      - name: Launch build container
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host --ipc=host --shm-size=16G \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS \
+            -e JA_WHEEL_PLAT_NAME -e AITER_ASM_DIR \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w /jax-aiter "$BUILD_IMAGE" tail -f /dev/null
+
+      - name: Install build tooling and JAX
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            # The manylinux image is minimal. --jax-only uses --no-deps, so
+            # provide the JAX runtime requirements first.
+            python3 -m pip install --break-system-packages \
+              numpy ml_dtypes scipy opt_einsum
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
+            python3 -m pip install --break-system-packages pandas auditwheel
+            # build_wheel.sh runs pip wheel --no-build-isolation, so the PEP 517
+            # backend must already be importable. wheel is capped because
+            # setup.py imports wheel.bdist_wheel.
+            python3 -m pip install --break-system-packages \
+              "setuptools>=64" "wheel<1.0"
+          '
+
+      - name: Build umbrella and FFI shims
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            make
+            make ja_mods
+            test -s build/jax_aiter_build/libjax_aiter.so
+            test -s build/jax_aiter_build/mha_fwd_ja.so
+            test -s build/jax_aiter_build/mha_bwd_ja.so
+          '
+
+      - name: Package the full wheel
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc \
+            'bash scripts/build_wheel.sh --variant full'
+
+      - name: Hand the wheel back to the runner user
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" dist
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wheel
+          path: dist/*+full-*.whl
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
+
+  perf:
+    name: MXFP4 Llama 3.1 8B (8x MI355, blog_batch9)
+    needs: [bump, wheel]
+    runs-on: linux-jax-aiter-mi355-8
+    timeout-minutes: 180
+    env:
+      CONTAINER_NAME: ja_nightly_perf_${{ github.run_id }}
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.bump.outputs.branch_sha }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nightly-wheel
+          path: dist
 
       - name: Pull runtime image
         run: docker pull "$IMAGE"
 
-      - name: Launch isolated 4-GPU container
+      - name: Launch 8-GPU container
         run: |
           docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           docker run -d --name "$CONTAINER_NAME" \
@@ -61,65 +384,256 @@ jobs:
             --ipc=host --shm-size=64G --group-add=video \
             --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
             -e GPU_ARCHS=gfx950 -e AITER_SYMBOL_VISIBLE=1 \
-            -e HIP_VISIBLE_DEVICES=0,1,2,3 \
+            -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
             -v "${{ github.workspace }}:/jax-aiter" \
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
-      - name: Install JAX, JAX-AITER, and MHA assets
+      - name: Container privilege snapshot (diagnostic, never fails the job)
+        continue-on-error: true
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
+          # Runs 33458425029 and 33467884782 both died here at `apt-get update`
+          # with "Could not open lock file /var/lib/apt/lists/lock (13)". Adding
+          # `-u 0` did not help, and a dedicated probe on this same pool
+          # (probe-runner-perms, run 33474028161) came back uid=0 with
+          # CapEff a80c25fb, an unmapped userns and /var/lib/apt/lists WRITABLE.
+          # So the pool is not uniformly root-less; whatever differs is
+          # per-node. Print it on every night so the next failure names itself.
+          echo "runner=$RUNNER_NAME"
+          docker info --format 'Rootless={{.Rootless}} Driver={{.Driver}}' || true
+          docker exec -u 0 "$CONTAINER_NAME" bash -lc '
+            echo "uid=$(id -u) gid=$(id -g)"
+            grep CapEff /proc/self/status
+            echo "uid_map: $(cat /proc/self/uid_map)"
+            echo "apt lists: $(stat -c "%U:%G %a" /var/lib/apt/lists 2>&1)"
+            touch /var/lib/apt/lists/.probe && echo "APT DIR WRITABLE" || echo "APT DIR NOT WRITABLE"
+            touch /usr/local/lib/.probe && echo "SITEPKG WRITABLE" || echo "SITEPKG NOT WRITABLE"
+          ' || true
+
+      - name: Install JAX and tonight's wheel
+        run: |
+          # setup_jax_runtime.sh, not setup_jax.sh: this leg installs a prebuilt
+          # wheel and compiles nothing, so it needs none of the apt tooling --
+          # and some nodes in the linux-jax-aiter-mi355-8 ARC pool deny even
+          # uid 0 a writable /var/lib/apt/lists inside docker exec, which turned
+          # an unnecessary `apt-get update` into a hard failure twice (runs
+          # 33458425029, 33467884782). It is a separate script rather than a
+          # flag because ci/setup_jax.sh is hashed into the JIT CACHE_ID; see
+          # the header of ci/setup_jax_runtime.sh. -u 0 is kept as the
+          # project-wide convention. Output ownership is handled by the sudo
+          # chown step below.
+          docker exec -u 0 "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax_runtime.sh
             shopt -s nullglob
-            wheels=(dist/jax_aiter-0.1.0a2-*.whl)
+            wheels=(dist/jax_aiter-*+full-*.whl)
             test "${#wheels[@]}" -eq 1
             python3 -m pip install --break-system-packages "${wheels[0]}"
             cd /tmp
-            jax-aiter-fetch-mha
-            python3 -c "import jax; from jax_aiter.mha import flash_attn_func; print(jax.devices(), flash_attn_func)"
+            python3 -c "import jax; from jax_aiter.mha import flash_attn_func; print(jax.devices()); print(flash_attn_func)"
           '
 
-      - name: Run canonical MXFP4 FSDP4 process
+      - name: Wait for an idle GPU
         run: |
-          docker exec \
+          # Co-tenancy on these boxes is real. A run that starts against someone
+          # else's job produces a number that looks like a regression and is
+          # not one; two mid-run excursions traced to exactly this forced a
+          # measured run to be retired during the wheel-vs-source analysis.
+          # Runs inside the container because rocm-smi ships in the runtime
+          # image and is not guaranteed on the ARC runner host. Best-effort:
+          # a busy box warns and measures anyway rather than failing the build.
+          docker exec -u 0 -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+            "$CONTAINER_NAME" bash -lc 'bash scripts/wait_for_idle_gpu.sh' || true
+
+      - name: Capture GPU provenance (pre-run)
+        continue-on-error: true
+        run: |
+          # This pool is ephemeral: every nightly lands on a different physical
+          # host and that host is gone by the time anyone reads the result.
+          # Without machine state a flat offset against the frozen 1840.6644
+          # anchor cannot be told apart from a real kernel regression -- the
+          # recipe, XLA_FLAGS and COMMAND already diff clean, so the remaining
+          # candidates are all node-level (power cap first, then VBIOS/driver).
+          docker exec -u 0 -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+            -e RUNNER_NAME="$RUNNER_NAME" -e GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            "$CONTAINER_NAME" bash -lc \
+            'bash ci/perf/capture_gpu_provenance.sh /jax-aiter/ci_perf_out/gpu_provenance_pre.txt'
+
+      - name: Run the blog_batch9 MXFP4 process
+        id: recipe
+        run: |
+          docker exec -u 0 \
             -e PERF_OUT_DIR=/jax-aiter/ci_perf_out \
             -e MAXTEXT_DIR=/maxtext_perf \
+            -e RECIPE_PROFILE=blog_batch9 \
             "$CONTAINER_NAME" bash -lc 'bash ci/perf/run_8b_fp4.sh'
+
+      - name: Capture GPU provenance (post-run)
+        if: always()
+        continue-on-error: true
+        run: |
+          docker exec -u 0 -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+            -e RUNNER_NAME="$RUNNER_NAME" -e GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            "$CONTAINER_NAME" bash -lc \
+            'bash ci/perf/capture_gpu_provenance.sh /jax-aiter/ci_perf_out/gpu_provenance_post.txt' || true
 
       - name: Hand perf output back to the runner user
         if: always()
         run: |
           if [ -d "${{ github.workspace }}/ci_perf_out" ]; then
-            sudo chown -R "$(id -u):$(id -g)" \
-              "${{ github.workspace }}/ci_perf_out"
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/ci_perf_out"
           fi
 
-      - name: Parse tail-10 (record-only)
-        if: always()
+      - name: Parse tail-10 and apply the gate
+        # Only meaningful if the recipe actually produced a train.log. Without
+        # this the step fails with "log not found" on top of whatever really
+        # broke, and the run summary reports the wrong root cause.
+        if: steps.recipe.outcome == 'success'
         run: |
+          # tail-10 over a 50-step run is completed_steps_40_49, the same
+          # measurement window the recipe and the published numbers use.
           python3 ci/perf/parse_perf_log.py \
             --log ci_perf_out/mxfp4/train.log \
-            --out-json ci_perf_out/perf_8b_fp4.json \
-            --label 8b_fp4 --tail-n 10 \
-            --step-summary ci_perf_out/perf_8b_fp4_summary.md
+            --out-json ci_perf_out/perf_8b_fp4_fsdp8.json \
+            --label 8b_fp4_fsdp8 --tail-n 10 \
+            --baseline ci/perf/baseline_8b_fp4_fsdp8.json \
+            --step-summary ci_perf_out/perf_8b_fp4_fsdp8_summary.md \
+            ${{ inputs.gate && '--gate' || '' }}
 
       - name: Write step summary
         if: always()
         run: |
-          if [ -f ci_perf_out/perf_8b_fp4_summary.md ]; then
-            cat ci_perf_out/perf_8b_fp4_summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f ci_perf_out/perf_8b_fp4_fsdp8_summary.md ]; then
+            cat ci_perf_out/perf_8b_fp4_fsdp8_summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f ci_perf_out/gpu_provenance_pre.txt ]; then
+            {
+              echo ""
+              echo "### Node"
+              echo '```'
+              grep -E "^(runner_name|hostname|driver_version)=|max_power_w=" \
+                ci_perf_out/gpu_provenance_pre.txt | sort -u
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perf-8b-fp4-fsdp4
+          name: nightly-perf-8b-fp4-fsdp8
           path: |
             ci_perf_out/mxfp4/train.log
-            ci_perf_out/perf_8b_fp4.json
-            ci_perf_out/perf_8b_fp4_summary.md
+            ci_perf_out/perf_8b_fp4_fsdp8.json
+            ci_perf_out/perf_8b_fp4_fsdp8_summary.md
+            ci_perf_out/gpu_provenance_pre.txt
+            ci_perf_out/gpu_provenance_post.txt
           if-no-files-found: warn
 
       - name: Cleanup
         if: always()
         run: docker rm -f "$CONTAINER_NAME" || true
+
+  tests:
+    name: full suite at the candidate pin (4x MI355)
+    needs: [bump, wheel]
+    runs-on: linux-jax-aiter-mi355-4
+    timeout-minutes: 120
+    env:
+      CONTAINER_NAME: ja_nightly_tests_${{ github.run_id }}
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.bump.outputs.branch_sha }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Fetch the JIT libs the wheel job just published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p build/aiter_build
+          bash ci/fetch_jit_libs.sh
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Launch container
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host --device=/dev/kfd --device=/dev/dri \
+            --ipc=host --shm-size=32G --group-add=video \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS -e AITER_ASM_DIR \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
+
+      - name: Install tooling and JAX
+        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+
+      - name: Build against the candidate pin
+        run: |
+          docker exec -e JA_SKIP_JIT_BUILD=true "$CONTAINER_NAME" \
+            bash -lc 'bash ci/build.sh'
+
+      - name: Test (full suite, including slow and multigpu)
+        run: |
+          docker exec -e JA_TEST_TIER=nightly "$CONTAINER_NAME" \
+            bash -lc 'bash ci/test.sh'
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true
+
+  promote:
+    name: promote the pin to main
+    needs: [bump, perf, tests]
+    # `github.ref` is load-bearing, not belt-and-braces. Without it, dispatching
+    # this workflow from a feature branch with promote=true would fast-forward
+    # main onto that branch's HEAD -- merging the whole branch by side door,
+    # since the merge-base check below only proves main is an ANCESTOR, which
+    # any branch cut from main satisfies. Scheduled runs always carry
+    # refs/heads/main, so this costs the nightly nothing.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && needs.bump.outputs.moved == 'true'
+      && needs.perf.result == 'success'
+      && needs.tests.result == 'success'
+      && (github.event_name == 'schedule' || inputs.promote)
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.bump.outputs.branch_sha }}
+          fetch-depth: 0
+
+      - name: Fast-forward main to the validated pin
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          # Only ever a fast-forward. If main moved while the night ran, the
+          # candidate was validated against a tree that no longer exists and
+          # promoting it would silently revert whatever landed in between;
+          # tomorrow's run rebases onto the new main and re-validates.
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "::warning::main advanced during the run; skipping promotion."
+            exit 0
+          fi
+          git push origin "HEAD:refs/heads/main"
+          echo "promoted AITER pin -> ${{ needs.bump.outputs.aiter_sha }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Promoted"
+            echo ""
+            echo "AITER pin \`${{ needs.bump.outputs.previous_sha }}\`"
+            echo "-> \`${{ needs.bump.outputs.aiter_sha }}\` on \`main\`."
+          } >> "$GITHUB_STEP_SUMMARY"
