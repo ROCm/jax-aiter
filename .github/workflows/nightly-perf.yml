@@ -393,9 +393,11 @@ jobs:
 
       - name: Install JAX and tonight's wheel
         run: |
-          # -u 0: the 8-GPU label is served by the self-hosted n15-13, where
-          # docker exec does NOT land as root (the ARC pools that serve the
-          # other labels do). setup_jax's apt-get then dies with
+          # -u 0: the linux-jax-aiter-mi355-8 pool does NOT give root inside
+          # docker exec, while build-only-jax-aiter and linux-jax-aiter-mi355-1
+          # and -4 do. All four are ARC ephemeral pools -- this is a property of
+          # that one pool's config, not of self-hosted vs ARC (verified against
+          # runner names in run 33458425029). setup_jax's apt-get then dies with
           # "Could not open lock file /var/lib/apt/lists/lock". This matches the
           # project-wide `docker exec -u 0` convention. Output ownership is
           # already handled by the sudo chown step below.
