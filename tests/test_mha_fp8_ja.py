@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from jax_aiter.mha import flash_attn_func, flash_attn_varlen
-from jax_aiter.ja_compat.dtypes import get_dtype_fp8
+from jax_aiter.ja_compat.chip_info import get_gfx
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ def run_fwd(q, k, v, **kw):
 
 def _fp8_dtype():
     """Returns the FP8 dtype for the current GPU (e4m3fn on gfx950, e4m3fnuz on gfx942)."""
-    return get_dtype_fp8()
+    return jnp.float8_e4m3fnuz if get_gfx() == "gfx942" else jnp.float8_e4m3fn
 
 
 def _make_fp8_qkv(b, sq, sk, hq, hk, d, seed=0):
@@ -305,8 +305,9 @@ class TestFp8Regressions:
         k_t = jnp.ones((2, 128, 4, 128), dtype=fp8)
         v = jnp.ones((2, 128, 4, 128), dtype=fp8)
         with pytest.raises(Exception):
-            # No descales → C++ bridge returns error → JAX raises
-            _ = run_fwd(q, k_t, v)
+            # No descales → C++ bridge returns error → JAX raises. Dispatch is
+            # async, so block to surface the handler's error here.
+            jax.block_until_ready(run_fwd(q, k_t, v))
 
     def test_fp8_non_power_of_2_gqa_raises(self):
         """FP8 GQA ratio 3 (non-power-of-2) must be rejected."""
@@ -316,7 +317,9 @@ class TestFp8Regressions:
         v = jnp.ones((2, 128, 2, 128), dtype=fp8)
         desc = jnp.ones((1,), dtype=jnp.float32)
         with pytest.raises(Exception):
-            _ = run_fwd(q, k_t, v, q_descale=desc, k_descale=desc, v_descale=desc)
+            jax.block_until_ready(
+                run_fwd(q, k_t, v, q_descale=desc, k_descale=desc, v_descale=desc)
+            )
 
     @pytest.mark.parametrize("d", [128, 256], ids=["d128", "d256"])
     def test_fp8_output_is_bf16_not_fp8(self, d):
