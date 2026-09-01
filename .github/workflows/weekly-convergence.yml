@@ -151,22 +151,24 @@ jobs:
             -v "$JA_DATA_ROOT:/datasets:ro" \
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
+      # -u 0 throughout: this workflow runs on the self-hosted 8-GPU runner,
+      # where docker exec does not land as root and apt/pip writes fail.
       - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+        run: docker exec -u 0 "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
 
       - name: Build against the current pin
         run: |
-          docker exec -e JA_SKIP_JIT_BUILD=true "$CONTAINER_NAME" \
+          docker exec -u 0 -e JA_SKIP_JIT_BUILD=true "$CONTAINER_NAME" \
             bash -lc 'bash ci/build.sh'
 
       - name: Install MaxText at the pinned recipe commit
         run: |
-          docker exec -e MAXTEXT_DIR=/maxtext_conv "$CONTAINER_NAME" \
+          docker exec -u 0 -e MAXTEXT_DIR=/maxtext_conv "$CONTAINER_NAME" \
             bash -lc 'JA_MAXTEXT_ONLY=1 bash ci/perf/run_8b_fp4.sh'
 
       - name: Run the ${{ matrix.arm }} convergence leg
         run: |
-          docker exec \
+          docker exec -u 0 \
             -e PROJECT_ROOT=/ \
             -e JAX_AITER_ROOT=/jax-aiter \
             -e MAXTEXT_ROOT=/maxtext_conv \

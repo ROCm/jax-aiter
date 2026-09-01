@@ -393,7 +393,13 @@ jobs:
 
       - name: Install JAX and tonight's wheel
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
+          # -u 0: the 8-GPU label is served by the self-hosted n15-13, where
+          # docker exec does NOT land as root (the ARC pools that serve the
+          # other labels do). setup_jax's apt-get then dies with
+          # "Could not open lock file /var/lib/apt/lists/lock". This matches the
+          # project-wide `docker exec -u 0` convention. Output ownership is
+          # already handled by the sudo chown step below.
+          docker exec -u 0 "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
             # Full mode, NOT --jax-only. --jax-only implies --no-deps and exists
             # to RESTORE our jax pins *after* MaxText has pulled its own -- which
@@ -412,7 +418,7 @@ jobs:
       - name: Run the blog_batch9 MXFP4 process
         id: recipe
         run: |
-          docker exec \
+          docker exec -u 0 \
             -e PERF_OUT_DIR=/jax-aiter/ci_perf_out \
             -e MAXTEXT_DIR=/maxtext_perf \
             -e RECIPE_PROFILE=blog_batch9 \
