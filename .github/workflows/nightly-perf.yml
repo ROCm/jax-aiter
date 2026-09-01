@@ -423,23 +423,19 @@ jobs:
 
       - name: Install JAX and tonight's wheel
         run: |
-          # --no-apt: this leg installs a prebuilt wheel and compiles nothing, so
-          # it needs none of git/curl/build-essential/pkg-config/zstd beyond what
-          # the runtime image already ships. Some nodes in the
-          # linux-jax-aiter-mi355-8 pool deny even uid 0 a writable
-          # /var/lib/apt/lists inside docker exec, which turned an unnecessary
-          # `apt-get update` into a hard failure twice (runs 33458425029,
-          # 33467884782). -u 0 is kept: it is the project-wide convention and is
-          # harmless where exec is already root. Output ownership is handled by
-          # the sudo chown step below.
+          # setup_jax_runtime.sh, not setup_jax.sh: this leg installs a prebuilt
+          # wheel and compiles nothing, so it needs none of the apt tooling --
+          # and some nodes in the linux-jax-aiter-mi355-8 ARC pool deny even
+          # uid 0 a writable /var/lib/apt/lists inside docker exec, which turned
+          # an unnecessary `apt-get update` into a hard failure twice (runs
+          # 33458425029, 33467884782). It is a separate script rather than a
+          # flag because ci/setup_jax.sh is hashed into the JIT CACHE_ID; see
+          # the header of ci/setup_jax_runtime.sh. -u 0 is kept as the
+          # project-wide convention. Output ownership is handled by the sudo
+          # chown step below.
           docker exec -u 0 "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
-            # Full mode, NOT --jax-only. --jax-only implies --no-deps and exists
-            # to RESTORE our jax pins *after* MaxText has pulled its own -- which
-            # run_8b_fp4.sh already does for itself at the right moment. Running
-            # it here, first, in a bare runtime container leaves numpy uninstalled
-            # and setup_jax's own verify step dies importing jax.
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --no-apt
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax_runtime.sh
             shopt -s nullglob
             wheels=(dist/jax_aiter-*+full-*.whl)
             test "${#wheels[@]}" -eq 1
