@@ -4,6 +4,10 @@
 // Unified MHA forward FFI handler for both batch and varlen modes.
 // Detects mode from tensor rank: 4D = batch [b,s,h,d], 3D = varlen [total,h,d].
 // Calls aiter::mha_fwd(args, stream) which handles CK vs ASM v3 internally.
+//
+// FP8 support: when q/k/v are fp8 (F8E4M3FN / F8E4M3FNUZ), optional descale
+// buffers (q_descale, k_descale, v_descale) of shape [1] or [batch, nheads_k]
+// in fp32 must be provided. Output is always bf16 for fp8 input.
 
 #include <chrono>
 #include <cstring>
@@ -51,6 +55,9 @@ MhaFwdUnified_Bridge(
     std::optional<ffi::AnyBuffer> gen_,
     std::optional<ffi::AnyBuffer> cu_seqlens_q_logical_,
     std::optional<ffi::AnyBuffer> cu_seqlens_kv_logical_,
+    std::optional<ffi::AnyBuffer> q_descale_,
+    std::optional<ffi::AnyBuffer> k_descale_,
+    std::optional<ffi::AnyBuffer> v_descale_,
     ffi::Result<ffi::AnyBuffer> o,
     ffi::Result<ffi::AnyBuffer> lse,
     ffi::Result<ffi::AnyBuffer> p,
@@ -124,14 +131,33 @@ MhaFwdUnified_Bridge(
   }
 
   auto q_dtype = q.element_type();
-  if (q_dtype != ffi::DataType::F16 && q_dtype != ffi::DataType::BF16) {
+  const bool is_fp8 = q_dtype == ffi::DataType::F8E4M3FN ||
+                      q_dtype == ffi::DataType::F8E4M3FNUZ;
+
+  if (!is_fp8 && q_dtype != ffi::DataType::F16 && q_dtype != ffi::DataType::BF16) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
-                      "FlashAttention only supports fp16 and bf16");
+                      "FlashAttention only supports fp16, bf16, and fp8");
   }
   if (k.element_type() != q_dtype || v.element_type() != q_dtype) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument,
                       "q, k, v must have the same dtype");
   }
+
+  if (is_fp8) {
+    // FP8 hd256 only supported on gfx950 via ASM v3; hd128 also works.
+    if ((head_size_q != 128 || head_size_v != 128) &&
+        (head_size_q != 256 || head_size_v != 256)) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                        "FP8 FlashAttention only supports hdim 128x128 or 256x256");
+    }
+    // GQA ratio must be power-of-2 for the ASM FP8 kernels.
+    int64_t gqa_ratio = num_heads / num_heads_k;
+    if ((gqa_ratio & (gqa_ratio - 1)) != 0) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                        "FP8 FlashAttention requires GQA ratio (nheads_q/nheads_k) to be a power of 2");
+    }
+  }
+
   if (batch_size <= 0) {
     return ffi::Error(ffi::ErrorCode::kInvalidArgument, "batch size must be positive");
   }
@@ -150,7 +176,49 @@ MhaFwdUnified_Bridge(
                       "return_dropout_randval requires dropout_p > 0");
   }
 
-  std::string dtype_str = mha_utils::dtype_to_string(q_dtype);
+  std::string dtype_str =
+      is_fp8 ? "fp8bf16" : mha_utils::dtype_to_string(q_dtype);
+
+  // Descale pointers for FP8. Shape [1] -> per-tensor; [batch, nheads_k] -> per-head.
+  const void *q_descale_ptr = nullptr;
+  const void *k_descale_ptr = nullptr;
+  const void *v_descale_ptr = nullptr;
+  ck_tile::index_t nhead_stride_q_descale = 0, nhead_stride_k_descale = 0, nhead_stride_v_descale = 0;
+  ck_tile::index_t batch_stride_q_descale = 0, batch_stride_k_descale = 0, batch_stride_v_descale = 0;
+
+  if (is_fp8) {
+    auto get_descale = [](const std::optional<ffi::AnyBuffer> &buf,
+                          const void *&ptr,
+                          ck_tile::index_t &nhead_stride,
+                          ck_tile::index_t &batch_stride) -> ffi::Error {
+      if (!buf.has_value() || !mha_utils::is_valid_buffer(*buf)) {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "FP8 FlashAttention requires q_descale, k_descale, v_descale");
+      }
+      ptr = buf->untyped_data();
+      auto dims = buf->dimensions();
+      if (dims.size() == 1) {
+        // Per-tensor: [1] - stride = 0 (broadcast)
+        nhead_stride = 0;
+        batch_stride = 0;
+      } else if (dims.size() == 2) {
+        // Per-head: [batch, nheads_k]
+        nhead_stride = 1;
+        batch_stride = static_cast<ck_tile::index_t>(dims[1]);
+      } else {
+        return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                          "descale buffers must be 1D [1] or 2D [batch, nheads_k]");
+      }
+      return ffi::Error::Success();
+    };
+
+    auto err = get_descale(q_descale_, q_descale_ptr, nhead_stride_q_descale, batch_stride_q_descale);
+    if (!err.success()) return err;
+    err = get_descale(k_descale_, k_descale_ptr, nhead_stride_k_descale, batch_stride_k_descale);
+    if (!err.success()) return err;
+    err = get_descale(v_descale_, v_descale_ptr, nhead_stride_v_descale, batch_stride_v_descale);
+    if (!err.success()) return err;
+  }
 
   // Bias / ALiBi handling.
   const void *bias_ptr = nullptr;
@@ -325,9 +393,9 @@ MhaFwdUnified_Bridge(
       .k_ptr = k.untyped_data(),
       .v_ptr = v.untyped_data(),
       .bias_ptr = bias_ptr,
-      .q_descale_ptr = nullptr,
-      .k_descale_ptr = nullptr,
-      .v_descale_ptr = nullptr,
+      .q_descale_ptr = q_descale_ptr,
+      .k_descale_ptr = k_descale_ptr,
+      .v_descale_ptr = v_descale_ptr,
       .rand_val_ptr = return_dropout_randval ? p->untyped_data() : nullptr,
       .lse_ptr = return_softmax_lse ? lse->untyped_data() : nullptr,
       .o_ptr = o->untyped_data(),
@@ -367,9 +435,9 @@ MhaFwdUnified_Bridge(
       .nhead_stride_randval = nhead_stride_randval,
       .nhead_stride_lse = nhead_stride_lse,
       .nhead_stride_o = nhead_stride_o,
-      .nhead_stride_q_descale = 0,
-      .nhead_stride_k_descale = 0,
-      .nhead_stride_v_descale = 0,
+      .nhead_stride_q_descale = nhead_stride_q_descale,
+      .nhead_stride_k_descale = nhead_stride_k_descale,
+      .nhead_stride_v_descale = nhead_stride_v_descale,
       .batch_stride_q = batch_stride_q,
       .batch_stride_k = batch_stride_k,
       .batch_stride_v = batch_stride_v,
@@ -377,9 +445,9 @@ MhaFwdUnified_Bridge(
       .batch_stride_randval = batch_stride_randval,
       .batch_stride_lse = batch_stride_lse,
       .batch_stride_o = batch_stride_o,
-      .batch_stride_q_descale = 0,
-      .batch_stride_k_descale = 0,
-      .batch_stride_v_descale = 0,
+      .batch_stride_q_descale = batch_stride_q_descale,
+      .batch_stride_k_descale = batch_stride_k_descale,
+      .batch_stride_v_descale = batch_stride_v_descale,
 
       .window_size_left = mask.left,
       .window_size_right = mask.right,
@@ -425,6 +493,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // gen (optional)
         .Arg<ffi::AnyBuffer>() // cu_seqlens_q_logical (optional)
         .Arg<ffi::AnyBuffer>() // cu_seqlens_kv_logical (optional)
+        .Arg<ffi::AnyBuffer>() // q_descale: fp32 [1] or [batch, nheads_k] (optional, fp8 only)
+        .Arg<ffi::AnyBuffer>() // k_descale (optional, fp8 only)
+        .Arg<ffi::AnyBuffer>() // v_descale (optional, fp8 only)
         .Ret<ffi::AnyBuffer>() // o
         .Ret<ffi::AnyBuffer>() // lse
         .Ret<ffi::AnyBuffer>() // p (dropout mask)

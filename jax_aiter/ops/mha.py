@@ -39,6 +39,12 @@ def _empty(dtype):
     return jnp.zeros((0,), dtype=dtype)
 
 
+# Two uint64 values (seed, offset) packed into 4 int32 elements (16 bytes).
+# JAX default mode truncates int64 to int32, so we use int32 x 4 explicitly.
+_RNG_STATE_SHAPE = (4,)
+_RNG_STATE_DTYPE = jnp.int32
+
+
 def _sf(x) -> np.float32:
     return np.float32(x)
 
@@ -47,29 +53,31 @@ def _si(x) -> np.int32:
     return np.int32(x)
 
 
-def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, rng_shape, dtype):
+def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype):
     call = jax.ffi.ffi_call(
         "MhaFwdUnifiedJA",
         (
-            jax.ShapeDtypeStruct(out_shape, dtype),
+            jax.ShapeDtypeStruct(out_shape, out_dtype),
             jax.ShapeDtypeStruct(lse_shape, jnp.float32),
             jax.ShapeDtypeStruct(p_shape, jnp.uint8),
-            jax.ShapeDtypeStruct(rng_shape, jnp.int64),
+            jax.ShapeDtypeStruct(_RNG_STATE_SHAPE, _RNG_STATE_DTYPE),
         ),
         vmap_method="broadcast_all",
-        input_layouts=[None] * 11,
+        input_layouts=[None] * 14,
         output_layouts=[None] * 4,
         has_side_effect=False,
     )
 
     def _invoke(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
-                cu_sq_log, cu_skv_log, *,
+                cu_sq_log, cu_skv_log,
+                q_descale, k_descale, v_descale, *,
                 dropout_p, softmax_scale, is_causal, wl, wr,
                 return_lse, return_randval, use_asm_v3, how_v3_bf16_cvt,
                 max_seqlen_q_attr, max_seqlen_k_attr, min_seqlen_q,
                 logits_soft_cap, zero_tensors):
         return call(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
                     cu_sq_log, cu_skv_log,
+                    q_descale, k_descale, v_descale,
                     dropout_p=dropout_p, softmax_scale=softmax_scale,
                     is_causal=is_causal, window_size_left=wl, window_size_right=wr,
                     return_softmax_lse=return_lse,
@@ -128,8 +136,13 @@ def _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape, sd_shape, dbias_shape
         "max_seqlen_q_attr", "max_seqlen_k_attr", "zero_tensors"))
 
 
+def _is_fp8_dtype(dtype):
+    return dtype in (jnp.float8_e4m3fn, jnp.float8_e4m3fnuz)
+
+
 def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
-            cu_sq_log=None, cu_skv_log=None, config=None):
+            cu_sq_log=None, cu_skv_log=None, config=None,
+            q_descale=None, k_descale=None, v_descale=None):
     """Raw MHA forward FFI call. Derives output shapes from per-shard Q.
 
     Args:
@@ -145,9 +158,12 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
         cu_sq_log: Cumulative logical query lengths excluding padding, or empty.
         cu_skv_log: Cumulative logical KV lengths excluding padding, or empty.
         config: MhaFwdConfig namedtuple.
+        q_descale: fp32 descale for q, shape [1] or [batch, nheads_k] (fp8 only).
+        k_descale: fp32 descale for k (fp8 only).
+        v_descale: fp32 descale for v (fp8 only).
 
     Returns:
-        (out, lse, p, rng_state) tuple.
+        (out, lse, p, rng_state) tuple. For fp8 input, out dtype is bfloat16.
     """
     _ensure_registered("MhaFwdUnifiedJA")
     if cu_sq_log is None:
@@ -155,6 +171,9 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
     if cu_skv_log is None:
         cu_skv_log = _empty(jnp.int32)
     is_varlen = (q.ndim == 3)
+    is_fp8 = _is_fp8_dtype(q.dtype)
+    out_dtype = jnp.bfloat16 if is_fp8 else q.dtype
+
     if is_varlen:
         total_q, hq, dq = q.shape
         _, hk, dv = v.shape
@@ -172,11 +191,16 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
         out_shape = (b, sq, hq, dv)
         lse_shape = (b, hq, sq) if config.return_lse else (0,)
         p_shape = (b, hq, sq, sk) if config.return_randval else (0,)
-    rng_shape = (2,)
-    fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape,
-                                  rng_shape, q.dtype)
+
+    empty_descale = _empty(jnp.float32)
+    q_desc = q_descale if q_descale is not None else empty_descale
+    k_desc = k_descale if k_descale is not None else empty_descale
+    v_desc = v_descale if v_descale is not None else empty_descale
+
+    fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype)
     return fn(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
               cu_sq_log, cu_skv_log,
+              q_desc, k_desc, v_desc,
               dropout_p=_sf(config.dropout_p),
               softmax_scale=_sf(config.softmax_scale),
               is_causal=config.is_causal,

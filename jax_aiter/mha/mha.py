@@ -33,6 +33,7 @@ from ..ops.mha import (
     mha_bwd as _mha_bwd_raw,
     MhaFwdConfig, MhaBwdConfig,
     _empty,
+    _is_fp8_dtype,
 )
 
 log = logging.getLogger("jax-aiter.mha_v2")
@@ -170,11 +171,15 @@ def _get_rank(t):
 # custom_partitioning: forward
 # ---------------------------------------------------------------------------
 
-@partial(custom_partitioning, static_argnums=(11,))
+@partial(custom_partitioning, static_argnums=(14,))
 def _mha_fwd_partitioned(q, k, v, cu_sq, cu_skv, out_prov,
-                         bias, alibi, gen, cu_sq_log, cu_skv_log, config):
+                         bias, alibi, gen, cu_sq_log, cu_skv_log,
+                         q_descale, k_descale, v_descale, config):
     return _mha_fwd_raw(q, k, v, cu_sq, cu_skv, out_prov,
-                        bias, alibi, gen, cu_sq_log, cu_skv_log, config)
+                        bias, alibi, gen, cu_sq_log, cu_skv_log, config,
+                        q_descale=q_descale,
+                        k_descale=k_descale,
+                        v_descale=v_descale)
 
 
 def _mha_fwd_infer_sharding(config, mesh, arg_shapes, result_shapes):
@@ -211,6 +216,7 @@ def _mha_fwd_partition(config, mesh, arg_shapes, result_shapes):
         if a.shape[0] == 0:
             shardings.append(NamedSharding(mesh, P(*((None,) * a.ndim))))
         elif i == 6 and a.ndim == 2:
+            # bias [sq, sk]: shard along sq matching q
             shardings.append(NamedSharding(mesh, P(q_spec[1], None)))
         elif cp_active and i in (1, 2) and a.ndim == 4:
             s = _get_padded_spec(a)
@@ -220,9 +226,12 @@ def _mha_fwd_partition(config, mesh, arg_shapes, result_shapes):
     arg_shardings = tuple(shardings)
 
     def _lowered(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
-                 cu_sq_log, cu_skv_log):
+                 cu_sq_log, cu_skv_log, q_descale, k_descale, v_descale):
         return _mha_fwd_raw(q, k, v, cu_sq, cu_skv, out_prov,
-                            bias, alibi, gen, cu_sq_log, cu_skv_log, config)
+                            bias, alibi, gen, cu_sq_log, cu_skv_log, config,
+                            q_descale=q_descale,
+                            k_descale=k_descale,
+                            v_descale=v_descale)
 
     return mesh, _lowered, out_shardings, arg_shardings
 
@@ -366,11 +375,16 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
                     max_seqlen_q=-1, max_seqlen_k=-1, min_seqlen_q=0,
                     logits_soft_cap=0.0, zero_tensors=False,
                     cp_axis=None, cp_size=1, cp_load_balanced=True,
-                    cu_seqlens_q_logical=None, cu_seqlens_kv_logical=None):
+                    cu_seqlens_q_logical=None, cu_seqlens_kv_logical=None,
+                    q_descale=None, k_descale=None, v_descale=None):
     """Unified forward for both batch (4D q) and varlen (3D q).
 
     In varlen/group mode ``cu_seqlens_*`` are cumulative *physical* offsets and
     ``cu_seqlens_*_logical`` are cumulative *logical* lengths excluding padding.
+
+    For FP8 input (float8_e4m3fn / float8_e4m3fnuz), q_descale, k_descale,
+    and v_descale must be provided as fp32 tensors of shape [1] (per-tensor)
+    or [batch, nheads_k] (per-head). Output will be bfloat16.
     """
     if cu_seqlens_q is None:
         cu_seqlens_q = _empty(jnp.int32)
@@ -387,7 +401,16 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
     if gen is None:
         gen = _empty(jnp.int64)
 
+    empty_descale = _empty(jnp.float32)
+    q_desc = q_descale if q_descale is not None else empty_descale
+    k_desc = k_descale if k_descale is not None else empty_descale
+    v_desc = v_descale if v_descale is not None else empty_descale
+
     bf16_cvt = 0 if get_gfx() == "gfx950" else 1
+
+    # For FP8 input the provisioning tensor dtype must match the output dtype (bf16).
+    is_fp8 = _is_fp8_dtype(q.dtype)
+    out_dtype = jnp.bfloat16 if is_fp8 else q.dtype
 
     # Forward uses the CK FA v3 ASM kernel by default (AITER falls back to v2 CK
     # when use_asm_v3=False or the shape is unsupported). JA_MHA_FWD_USE_ASM_V3=0
@@ -414,8 +437,9 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
         cp_load_balanced=cp_load_balanced,
     )
     return _mha_fwd_partitioned(q, k, v, cu_seqlens_q, cu_seqlens_kv,
-                                _empty(q.dtype), bias, alibi_slopes, gen,
+                                _empty(out_dtype), bias, alibi_slopes, gen,
                                 cu_seqlens_q_logical, cu_seqlens_kv_logical,
+                                q_desc, k_desc, v_desc,
                                 config)
 
 
@@ -482,7 +506,8 @@ def mha_bwd_unified(dout, q, k, v, out, lse, dropout_p, softmax_scale,
 def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal,
                         wl, wr, bias, alibi_slopes,
                         return_lse, return_softmax,
-                        cu_seqlens_q=None, cu_seqlens_kv=None):
+                        cu_seqlens_q=None, cu_seqlens_kv=None,
+                        q_descale=None, k_descale=None, v_descale=None):
     _, sk, _, _ = v.shape
     if wl >= sk: wl = -1
     if wr >= sk: wr = -1
@@ -491,7 +516,8 @@ def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal,
         q, k, v, dropout_p, softmax_scale, causal, wl, wr,
         return_lse, return_softmax,
         bias=bias, alibi_slopes=alibi_slopes,
-        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
     return result
 
 
@@ -532,7 +558,7 @@ def _flash_attn_backward(dout, q, k, v, out, lse,
 # Public API: flash_attn_func with custom_vjp
 # ---------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 9, 10, 11, 12, 13))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16))
 def flash_attn_func(
     q: jnp.ndarray,
     k: jnp.ndarray,
@@ -548,13 +574,16 @@ def flash_attn_func(
     return_attn_probs: bool = False,
     cu_seqlens_q: Optional[jnp.ndarray] = None,
     cu_seqlens_kv: Optional[jnp.ndarray] = None,
+    q_descale: Optional[jnp.ndarray] = None,
+    k_descale: Optional[jnp.ndarray] = None,
+    v_descale: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Flash attention with automatic CK/ASM v3 dispatch via AITER.
 
     Args:
-        q: (batch, seqlen_q, nheads, headdim_q)
-        k: (batch, seqlen_k, nheads_k, headdim_q)
-        v: (batch, seqlen_k, nheads_k, headdim_v)
+        q: (batch, seqlen_q, nheads, headdim_q). May be fp16, bf16, or fp8.
+        k: (batch, seqlen_k, nheads_k, headdim_q). Same dtype as q.
+        v: (batch, seqlen_k, nheads_k, headdim_v). Same dtype as q.
         dropout_p: Dropout probability (0.0 during eval).
         softmax_scale: Scaling factor (default: 1/sqrt(headdim_q)).
         causal: Apply causal mask (bottom-right aligned).
@@ -564,8 +593,12 @@ def flash_attn_func(
         deterministic: Use deterministic backward (slower, more memory).
         return_lse: Return log-sum-exp values.
         return_attn_probs: Return attention probabilities (testing only).
+        q_descale: fp32 descale for q, shape [1] or [batch, nheads_k] (fp8 only).
+        k_descale: fp32 descale for k (fp8 only).
+        v_descale: fp32 descale for v (fp8 only).
     Returns:
-        out: (batch, seqlen_q, nheads, headdim_v), or tuple if return_lse/return_attn_probs.
+        out: (batch, seqlen_q, nheads, headdim_v) in bf16 for fp8 input, else same as q dtype.
+             Returns a tuple if return_lse or return_attn_probs is True.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -592,7 +625,8 @@ def flash_attn_func(
         bias=bias, alibi_slopes=alibi_slopes,
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
-        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
 
     out = out_p[..., :hd_v_og]
     result = [out]
@@ -608,7 +642,8 @@ def _flash_attn_func_fwd(q, k, v,
                          window_size=(-1, -1), bias=None, alibi_slopes=None,
                          deterministic=True, return_lse=False,
                          return_attn_probs=False,
-                         cu_seqlens_q=None, cu_seqlens_kv=None):
+                         cu_seqlens_q=None, cu_seqlens_kv=None,
+                         q_descale=None, k_descale=None, v_descale=None):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -633,7 +668,8 @@ def _flash_attn_func_fwd(q, k, v,
         causal=causal, wl=wl, wr=wr,
         bias=bias, alibi_slopes=alibi_slopes,
         return_lse=True, return_softmax=return_attn_probs and dropout_p > 0,
-        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
 
     out_p, lse, rng_state = _tag_context(out_p, lse, rng_state)
     out = out_p[..., :hd_v_og]
@@ -653,6 +689,7 @@ def _flash_attn_func_fwd(q, k, v,
 def _flash_attn_func_bwd(dropout_p, softmax_scale, causal, window_size,
                          deterministic, return_lse, return_attn_probs,
                          cu_seqlens_q, cu_seqlens_kv,
+                         q_descale, k_descale, v_descale,
                          residuals, grad_outputs):
     (q_p, k_p, v_p, out_p, lse, rng_state,
      res_dp, res_scale, res_causal, res_ws,
@@ -682,7 +719,7 @@ flash_attn_func.defvjp(_flash_attn_func_fwd, _flash_attn_func_bwd)
 # Varlen public API: flash_attn_varlen with custom_vjp
 # ---------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14))
+@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17))
 def flash_attn_varlen(
     q: jnp.ndarray,              # [total_q, nheads, headdim]
     k: jnp.ndarray,              # [total_k, nheads_k, headdim]
@@ -699,6 +736,9 @@ def flash_attn_varlen(
     window_size: Tuple[int, int] = (-1, -1),
     deterministic: bool = False,
     return_lse: bool = False,
+    q_descale: Optional[jnp.ndarray] = None,
+    k_descale: Optional[jnp.ndarray] = None,
+    v_descale: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """Variable-length flash attention using packed sequences.
 
@@ -717,8 +757,11 @@ def flash_attn_varlen(
             lengths.
         max_seqlen_q: Maximum query sequence length.
         max_seqlen_k: Maximum key sequence length.
+        q_descale: fp32 descale for q, shape [1] or [batch, nheads_k] (fp8 only).
+        k_descale: fp32 descale for k (fp8 only).
+        v_descale: fp32 descale for v (fp8 only).
     Returns:
-        out: [total_q, nheads, headdim_v].
+        out: [total_q, nheads, headdim_v]. bf16 for fp8 input.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -745,7 +788,8 @@ def flash_attn_varlen(
         max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
         zero_tensors=_zero_pad(cu_seqlens_q_logical),
         cu_seqlens_q_logical=cu_seqlens_q_logical,
-        cu_seqlens_kv_logical=cu_seqlens_k_logical)
+        cu_seqlens_kv_logical=cu_seqlens_k_logical,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
 
     out = out_p[..., :hd_v_og]
     if return_lse:
@@ -757,7 +801,8 @@ def _flash_attn_varlen_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
                            cu_seqlens_q_logical, cu_seqlens_k_logical,
                            max_seqlen_q, max_seqlen_k, dropout_p,
                            softmax_scale, causal, window_size,
-                           deterministic, return_lse):
+                           deterministic, return_lse,
+                           q_descale, k_descale, v_descale):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -782,7 +827,8 @@ def _flash_attn_varlen_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
         max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
         zero_tensors=_zero_pad(cu_seqlens_q_logical),
         cu_seqlens_q_logical=cu_seqlens_q_logical,
-        cu_seqlens_kv_logical=cu_seqlens_k_logical)
+        cu_seqlens_kv_logical=cu_seqlens_k_logical,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
 
     out_p, lse, rng_state = _tag_context(out_p, lse, rng_state)
     out = out_p[..., :hd_v_og]
@@ -800,6 +846,7 @@ def _flash_attn_varlen_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
 def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
                            softmax_scale, causal, window_size,
                            deterministic, return_lse,
+                           q_descale, k_descale, v_descale,
                            residuals, grad_outputs):
     (q_p, k_p, v_p, out_p, lse, rng_state,
      cu_sq, cu_sk, cu_sq_log, cu_sk_log,
