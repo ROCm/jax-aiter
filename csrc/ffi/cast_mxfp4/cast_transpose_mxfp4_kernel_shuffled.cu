@@ -153,6 +153,28 @@ __device__ __forceinline__ float ds_swizzle_xor2(float val) {
 // REDUCTION OPERATIONS - Finding Maximum Absolute Value
 // ============================================================================
 
+__device__ __forceinline__ float dpp_max_xor2(float val) {
+    float out;
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_max_f32 %0, %1, %2 "
+        "quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1"
+        : "=v"(out)
+        : "v"(val), "v"(val));
+    return out;
+}
+
+__device__ __forceinline__ float dpp_max_xor1(float val) {
+    float out;
+    asm volatile(
+        "s_nop 1\n\t"
+        "v_max_f32 %0, %1, %2 "
+        "quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1"
+        : "=v"(out)
+        : "v"(val), "v"(val));
+    return out;
+}
+
 /*
  * Warp Reduction for Max Absolute Value
  * --------------------------------------
@@ -175,20 +197,11 @@ __device__ __forceinline__ float warp_reduce_max_8_dpp(float val) {
     asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F" : "=v"(tmp) : "v"(v));
     asm volatile("s_waitcnt lgkmcnt(0)" :::);
     val = fmaxf(val, uint_as_float(tmp));
-    v = float_as_uint(val);
-
-    // Step 2: XOR-2 exchange (pair swap within quad) via DPP quad_perm:[2,3,0,1].
-    tmp = __builtin_amdgcn_mov_dpp(v, /*dpp_ctrl=*/0x4E,
-                                   /*row_mask=*/0xF, /*bank_mask=*/0xF,
-                                   /*bound_ctrl=*/false);
-    val = fmaxf(val, uint_as_float(tmp));
-    v = float_as_uint(val);
-
-    // Step 3: XOR-1 exchange (lane swap within quad) via DPP quad_perm:[1,0,3,2].
-    tmp = __builtin_amdgcn_mov_dpp(v, /*dpp_ctrl=*/0xB1,
-                                   /*row_mask=*/0xF, /*bank_mask=*/0xF,
-                                   /*bound_ctrl=*/false);
-    val = fmaxf(val, uint_as_float(tmp));
+    // Steps 2-3 fuse each DPP exchange with its dependent maximum. The explicit
+    // s_nop supplies the two VALU-write -> DPP-read wait states required by
+    // CDNA4 when inline assembly bypasses LLVM's hazard recognizer.
+    val = dpp_max_xor2(val);
+    val = dpp_max_xor1(val);
 
     return val;
 }
@@ -269,28 +282,63 @@ __device__ __forceinline__ void hadamard16_inplace(
  * 
  * Algorithm:
  *   1. Round amax to nearest power of 2 (for robustness)
- *   2. Extract FP32 exponent and compute scale_unbiased = exp - 2
- *      (the -2 provides headroom for FP4 range)
+ *   2. Extract FP32 exponent and compute scale_unbiased = exp - 2 - scale_margin
+ *      (the -2 provides the legacy headroom for the FP4 range)
  *   3. Clamp scale_unbiased to [-127, 127]
  *   4. Return biased scale (scale_unbiased + 127) for E8M0 storage
  *   5. Build native_scale = 2^scale_unbiased for quantization
+ *
+ * scale_margin (B2, JA_FP4_SCALE_MARGIN) -- per-call E8M0 under-flush lever:
+ *   The block scale is the divisor applied before the FP32->FP4 convert, so a
+ *   value flushes to FP4 code +/-0 when |x| < 0.25 * native_scale. scale_margin
+ *   adds EXTRA headroom by shrinking native_scale (each +1 halves it):
+ *     * scale_margin > 0 -> SMALLER scale -> small entries that would flush to 0
+ *       instead survive as +/-0.5*scale (fixes §9 dgrad grad-operand under-flush)
+ *       at the cost of clipping the few largest entries (more saturation).
+ *     * scale_margin < 0 -> larger scale (more under-flush, less saturation).
+ *     * scale_margin == 0 -> EXACTLY the legacy exp-2 path (bit-identical).
+ *
+ * scale_mode (OAS, JA_FP4_OAS) -- overflow-aware scale SELECTION (paper
+ *   2603.08713). DISTINCT from scale_margin: margin adds a CONSTANT integer
+ *   shift to every block (data-independent, uniform); scale_mode changes the
+ *   amax->power-of-two ROUNDING RULE so the extra resolution is data-dependent
+ *   and bounded (only blocks whose amax sits high in its binade gain a bit):
+ *     * scale_mode == 0 -> round amax to NEAREST power of two (legacy; the
+ *       block max normalizes to ~[2.83, 5.66], wasting the FP4 [.,6] top).
+ *     * scale_mode == 1 -> FLOOR amax to a power of two, i.e. exp = floor(log2
+ *       amax). The block max then normalizes to [4, 8): it targets the high end
+ *       of the E2M1 range (~(3.5,7]) and lets the top of a binade OVERFLOW (clip
+ *       to +/-6) in exchange for ~2x more resolution on the small entries that
+ *       would otherwise flush to zero. "Limited overflow to reduce flush-to-
+ *       zero", cast-only. Averages ~half a bit more aggressive than legacy
+ *       (vs. margin=+1 which is a full uniform bit -> the prior over-clip fail).
  */
 __device__ __forceinline__ uint8_t compute_e8m0_scale(
     float amax,
-    float& native_scale
+    float& native_scale,
+    int scale_margin,
+    int scale_mode
 ) {
     if (amax == 0.0f) {
         native_scale = 1.0f;
         return 127;  // Neutral scale (2^0 = 1.0)
     }
 
-    // Round amax to nearest power of 2
+    // amax -> exponent. mode 0 (legacy): round to NEAREST power of two via the
+    // mantissa-MSB carry (+0x200000). mode 1 (OAS): FLOOR to a power of two by
+    // simply masking the mantissa (no carry) -> exp = floor(log2 amax).
     uint32_t amax_bits = float_as_uint(amax);
-    amax_bits = (amax_bits + 0x200000u) & 0xFF800000u;
+    if (scale_mode == 1) {
+        amax_bits = amax_bits & 0xFF800000u;            // OAS: floor to pow2
+    } else {
+        amax_bits = (amax_bits + 0x200000u) & 0xFF800000u;  // legacy: round-nearest
+    }
 
     // Extract and adjust exponent
     int exp = ((amax_bits >> 23) & 0xFF) - 127;  // Unbias FP32 exponent
-    int scale_unbiased = exp - 2;                 // Reserve 2 bits headroom
+    // Reserve 2 bits headroom (legacy); scale_margin adds EXTRA headroom so
+    // small entries survive the FP4 cast. scale_margin == 0 => legacy exp-2.
+    int scale_unbiased = exp - 2 - scale_margin;
     scale_unbiased = max(-127, min(127, scale_unbiased));
 
     // Build native scale as FP32: 2^scale_unbiased
@@ -334,8 +382,103 @@ __device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4(
     // Combine into 16-bit result (4 FP4 values)
     result |= (tmp << 8);
     return (uint16_t)(result & 0xFFFF);
+#elif defined(__HIP_DEVICE_COMPILE__)
+    // #9: fail loudly if MXFP4 device code is ever built for a non-gfx950 arch
+    // (replaces the silent `return 0`). Guarded by __HIP_DEVICE_COMPILE__ so the
+    // HIP host-compilation pass (where __gfx950__ is undefined) still compiles.
+    #error "MXFP4 hardware conversion requires gfx950"
 #else
-    return 0;  // Fallback for non-gfx950 architectures
+    return 0;  // host-pass trampoline (never executed; device path needs gfx950)
+#endif
+}
+
+/*
+ * FP32 to FP4 Conversion with Deterministic Stochastic Rounding (SR)
+ * ------------------------------------------------------------------
+ * The caller supplies four uint32 key words as an explicit FFI operand. The
+ * key is mixed with the semantic tensor role, row/column direction, and
+ * logical element coordinates. Identical operands and keys therefore produce
+ * identical packed FP4 bytes, while a new per-step/site key advances the
+ * stochastic stream without hidden clock state.
+ *
+ * v_cvt_scalef32_sr_pk_fp4_f32 (gfx950 / CDNA4) packs two FP32 inputs using
+ * one caller-supplied 32-bit random word. We generate a separate word for each
+ * packed pair with an integer avalanche finalizer; v_prng_b32 is an LFSR step,
+ * not a suitable hash for structured counters.
+ */
+#if defined(__gfx950__)
+typedef float fp32x2_t __attribute__((ext_vector_type(2)));
+#endif
+
+__device__ __forceinline__ uint32_t rotl32(uint32_t value, unsigned shift) {
+    return (value << shift) | (value >> (32u - shift));
+}
+
+__device__ __forceinline__ uint32_t fmix32(uint32_t value) {
+    value ^= value >> 16;
+    value *= 0x7FEB352Du;
+    value ^= value >> 15;
+    value *= 0x846CA68Bu;
+    value ^= value >> 16;
+    return value;
+}
+
+__device__ __forceinline__ uint32_t deterministic_sr_stream(
+    const uint32_t* __restrict__ key,
+    uint32_t role,
+    uint32_t direction
+) {
+    // JAX supplies four already-random uint32 words. Coordinate words receive
+    // the avalanche finalizer below; a second full fmix here only duplicates
+    // integer work without improving domain separation.
+    return (
+        key[0] ^ rotl32(key[1], 7) ^
+        (key[2] * 0x9E3779B1u) ^ rotl32(key[3], 17) ^
+        (role * 0xD1B54A35u) ^ (direction * 0x94D049BBu));
+}
+
+__device__ __forceinline__ uint32_t deterministic_sr_word(
+    uint32_t stream,
+    uint32_t row,
+    uint32_t col
+) {
+    uint32_t word = fmix32(
+        stream ^ (row * 0x85EBCA77u) ^ (col * 0xC2B2AE3Du));
+    return word == 0 ? 0xA511E9B3u : word;
+}
+
+__device__ __forceinline__ uint16_t cvt_f32x4_to_fp4x4_sr(
+    float v0, float v1, float v2, float v3,
+    float scale,
+    uint32_t stream,
+    uint32_t direction,
+    uint32_t row,
+    uint32_t col
+) {
+#if defined(__gfx950__)
+    uint32_t rng0 = deterministic_sr_word(
+        stream, row, col);
+    uint32_t rng1 = deterministic_sr_word(
+        stream,
+        row + (direction ? 2u : 0u),
+        col + (direction ? 0u : 2u));
+
+    fp32x2_t pair0 = {v0, v1};
+    fp32x2_t pair1 = {v2, v3};
+
+    // dst_sel = 0 -> result byte 0 holds the packed fp4x2 (matches the RNE path).
+    uint32_t lo = __builtin_amdgcn_cvt_scalef32_sr_pk_fp4_f32(0u, pair0, rng0, scale, 0);
+    uint32_t hi = __builtin_amdgcn_cvt_scalef32_sr_pk_fp4_f32(0u, pair1, rng1, scale, 0);
+
+    uint32_t result = (lo & 0xFFu) | ((hi & 0xFFu) << 8);
+    return (uint16_t)(result & 0xFFFF);
+#elif defined(__HIP_DEVICE_COMPILE__)
+    // #9: fail loudly if MXFP4 device code is ever built for a non-gfx950 arch
+    // (replaces the silent `return 0`). Guarded by __HIP_DEVICE_COMPILE__ so the
+    // HIP host-compilation pass (where __gfx950__ is undefined) still compiles.
+    #error "MXFP4 hardware conversion requires gfx950"
+#else
+    return 0;  // host-pass trampoline (never executed; device path needs gfx950)
 #endif
 }
 
@@ -413,9 +556,16 @@ __device__ __forceinline__ int compute_shuffled_fp4_index_2bytes(
  *   USE_ROWWISE:         Enable rowwise quantization
  *   USE_COLWISE:         Enable columnwise quantization
  *   SHUFFLE_SCALES:      Enable shuffled layout for scale factors
- *   USE_HADAMARD:        Apply Hadamard transform before quantization
+ *   USE_HADAMARD_ROW:    Apply Hadamard to the ROWWISE output (Phase 2)
+ *   USE_HADAMARD_COL:    Apply Hadamard to the COLWISE output (Phase 3).
+ *                        Independent of the row flag so a single dual launch
+ *                        can emit asymmetric row/col Hadamard (no split cast).
  *   SHUFFLE_ROWWISE_FP4: Enable shuffled layout for rowwise FP4 data
  *   SHUFFLE_COLWISE_FP4: Enable shuffled layout for columnwise FP4 data
+ *   USE_SR_ROW:          Stochastic rounding for the ROWWISE output (Phase 2).
+ *   USE_SR_COL:          Stochastic rounding for the COLWISE output (Phase 3),
+ *                        independent of the row flag. Both RNE+SR paths are
+ *                        compiled; the launcher selects per direction.
  * 
  * Grid Structure:
  *   - Grid: (cdiv(M, 128), cdiv(N, 64))
@@ -437,13 +587,17 @@ template<
     bool USE_ROWWISE,
     bool USE_COLWISE,
     bool SHUFFLE_SCALES,
-    bool USE_HADAMARD,
+    bool USE_HADAMARD_ROW,
+    bool USE_HADAMARD_COL,
     bool SHUFFLE_ROWWISE_FP4,
-    bool SHUFFLE_COLWISE_FP4
+    bool SHUFFLE_COLWISE_FP4,
+    bool USE_SR_ROW,
+    bool USE_SR_COL
 >
 __global__ __launch_bounds__(256, 8)
 void cast_transpose_mxfp4_shuffled(
     const uint16_t* __restrict__ input,
+    const uint32_t* __restrict__ sr_key,
     uint8_t* __restrict__ rowwise_fp4,
     uint8_t* __restrict__ rowwise_scale,
     uint8_t* __restrict__ colwise_fp4,
@@ -458,7 +612,11 @@ void cast_transpose_mxfp4_shuffled(
     const int colwise_scale_M,
     const int colwise_scale_N,
     const int colwise_scale_M_pad,
-    const int colwise_scale_N_pad
+    const int colwise_scale_N_pad,
+    const int scale_margin,
+    const int scale_mode,
+    const bool use_2d_scale,
+    const int sr_role
 ) {
     // ========================================================================
     // Thread and Block Identification
@@ -484,11 +642,32 @@ void cast_transpose_mxfp4_shuffled(
     const int K_packed = N / 2;
     const int M_packed = M / 2;
 
+    // The explicit key, semantic role and direction are invariant across all
+    // eight 32x32 chunks. Compute each active direction stream once here rather
+    // than repeating the key load/mix in every unrolled chunk body.
+    uint32_t row_sr_stream = 0;
+    uint32_t col_sr_stream = 0;
+    if constexpr (USE_SR_ROW) {
+        row_sr_stream = deterministic_sr_stream(
+            sr_key, (uint32_t)sr_role, 0u);
+    }
+    if constexpr (USE_SR_COL) {
+        col_sr_stream = deterministic_sr_stream(
+            sr_key, (uint32_t)sr_role, 1u);
+    }
+
     // ========================================================================
     // Shared Memory - 32x32 BF16 Tile with Padding
     // ========================================================================
     
     __shared__ uint16_t smem_tile[MXFP4_BLOCK_SIZE][MXFP4_BLOCK_SIZE + SMEM_PADDING];
+
+    // 2D weight scaling (use_2d_scale): scratch for the per-32x32-tile amax
+    // reduction so the rowwise and colwise phases share ONE UE8M0 scale (and
+    // therefore emit identical FP4 codes -> W_fprop == W_dgrad). Only touched
+    // when use_2d_scale && both directions are active (weight dual cast); the
+    // legacy 1x32 path never reads it, so default behavior is bit-identical.
+    __shared__ float s_chunk_amax[THREADS_PER_BLOCK];
 
     // ========================================================================
     // Main Loop - Process 128x64 Block in 32x32 Chunks
@@ -538,6 +717,48 @@ void cast_transpose_mxfp4_shuffled(
             __syncthreads();
 
             // ================================================================
+            // Phase 1b: 2D-tile amax (use_2d_scale; weight dual cast only)
+            // ----------------------------------------------------------------
+            // Reduce |x| over the whole 32x32 chunk so rowwise + colwise share
+            // ONE UE8M0 scale. Each of the 256 threads owns 4 rowwise elements
+            // (32 rows x 8 thread-groups = 256 -> all 1024 tile elements); a
+            // tree-reduce yields the tile amax, then one compute_e8m0_scale.
+            // use_2d_scale is a block-uniform kernel arg so the __syncthreads
+            // below are hit by all-or-no threads. Gated to dual casts; the
+            // single-direction (activation/grad) path keeps 1x32 scaling.
+            // ================================================================
+            float tile_native_scale = 1.0f;
+            uint8_t tile_e8m0 = 127;
+            if constexpr (USE_ROWWISE && USE_COLWISE) {
+                if (use_2d_scale) {
+                    int lr = warp_id * 8 + row_in_warp;          // 0..31
+                    int cb = thread_in_row * VALUES_PER_THREAD;  // 0,4,..,28
+                    // Split uint32 reads (see Phase 2): 68-byte smem row stride
+                    // leaves odd rows 4-byte aligned, so a uint64 read is
+                    // misaligned. Two aligned uint32 reads are byte-identical.
+                    uint32_t pk_lo = *reinterpret_cast<uint32_t*>(&smem_tile[lr][cb]);
+                    uint32_t pk_hi = *reinterpret_cast<uint32_t*>(&smem_tile[lr][cb + 2]);
+                    uint64_t pk = (uint64_t)pk_lo | ((uint64_t)pk_hi << 32);
+                    float t0, t1, t2, t3;
+                    bf16x4_to_float4(pk, t0, t1, t2, t3);
+                    float my = fmaxf(fmaxf(fabsf(t0), fabsf(t1)),
+                                     fmaxf(fabsf(t2), fabsf(t3)));
+                    s_chunk_amax[tid] = my;
+                    __syncthreads();
+                    for (int s = THREADS_PER_BLOCK / 2; s > 0; s >>= 1) {
+                        if (tid < s)
+                            s_chunk_amax[tid] = fmaxf(s_chunk_amax[tid],
+                                                      s_chunk_amax[tid + s]);
+                        __syncthreads();
+                    }
+                    tile_e8m0 = compute_e8m0_scale(s_chunk_amax[0],
+                                                   tile_native_scale,
+                                                   scale_margin, scale_mode);
+                    __syncthreads();  // release s_chunk_amax for the next chunk
+                }
+            }
+
+            // ================================================================
             // Phase 2: Rowwise Quantization (Horizontal Processing)
             // ================================================================
             
@@ -548,15 +769,22 @@ void cast_transpose_mxfp4_shuffled(
                 if (global_row < M && local_row < 32) {
                     int col_base = thread_in_row * VALUES_PER_THREAD;
 
-                    // Load 4 BF16 values and convert to FP32
-                    uint64_t packed_bf16 = *reinterpret_cast<uint64_t*>(
-                        &smem_tile[local_row][col_base]
-                    );
+                    // Load 4 BF16 values and convert to FP32.
+                    // Read as TWO uint32_t (not one uint64_t): the smem row
+                    // stride is (32+SMEM_PADDING)=34 uint16 = 68 bytes, so odd
+                    // rows are only 4-byte aligned -> a uint64_t (ds_read_b64,
+                    // 8B-aligned) read is misaligned there. Two 4-byte reads are
+                    // always aligned (col_base is a multiple of 4 uint16 = 8B;
+                    // +2 uint16 = +4B) and byte-identical (little-endian).
+                    // Mirrors the split-uint32 smem STORE in Phase 1a.
+                    uint32_t bf16_lo = *reinterpret_cast<uint32_t*>(&smem_tile[local_row][col_base]);
+                    uint32_t bf16_hi = *reinterpret_cast<uint32_t*>(&smem_tile[local_row][col_base + 2]);
+                    uint64_t packed_bf16 = (uint64_t)bf16_lo | ((uint64_t)bf16_hi << 32);
                     float v0, v1, v2, v3;
                     bf16x4_to_float4(packed_bf16, v0, v1, v2, v3);
 
-                    // Optional: Apply Hadamard transform
-                    if constexpr (USE_HADAMARD) {
+                    // Optional: Apply Hadamard transform (rowwise direction)
+                    if constexpr (USE_HADAMARD_ROW) {
                         hadamard16_inplace(v0, v1, v2, v3, thread_in_row);
                     }
 
@@ -567,14 +795,35 @@ void cast_transpose_mxfp4_shuffled(
                     );
                     float amax = warp_reduce_max_8_dpp(local_amax);
 
-                    // Compute E8M0 scale factor
+                    // Compute E8M0 scale factor. With 2D weight scaling the row
+                    // and col phases share the per-tile scale (computed above);
+                    // otherwise legacy per-row 1x32. use_2d only honored when
+                    // both directions are active (constexpr-gated).
                     float native_scale;
-                    uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale);
+                    uint8_t e8m0_scale;
+                    bool use_tile_row = false;
+                    if constexpr (USE_ROWWISE && USE_COLWISE) { use_tile_row = use_2d_scale; }
+                    if (use_tile_row) {
+                        native_scale = tile_native_scale;
+                        e8m0_scale = tile_e8m0;
+                    } else {
+                        e8m0_scale = compute_e8m0_scale(
+                            amax, native_scale, scale_margin, scale_mode);
+                    }
 
-                    // Convert to FP4 using hardware instruction
-                    uint16_t fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
-
+                    // Convert to FP4 using hardware instruction (RNE or SR).
+                    // SR is keyed by semantic role, rowwise direction, and
+                    // logical element-pair coordinates.
                     int global_col_base = tile_n + col_base;
+                    uint16_t fp4x4;
+                    if constexpr (USE_SR_ROW) {
+                        fp4x4 = cvt_f32x4_to_fp4x4_sr(
+                            v0, v1, v2, v3, native_scale, row_sr_stream, 0u,
+                            (uint32_t)global_row, (uint32_t)global_col_base);
+                    } else {
+                        fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
+                    }
+
                     if (global_col_base < N) {
                         if constexpr (SHUFFLE_ROWWISE_FP4) {
                             int packed_col = global_col_base / 2;
@@ -626,8 +875,8 @@ void cast_transpose_mxfp4_shuffled(
                     float v2 = uint_as_float(((uint32_t)smem_tile[row_base + 2][local_col]) << 16);
                     float v3 = uint_as_float(((uint32_t)smem_tile[row_base + 3][local_col]) << 16);
 
-                    // Optional: Apply Hadamard transform
-                    if constexpr (USE_HADAMARD) {
+                    // Optional: Apply Hadamard transform (colwise direction)
+                    if constexpr (USE_HADAMARD_COL) {
                         hadamard16_inplace(v0, v1, v2, v3, thread_in_row);
                     }
 
@@ -638,14 +887,33 @@ void cast_transpose_mxfp4_shuffled(
                     );
                     float amax = warp_reduce_max_8_dpp(local_amax);
 
-                    // Compute E8M0 scale factor
+                    // Compute E8M0 scale factor. 2D weight scaling shares the
+                    // per-tile scale across row+col (so W_fprop==W_dgrad);
+                    // otherwise legacy per-col 1x32. constexpr-gated to duals.
                     float native_scale;
-                    uint8_t e8m0_scale = compute_e8m0_scale(amax, native_scale);
+                    uint8_t e8m0_scale;
+                    bool use_tile_col = false;
+                    if constexpr (USE_ROWWISE && USE_COLWISE) { use_tile_col = use_2d_scale; }
+                    if (use_tile_col) {
+                        native_scale = tile_native_scale;
+                        e8m0_scale = tile_e8m0;
+                    } else {
+                        e8m0_scale = compute_e8m0_scale(
+                            amax, native_scale, scale_margin, scale_mode);
+                    }
 
-                    // Convert to FP4
-                    uint16_t fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
-
+                    // Convert to FP4. Columnwise SR uses a distinct direction
+                    // domain while retaining original logical coordinates.
                     int global_row_base = tile_m + row_base;
+                    uint16_t fp4x4;
+                    if constexpr (USE_SR_COL) {
+                        fp4x4 = cvt_f32x4_to_fp4x4_sr(
+                            v0, v1, v2, v3, native_scale, col_sr_stream, 1u,
+                            (uint32_t)global_row_base, (uint32_t)global_col);
+                    } else {
+                        fp4x4 = cvt_f32x4_to_fp4x4(v0, v1, v2, v3, native_scale);
+                    }
+
                     if (global_row_base < M) {
                         if constexpr (SHUFFLE_COLWISE_FP4) {
                             int packed_col = global_row_base / 2;
@@ -700,6 +968,7 @@ void cast_transpose_mxfp4_shuffled(
  */
 extern "C" void launch_cast_transpose_mxfp4_shuffled(
     const void* input,
+    const void* sr_key,
     void* rowwise_fp4,
     void* rowwise_scale,
     void* colwise_fp4,
@@ -709,9 +978,12 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     bool use_rowwise,
     bool use_colwise,
     bool shuffle_scales,
-    bool use_hadamard,
+    bool use_hadamard_row,
+    bool use_hadamard_col,
     bool shuffle_rowwise_fp4,
     bool shuffle_colwise_fp4,
+    bool use_sr_row,
+    bool use_sr_col,
     int rowwise_scale_stride,
     int colwise_scale_stride,
     int rowwise_scale_N,
@@ -721,53 +993,86 @@ extern "C" void launch_cast_transpose_mxfp4_shuffled(
     int colwise_scale_N,
     int colwise_scale_M_pad,
     int colwise_scale_N_pad,
+    int scale_margin,
+    int scale_mode,
+    bool use_2d_scale,
+    int sr_role,
     hipStream_t stream
 ) {
     // Grid configuration: tiles of 128x64
     dim3 grid((M + 128 - 1) / 128, (N + 64 - 1) / 64);
     dim3 block(256);
 
-    // Macro for cleaner kernel launch syntax
-    #define LAUNCH_KERNEL(ROW, COL, SHUF_SC, HAD, SHUF_ROW, SHUF_COL) \
-        mxfp4::cast_transpose_mxfp4_shuffled<ROW, COL, SHUF_SC, HAD, SHUF_ROW, SHUF_COL> \
+    // Macro for cleaner kernel launch syntax. Hadamard + SR are now PER-DIRECTION
+    // (HAD_R/HAD_C, SR_R/SR_C) so one dual launch can emit asymmetric row/col
+    // settings -- removing the frontend split-cast for selective placements.
+    #define LAUNCH_KERNEL(ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C) \
+        mxfp4::cast_transpose_mxfp4_shuffled<ROW, COL, SHUF_SC, HAD_R, HAD_C, SHUF_ROW, SHUF_COL, SR_R, SR_C> \
             <<<grid, block, 0, stream>>>( \
-                (const uint16_t*)input, \
+                (const uint16_t*)input, (const uint32_t*)sr_key, \
                 (uint8_t*)rowwise_fp4, (uint8_t*)rowwise_scale, \
                 (uint8_t*)colwise_fp4, (uint8_t*)colwise_scale, \
                 M, N, \
                 rowwise_scale_stride, colwise_scale_stride, \
                 rowwise_scale_N, rowwise_scale_M_pad, rowwise_scale_N_pad, \
-                colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad)
+                colwise_scale_M, colwise_scale_N, colwise_scale_M_pad, colwise_scale_N_pad, \
+                scale_margin, scale_mode, use_2d_scale, sr_role)
 
-    // Dispatch helper: innermost level selects rowwise/colwise/fp4-shuffle combos
-    #define DISPATCH_INNER(SHUF_SC, HAD) \
-        if (shuffle_rowwise_fp4 && shuffle_colwise_fp4) { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, true, true); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, true, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, true); \
-        } else if (shuffle_rowwise_fp4) { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, true, false); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, true, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, false); \
-        } else if (shuffle_colwise_fp4) { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, false, true); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, false, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, true); \
-        } else { \
-            if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD, false, false); \
-            else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD, false, false); \
-            else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, HAD, false, false); \
-        }
+    // Innermost level: select rowwise/colwise enable + fp4-shuffle combos, with
+    // the row/col Hadamard + SR template bools already resolved by DISP_HAD/DISP_SR.
+    // For single-direction launches the unused direction's bools are forced false
+    // to avoid pointless extra template instantiations (its phase is compiled out).
+    // Each DISP_* body is a do{...}while(0) so it nests cleanly inside if/else.
+    #define DISP_RC(SHUF_SC, HAD_R, HAD_C, SR_R, SR_C) \
+        do { \
+            if (shuffle_rowwise_fp4 && shuffle_colwise_fp4) { \
+                if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD_R, HAD_C, true, true, SR_R, SR_C); \
+                else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD_R, false, true, false, SR_R, false); \
+                else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, false, HAD_C, false, true, false, SR_C); \
+            } else if (shuffle_rowwise_fp4) { \
+                if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD_R, HAD_C, true, false, SR_R, SR_C); \
+                else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD_R, false, true, false, SR_R, false); \
+                else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, false, HAD_C, false, false, false, SR_C); \
+            } else if (shuffle_colwise_fp4) { \
+                if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD_R, HAD_C, false, true, SR_R, SR_C); \
+                else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD_R, false, false, false, SR_R, false); \
+                else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, false, HAD_C, false, true, false, SR_C); \
+            } else { \
+                if (use_rowwise && use_colwise)      LAUNCH_KERNEL(true, true, SHUF_SC, HAD_R, HAD_C, false, false, SR_R, SR_C); \
+                else if (use_rowwise)                LAUNCH_KERNEL(true, false, SHUF_SC, HAD_R, false, false, false, SR_R, false); \
+                else if (use_colwise)                LAUNCH_KERNEL(false, true, SHUF_SC, false, HAD_C, false, false, false, SR_C); \
+            } \
+        } while (0)
 
-    // Dispatch: shuffle_scales x use_hadamard -> DISPATCH_INNER
-    if (shuffle_scales) {
-        if (use_hadamard) { DISPATCH_INNER(true, true); }
-        else               { DISPATCH_INNER(true, false); }
-    } else {
-        if (use_hadamard) { DISPATCH_INNER(false, true); }
-        else               { DISPATCH_INNER(false, false); }
-    }
+    // Resolve the per-direction SR booleans (runtime -> template).
+    #define DISP_SR(SHUF_SC, HAD_R, HAD_C) \
+        do { \
+            if (use_sr_row) { \
+                if (use_sr_col) DISP_RC(SHUF_SC, HAD_R, HAD_C, true, true); \
+                else            DISP_RC(SHUF_SC, HAD_R, HAD_C, true, false); \
+            } else { \
+                if (use_sr_col) DISP_RC(SHUF_SC, HAD_R, HAD_C, false, true); \
+                else            DISP_RC(SHUF_SC, HAD_R, HAD_C, false, false); \
+            } \
+        } while (0)
 
-    #undef DISPATCH_INNER
+    // Resolve the per-direction Hadamard booleans (runtime -> template).
+    #define DISP_HAD(SHUF_SC) \
+        do { \
+            if (use_hadamard_row) { \
+                if (use_hadamard_col) DISP_SR(SHUF_SC, true, true); \
+                else                  DISP_SR(SHUF_SC, true, false); \
+            } else { \
+                if (use_hadamard_col) DISP_SR(SHUF_SC, false, true); \
+                else                  DISP_SR(SHUF_SC, false, false); \
+            } \
+        } while (0)
+
+    if (shuffle_scales) { DISP_HAD(true); }
+    else                { DISP_HAD(false); }
+
+    #undef DISP_HAD
+    #undef DISP_SR
+    #undef DISP_RC
     #undef LAUNCH_KERNEL
 }

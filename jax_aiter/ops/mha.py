@@ -63,18 +63,20 @@ def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype):
             jax.ShapeDtypeStruct(_RNG_STATE_SHAPE, _RNG_STATE_DTYPE),
         ),
         vmap_method="broadcast_all",
-        input_layouts=[None] * 12,
+        input_layouts=[None] * 14,
         output_layouts=[None] * 4,
         has_side_effect=False,
     )
 
     def _invoke(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
+                cu_sq_log, cu_skv_log,
                 q_descale, k_descale, v_descale, *,
                 dropout_p, softmax_scale, is_causal, wl, wr,
                 return_lse, return_randval, use_asm_v3, how_v3_bf16_cvt,
                 max_seqlen_q_attr, max_seqlen_k_attr, min_seqlen_q,
                 logits_soft_cap, zero_tensors):
         return call(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
+                    cu_sq_log, cu_skv_log,
                     q_descale, k_descale, v_descale,
                     dropout_p=dropout_p, softmax_scale=softmax_scale,
                     is_causal=is_causal, window_size_left=wl, window_size_right=wr,
@@ -105,18 +107,20 @@ def _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape, sd_shape, dbias_shape
             jax.ShapeDtypeStruct(dbias_shape, dtype),
         ),
         vmap_method="broadcast_all",
-        input_layouts=[None] * 15,
+        input_layouts=[None] * 17,
         output_layouts=[None] * 5,
         has_side_effect=False,
     )
 
     def _invoke(dout, q, k, v, out, lse, cu_sq, cu_sk,
-                dq, dk, dv, bias, alibi, rng, gen, *,
+                dq, dk, dv, bias, alibi, rng, gen,
+                cu_sq_log, cu_sk_log, *,
                 dropout_p, softmax_scale, is_causal, wl, wr,
                 deterministic, use_asm_v3, is_v3_atomic_fp32, how_v3_bf16_cvt,
                 max_seqlen_q_attr, max_seqlen_k_attr, zero_tensors):
         return call(dout, q, k, v, out, lse, cu_sq, cu_sk,
                     dq, dk, dv, bias, alibi, rng, gen,
+                    cu_sq_log, cu_sk_log,
                     dropout_p=dropout_p, softmax_scale=softmax_scale,
                     is_causal=is_causal, window_size_left=wl, window_size_right=wr,
                     deterministic=deterministic, use_asm_v3=use_asm_v3,
@@ -136,7 +140,8 @@ def _is_fp8_dtype(dtype):
     return dtype in (jnp.float8_e4m3fn, jnp.float8_e4m3fnuz)
 
 
-def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config,
+def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
+            cu_sq_log=None, cu_skv_log=None, config=None,
             q_descale=None, k_descale=None, v_descale=None):
     """Raw MHA forward FFI call. Derives output shapes from per-shard Q.
 
@@ -144,12 +149,14 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config,
         q: [B, Sq, Hq, D] (batch) or [total_q, Hq, D] (varlen).
         k: [B, Sk, Hk, D] or [total_k, Hk, D].
         v: [B, Sk, Hk, Dv] or [total_k, Hk, Dv].
-        cu_sq: Cumulative query sequence lengths (varlen) or empty.
-        cu_skv: Cumulative KV sequence lengths (varlen) or empty.
+        cu_sq: Cumulative physical query offsets (varlen) or empty.
+        cu_skv: Cumulative physical KV offsets (varlen) or empty.
         out_prov: Provisioning tensor (empty).
         bias: Attention bias or empty.
         alibi: ALiBi slopes or empty.
         gen: RNG generator state or empty.
+        cu_sq_log: Cumulative logical query lengths excluding padding, or empty.
+        cu_skv_log: Cumulative logical KV lengths excluding padding, or empty.
         config: MhaFwdConfig namedtuple.
         q_descale: fp32 descale for q, shape [1] or [batch, nheads_k] (fp8 only).
         k_descale: fp32 descale for k (fp8 only).
@@ -159,6 +166,10 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config,
         (out, lse, p, rng_state) tuple. For fp8 input, out dtype is bfloat16.
     """
     _ensure_registered("MhaFwdUnifiedJA")
+    if cu_sq_log is None:
+        cu_sq_log = _empty(jnp.int32)
+    if cu_skv_log is None:
+        cu_skv_log = _empty(jnp.int32)
     is_varlen = (q.ndim == 3)
     is_fp8 = _is_fp8_dtype(q.dtype)
     out_dtype = jnp.bfloat16 if is_fp8 else q.dtype
@@ -167,7 +178,12 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config,
         total_q, hq, dq = q.shape
         _, hk, dv = v.shape
         out_shape = (total_q, hq, dv)
-        lse_shape = (hq, config.max_seqlen_q) if config.return_lse else (0,)
+        # Varlen LSE spans ALL packed tokens per head: the FFI handler sets
+        # nhead_stride_lse = stride(lse_dims, 0), so the buffer must be
+        # (hq, total_q). Using max_seqlen_q here undersizes it whenever
+        # total_q > max_seqlen_q (multi-segment packing) -> OOB write -> GPU
+        # memory-access fault. (was: (hq, max_seqlen_q))
+        lse_shape = (hq, total_q) if config.return_lse else (0,)
         p_shape = (0,)
     else:
         b, sq, hq, dq = q.shape
@@ -183,6 +199,7 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config,
 
     fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype)
     return fn(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
+              cu_sq_log, cu_skv_log,
               q_desc, k_desc, v_desc,
               dropout_p=_sf(config.dropout_p),
               softmax_scale=_sf(config.softmax_scale),
@@ -200,7 +217,8 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen, config,
 
 
 def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
-            dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen, config):
+            dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
+            cu_sq_log=None, cu_sk_log=None, config=None):
     """Raw MHA backward FFI call. Derives output shapes from per-shard Q.
 
     Args:
@@ -208,15 +226,21 @@ def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
         q, k, v: Same as forward.
         out: Forward output.
         lse: Log-sum-exp from forward.
-        cu_sq, cu_sk: Cumulative sequence lengths (varlen) or empty.
+        cu_sq, cu_sk: Cumulative physical offsets (varlen) or empty.
         dq_ws, dk_ws, dv_ws: Workspace tensors (empty).
         bias, alibi, rng, gen: Same as forward.
+        cu_sq_log, cu_sk_log: Cumulative logical lengths excluding padding, or
+            empty.
         config: MhaBwdConfig namedtuple.
 
     Returns:
         (dq, dk, dv, softmax_d, dbias) tuple.
     """
     _ensure_registered("MhaBwdUnifiedJA")
+    if cu_sq_log is None:
+        cu_sq_log = _empty(jnp.int32)
+    if cu_sk_log is None:
+        cu_sk_log = _empty(jnp.int32)
     is_varlen = (q.ndim == 3)
     if is_varlen:
         total_q, hq, dq_dim = q.shape
@@ -226,7 +250,8 @@ def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
         dq_shape = (total_q, hq, dq_dim)
         dk_shape = (total_k, hk, dq_dim)
         dv_shape = (total_k, hk, dv_dim)
-        sd_shape = (hq, config.max_seqlen_q)
+        # softmax_d spans all packed tokens per head (matches LSE layout above).
+        sd_shape = (hq, total_q)
         dbias_shape = (0,)
     else:
         b, sq, hq, dq_dim = q.shape
@@ -241,6 +266,7 @@ def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
                                   sd_shape, dbias_shape, q.dtype)
     return fn(dout, q, k, v, out, lse, cu_sq, cu_sk,
               dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
+              cu_sq_log, cu_sk_log,
               dropout_p=_sf(config.dropout_p),
               softmax_scale=_sf(config.softmax_scale),
               is_causal=config.is_causal,

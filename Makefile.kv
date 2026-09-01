@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Paged-KV FFI shims. Build with:
+#
+#     make -f Makefile.kv ja_kv GFX=gfx942
+#
+# These rules live outside the main Makefile on purpose. ci/jit_libs_manifest.py
+# hashes the Makefile and all of csrc/common as inputs that "can change the JIT
+# library bytes", and that hash keys the immutable release holding the multi-GB
+# MHA libraries. Adding KV targets there would invalidate those binaries on every
+# paged-KV change even though none of it reaches their build: build_jit.py
+# compiles only aiter and CK sources, and these shims are separate .so files that
+# link nothing from the JIT libraries.
+#
+# Keeping them here means a paged-KV change costs no JIT rebuild. It follows the
+# same reasoning already applied to scripts/*.patch, which were removed from the
+# hash for invalidating MHA binaries they never fed.
+#
+# Everything shared -- HIPCC, arch flags, include roots, the build directory --
+# comes from the main Makefile.
+
+include Makefile
+
+# The M0 aliasing probe deliberately carries no aiter dependency, so it builds
+# and runs before third_party/aiter is populated.
+KV_PROBE_INCLUDES := -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC)
+
+# append_kv and paged attention compile aiter sources directly rather than
+# linking a JIT library, so they need aiter's own include tree.
+#
+# AITER_NO_TORCH_TYPES is kept for aiter code that honours it. The consumed
+# pin's aiter_opus_plus.h still includes <c10/util/{BFloat16,Half}.h>
+# unconditionally for t2opus; jax-aiter supplies torch-free stubs under
+# csrc/common/c10/util/ so append_kv compiles with no PyTorch headers.
+KV_DEFINES  := -DAITER_NO_TORCH_TYPES
+KV_INCLUDES := $(KV_PROBE_INCLUDES) $(KV_DEFINES) \
+               -I$(AITER_SRC_DIR)/csrc/include \
+               -I$(AITER_SRC_DIR)/csrc/include/ck_tile \
+               -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include
+
+# Paged attention compiles the kernels into its own module, the same way
+# append_kv and paged_prefill do. It links none of aiter's cpp_itfs dispatch
+# layer -- see the comment at the top of csrc/ffi/kv/paged_attention_ja.cu for
+# why that layer is unusable -- so it needs no fmt and no openssl.
+#
+# scripts/gen_pa_ragged.py renders aiter's pa_ragged.cpp.jinja once per
+# configuration plus a dispatch header. Like BP_STAMP below, the stamp exists
+# because the file list is not known until the generator has run.
+#
+# Adding a configuration means widening default_configs() in that script and
+# rebuilding, the same contract BP_FILTER documents for paged prefill. The
+# handler turns an unmatched configuration into an error naming the script.
+PA_GEN_DIR := $(JA_BUILD_DIR)/pa_ragged_gen
+PA_STAMP   := $(PA_GEN_DIR)/.generated
+PA_INCLUDES := $(KV_PROBE_INCLUDES) $(KV_DEFINES) \
+               -I$(AITER_SRC_DIR)/csrc/include \
+               -I$(AITER_SRC_DIR)/csrc/include/ck_tile \
+               -I$(AITER_SRC_DIR)/csrc/cpp_itfs/pa \
+               -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
+               -I$(PA_GEN_DIR)
+
+# Paged prefill compiles aiter's batch-prefill kernels into its own module.
+#
+# The full generated set is 6145 files and is what makes libmha_fwd.so a 1.3 GB,
+# multi-hour build. Almost all of it is configurations this path never asks for,
+# so the codegen is filtered to the ones it does: no logits soft cap, no bias, no
+# LSE, no dropout, no quantisation scales, no attention sink. Dtype, mask mode
+# and page-table layout are left unconstrained, since a filter token dropped from
+# the glob widens rather than narrows it -- that keeps fp16 and bf16, causal and
+# full attention, and both pool layouts, in 193 files.
+#
+# Widening this is the supported way to add a configuration: add or remove a
+# token and rebuild. The handler turns an unmatched configuration into an error
+# naming this variable rather than a silent fallback.
+BP_FILTER := *_nlogits*_nbias*_nlse*_ndropout*_nqscale*_nsink*
+BP_GEN_DIR := $(JA_BUILD_DIR)/batch_prefill_gen
+BP_STAMP := $(BP_GEN_DIR)/.generated
+BP_FMHA_DIR := $(AITER_SRC_DIR)/3rdparty/composable_kernel/example/ck_tile/01_fmha
+
+BP_INCLUDES := $(KV_PROBE_INCLUDES) $(KV_DEFINES) \
+               -I$(AITER_SRC_DIR)/csrc/include \
+               -Icsrc/common \
+               -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
+               -I$(BP_FMHA_DIR) \
+               -I$(BP_GEN_DIR)
+
+# Mirrors the flags libmha_fwd is built with in jax_aiter/jit/optCompilerConfig.json.
+# CK_TILE_FMHA_FWD_FAST_EXP2 in particular changes numerics, so it has to match
+# what the kernels were generated for.
+BP_DEFINES := -DCK_TILE_FMHA_FWD_FAST_EXP2=1 -DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=2
+
+JA_KV_PROBE_MODULES := $(JA_BUILD_DIR)/kv_alias_probe_ja.so
+
+JA_KV_MODULES := $(JA_KV_PROBE_MODULES) \
+                 $(JA_BUILD_DIR)/append_kv_ja.so \
+                 paged_attention \
+                 paged_prefill
+
+.PHONY: ja_kv ja_kv_probe
+
+# Paged-KV shims: probe plus append_kv (M1) and paged attention (M2).
+ja_kv: $(JA_KV_MODULES)
+
+# M0 only: the aliasing probe, buildable with no aiter sources present.
+ja_kv_probe: $(JA_KV_PROBE_MODULES)
+
+$(JA_BUILD_DIR)/kv_alias_probe_ja.so: csrc/ffi/kv/kv_alias_probe_ja.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(KV_PROBE_INCLUDES) $< -o $@
+
+# Compiles aiter's cache kernels into the module, so append_kv needs no JIT lib.
+$(JA_BUILD_DIR)/append_kv_ja.so: csrc/ffi/kv/append_kv_ja.cu \
+                                 $(AITER_SRC_DIR)/csrc/kernels/cache_kernels.cu | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(KV_INCLUDES) \
+		csrc/ffi/kv/append_kv_ja.cu $(AITER_SRC_DIR)/csrc/kernels/cache_kernels.cu -o $@
+
+$(PA_STAMP): scripts/gen_pa_ragged.py jax_aiter/kv/pa_config.py \
+             $(AITER_SRC_DIR)/csrc/cpp_itfs/pa/pa_ragged.cpp.jinja | $(JA_BUILD_DIR)/
+	rm -rf $(PA_GEN_DIR)
+	mkdir -p $(PA_GEN_DIR)
+	$(PYTHON3) scripts/gen_pa_ragged.py --out-dir $(PA_GEN_DIR)
+	touch $@
+
+.PHONY: pa_gen paged_attention
+pa_gen: $(PA_STAMP)
+
+# Six configurations at roughly 2 s each. They are separate objects so make's
+# -j applies, and so a widened config list does not rebuild the whole set. The
+# wildcard is empty on a clean tree, so `paged_attention` generates first and
+# then re-enters make to re-evaluate it -- the same shape as paged_prefill.
+PA_SRCS := $(wildcard $(PA_GEN_DIR)/*.cpp)
+PA_OBJS := $(PA_SRCS:.cpp=.o) $(PA_GEN_DIR)/paged_attention_ja.o
+
+paged_attention: $(PA_STAMP)
+	@$(MAKE) -f Makefile.kv $(JA_BUILD_DIR)/paged_attention_ja.so
+
+$(PA_GEN_DIR)/%.o: $(PA_GEN_DIR)/%.cpp $(PA_STAMP)
+	$(HIPCC) -c -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(PA_INCLUDES) $< -o $@
+
+$(PA_GEN_DIR)/paged_attention_ja.o: csrc/ffi/kv/paged_attention_ja.cu $(PA_STAMP)
+	$(HIPCC) -c -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(PA_INCLUDES) $< -o $@
+
+$(JA_BUILD_DIR)/paged_attention_ja.so: $(PA_OBJS) | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(AMDGPU_TARGET_FLAGS) $(PA_OBJS) -o $@
+
+# ck_tile emits one translation unit per kernel instance plus the dispatcher in
+# fmha_batch_prefill_api.cpp. The stamp exists because the file list is not known
+# until the generator has run.
+$(BP_STAMP): $(BP_FMHA_DIR)/generate.py | $(JA_BUILD_DIR)/
+	rm -rf $(BP_GEN_DIR)
+	mkdir -p $(BP_GEN_DIR)
+	cd $(BP_FMHA_DIR) && $(PYTHON3) generate.py -d batch_prefill --receipt 200 \
+		--filter "$(BP_FILTER)" --output_dir $(CURDIR)/$(BP_GEN_DIR)
+	touch $@
+
+.PHONY: bp_gen paged_prefill
+bp_gen: $(BP_STAMP)
+
+# An instance costs about 12 seconds and the filtered set is 193 of them, so
+# these are compiled as separate objects to get make's parallelism -- serially it
+# is a 40 minute build. The file list only exists after the generator has run, so
+# the wildcard below is empty on a clean tree; `paged_prefill` generates first and
+# then re-enters make, which re-evaluates it. $(MAKE) hands down the jobserver, so
+# `make -j` still applies to the inner build.
+BP_SRCS := $(wildcard $(BP_GEN_DIR)/*.cpp)
+BP_OBJS := $(BP_SRCS:.cpp=.o) \
+           $(BP_GEN_DIR)/paged_prefill_ja.o \
+           $(BP_GEN_DIR)/mha_fwd_batch_prefill.o
+
+paged_prefill: $(BP_STAMP)
+	@$(MAKE) -f Makefile.kv $(JA_BUILD_DIR)/paged_prefill_ja.so
+
+$(BP_GEN_DIR)/%.o: $(BP_GEN_DIR)/%.cpp $(BP_STAMP)
+	$(HIPCC) -c -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) \
+		$(BP_INCLUDES) $(BP_DEFINES) $< -o $@
+
+$(BP_GEN_DIR)/paged_prefill_ja.o: csrc/ffi/kv/paged_prefill_ja.cu $(BP_STAMP)
+	$(HIPCC) -c -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) \
+		$(BP_INCLUDES) $(BP_DEFINES) $< -o $@
+
+# aiter's torch-free wrapper: it holds no kernels itself, only the traits lookup
+# that forwards to the generated dispatcher above.
+$(BP_GEN_DIR)/mha_fwd_batch_prefill.o: \
+		$(AITER_SRC_DIR)/csrc/cpp_itfs/mha_fwd_batch_prefill.cu $(BP_STAMP)
+	$(HIPCC) -c -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) \
+		$(BP_INCLUDES) $(BP_DEFINES) $< -o $@
+
+# Compiling the kernels in here rather than reusing libmha_fwd.so is what keeps
+# this independent of the multi-GB prebuilt JIT release, which is keyed to an
+# aiter SHA this branch does not match.
+$(JA_BUILD_DIR)/paged_prefill_ja.so: $(BP_OBJS) | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(AMDGPU_TARGET_FLAGS) $(BP_OBJS) -o $@
+
+# `include Makefile` above would otherwise make its `all` target the default.
+.DEFAULT_GOAL := ja_kv

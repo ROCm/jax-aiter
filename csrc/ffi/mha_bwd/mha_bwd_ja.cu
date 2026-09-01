@@ -5,19 +5,22 @@
 // Detects mode from tensor rank: 4D = batch [b,s,h,d], 3D = varlen [total,h,d].
 // Calls aiter::mha_bwd(args, stream) which handles CK vs ASM v3 internally.
 //
-// Multi-GPU note: AITER's fmha_v3_bwd impl_ptr_map is now protected by a
-// mutex (Xinya's fix cherry-picked onto third_party/aiter), so ASM v3
-// kernels can be used on all devices concurrently.
+// Multi-GPU note: AITER's ASM kernel cache is a SynchronizedCache upstream as
+// of v0.1.19 (cpp_itfs/mha_bwd.cu), so ASM v3 kernels can be used on all
+// devices concurrently. This no longer depends on a local cherry-pick.
 
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
-#include "ck_tile/host/pinned_host_releaser.hpp"
 #include "hip_utils.h"
 #include "mha_bwd.h"
 #include "mha_common_utils.cu"
@@ -44,12 +47,7 @@ struct WorkspacePool {
       cap = bytes;
       dev = cur_dev;
     }
-    if (zero) {
-      // Zero the full pooled slab. Partial zero of `bytes` leaves stale data
-      // when a smaller request reuses a larger prior allocation (CK bwd then
-      // ASM v3 dq_acc on gfx950).
-      hipMemsetAsync(ptr, 0, cap, stream);
-    }
+    if (zero) hipMemsetAsync(ptr, 0, bytes, stream);
     return ptr;
   }
 
@@ -61,12 +59,50 @@ struct WorkspacePool {
   }
 };
 
-static thread_local WorkspacePool s_ck_workspace_pool;
-static thread_local WorkspacePool s_asm_workspace_pool;
+static thread_local WorkspacePool s_aiter_ws_pool;
 static thread_local WorkspacePool s_dk_exp_pool;
 static thread_local WorkspacePool s_dv_exp_pool;
 static thread_local WorkspacePool s_dbias_pool;
 static thread_local WorkspacePool s_rng_pool;
+
+// Pinned host blocks handed to aiter::mha_bwd via mha_bwd_args::pinned_host_alloc,
+// which is mandatory in group mode. aiter extends the shared_ptr lifetime to the
+// stream tail, so the deleter firing is precisely the point at which no pending
+// stream operation can still reference the block and reuse becomes safe.
+class PinnedHostPool {
+ public:
+  std::shared_ptr<void> acquire(size_t bytes) {
+    if (bytes == 0) bytes = 1;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      for (size_t i = 0; i < free_.size(); ++i) {
+        if (free_[i].second >= bytes) {
+          Block b = free_[i];
+          free_.erase(free_.begin() + i);
+          return wrap(b);
+        }
+      }
+    }
+    void *p = nullptr;
+    if (hipHostMalloc(&p, bytes, hipHostMallocDefault) != hipSuccess) return {};
+    return wrap(Block{p, bytes});
+  }
+
+ private:
+  using Block = std::pair<void *, size_t>;
+
+  std::shared_ptr<void> wrap(Block b) {
+    return std::shared_ptr<void>(b.first, [this, b](void *) {
+      std::lock_guard<std::mutex> lk(mu_);
+      free_.push_back(b);
+    });
+  }
+
+  std::mutex mu_;
+  std::vector<Block> free_;
+};
+
+static PinnedHostPool s_pinned_host_pool;
 
 ffi::Error MhaBwdUnified_Bridge(
     hipStream_t stream,
@@ -78,6 +114,8 @@ ffi::Error MhaBwdUnified_Bridge(
     std::optional<ffi::AnyBuffer> dv_,
     std::optional<ffi::AnyBuffer> bias_, std::optional<ffi::AnyBuffer> alibi_slopes_,
     std::optional<ffi::AnyBuffer> rng_state_, std::optional<ffi::AnyBuffer> gen_,
+    std::optional<ffi::AnyBuffer> cu_seqlens_q_logical_,
+    std::optional<ffi::AnyBuffer> cu_seqlens_k_logical_,
     ffi::Result<ffi::AnyBuffer> dq_ret, ffi::Result<ffi::AnyBuffer> dk_ret,
     ffi::Result<ffi::AnyBuffer> dv_ret, ffi::Result<ffi::AnyBuffer> softmax_d_ret,
     ffi::Result<ffi::AnyBuffer> dbias_ret,
@@ -201,20 +239,8 @@ ffi::Error MhaBwdUnified_Bridge(
     seed_ptr = dummy_rng; offset_ptr = dummy_rng + 1;
   }
 
-  auto workspace_alloc = [use_asm_v3, stream](size_t bytes, bool zero_init) -> void* {
-    auto &pool = use_asm_v3 ? s_asm_workspace_pool : s_ck_workspace_pool;
-    return pool.get(bytes, stream, zero_init);
-  };
-
-  // Deleter runs from hipLaunchHostFunc on the driver helper thread; calling
-  // hipHostFree there deadlocks against main-thread HIP calls. Defer release.
-  auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
-    void *p = nullptr;
-    HIP_CHECK(hipHostMalloc(&p, bytes, hipHostMallocDefault));
-    return std::shared_ptr<void>(p, [](void *q) {
-      ck_tile::pinned_host_releaser::instance().enqueue(q);
-    });
-  };
+  // AITER v0.1.19 owns dq_acc sizing and layout internally; the caller supplies
+  // only memory, through mha_bwd_args::workspace_alloc below.
 
   // MQA/GQA expansion
   auto dq_dims = dq_ret->dimensions();
@@ -227,8 +253,13 @@ ffi::Error MhaBwdUnified_Bridge(
   if (is_mqa_gqa) {
     size_t dk_sz = (is_varlen ? seqlen_k : batch_size * seqlen_k) * num_heads * head_size_q * mha_utils::dtype_size(q.element_type());
     size_t dv_sz = (is_varlen ? seqlen_k : batch_size * seqlen_k) * num_heads * head_size_v * mha_utils::dtype_size(v.element_type());
-    dk_expanded_ptr = s_dk_exp_pool.get(dk_sz, stream);
-    dv_expanded_ptr = s_dv_exp_pool.get(dv_sz, stream);
+    // The AITER backward overwrites every logical expanded dK/dV element.
+    // Tight packing therefore needs no pre-clear. Padded packing sets
+    // zero_tensors and is explicitly cleared below so unwritten padding rows
+    // remain defined. Avoiding these unconditional clears removes 512 MiB of
+    // writes per attention call at the llama3-8b production shape.
+    dk_expanded_ptr = s_dk_exp_pool.get(dk_sz, stream, /*zero=*/false);
+    dv_expanded_ptr = s_dv_exp_pool.get(dv_sz, stream, /*zero=*/false);
     dk_final = dk_expanded_ptr; dv_final = dv_expanded_ptr;
   }
 
@@ -294,12 +325,22 @@ ffi::Error MhaBwdUnified_Bridge(
     bs_dv = is_mqa_gqa ? (seqlen_k * num_heads * head_size_v) : mha_utils::calculate_stride(dv_dims, 0);
   }
 
-  // Seqstart pointers
+  // Seqstart pointers. seqstart_* are cumulative PHYSICAL offsets; the optional
+  // cu_seqlen_* are cumulative LOGICAL lengths that tell AITER how much of each
+  // physical span is real (mha_bwd.h sequence-pointer notes). Both must match
+  // what the forward passed, or the backward masks a different region.
   const void *seqstart_q_ptr = nullptr, *seqstart_k_ptr = nullptr;
+  const void *cu_seqlen_q_ptr = nullptr, *cu_seqlen_k_ptr = nullptr;
   if (is_varlen) {
     seqstart_q_ptr = cu_seqlens_q_->untyped_data();
     if (cu_seqlens_k_.has_value() && mha_utils::is_valid_buffer(*cu_seqlens_k_))
       seqstart_k_ptr = cu_seqlens_k_->untyped_data();
+    if (cu_seqlens_q_logical_.has_value() &&
+        mha_utils::is_valid_buffer(*cu_seqlens_q_logical_))
+      cu_seqlen_q_ptr = cu_seqlens_q_logical_->untyped_data();
+    if (cu_seqlens_k_logical_.has_value() &&
+        mha_utils::is_valid_buffer(*cu_seqlens_k_logical_))
+      cu_seqlen_k_ptr = cu_seqlens_k_logical_->untyped_data();
   }
 
   auto args = aiter::mha_bwd_args{
@@ -325,6 +366,7 @@ ffi::Error MhaBwdUnified_Bridge(
       .dq_ptr = dq_ret->untyped_data(), .dk_ptr = dk_final, .dv_ptr = dv_final,
       .dbias_ptr = dbias_expanded_ptr,
       .seqstart_q_ptr = seqstart_q_ptr, .seqstart_k_ptr = seqstart_k_ptr,
+      .cu_seqlen_q_ptr = cu_seqlen_q_ptr, .cu_seqlen_k_ptr = cu_seqlen_k_ptr,
       .seqlen_q = static_cast<int>(seqlen_q), .seqlen_k = static_cast<int>(seqlen_k),
       .batch = static_cast<int>(batch_size),
       .max_seqlen_q = static_cast<int>(max_sq), .max_seqlen_k = static_cast<int>(max_sk),
@@ -356,8 +398,15 @@ ffi::Error MhaBwdUnified_Bridge(
       .window_size_right = static_cast<int>(mask.right),
       .p_drop = dropout_p, .p_undrop = p_undrop,
       .drop_seed_offset = std::make_pair(seed_ptr, offset_ptr),
-      .workspace_alloc = workspace_alloc,
-      .pinned_host_alloc = pinned_host_alloc,
+      // zero_init is honoured rather than assumed, so the accumulator is cleared
+      // only when the kernel aiter selects actually reads it.
+      .workspace_alloc = [stream](size_t bytes, bool zero_init) -> void * {
+        if (bytes == 0) return nullptr;
+        return s_aiter_ws_pool.get(bytes, stream, zero_init);
+      },
+      .pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+        return s_pinned_host_pool.acquire(bytes);
+      }
   };
 
   // Ensure HIP device context matches the data device.  XLA usually sets
@@ -378,17 +427,27 @@ ffi::Error MhaBwdUnified_Bridge(
   if (is_mqa_gqa) {
     int64_t groups = num_heads / num_heads_k;
     int64_t total_tokens = is_varlen ? seqlen_k : batch_size * seqlen_k;
+    const char *fuse_env = std::getenv("JA_MHA_FUSE_GQA_REDUCE");
+    const bool fuse_pair =
+        head_size_q == head_size_v &&
+        !(fuse_env != nullptr && std::string(fuse_env) == "0");
 
-    mha_utils::launch_mqa_gqa_reduction(
-        dk_expanded_ptr, dk_ret->untyped_data(),
-        is_varlen ? 1 : batch_size,
-        is_varlen ? seqlen_k : seqlen_k,
-        num_heads, num_heads_k, head_size_q, groups, q.element_type(), stream);
-    mha_utils::launch_mqa_gqa_reduction(
-        dv_expanded_ptr, dv_ret->untyped_data(),
-        is_varlen ? 1 : batch_size,
-        is_varlen ? seqlen_k : seqlen_k,
-        num_heads, num_heads_k, head_size_v, groups, v.element_type(), stream);
+    if (fuse_pair) {
+      mha_utils::launch_mqa_gqa_reduction_pair(
+          dk_expanded_ptr, dv_expanded_ptr, dk_ret->untyped_data(),
+          dv_ret->untyped_data(), is_varlen ? 1 : batch_size, seqlen_k,
+          num_heads, num_heads_k, head_size_q, groups, q.element_type(),
+          stream);
+    } else {
+      mha_utils::launch_mqa_gqa_reduction(
+          dk_expanded_ptr, dk_ret->untyped_data(),
+          is_varlen ? 1 : batch_size, seqlen_k, num_heads, num_heads_k,
+          head_size_q, groups, q.element_type(), stream);
+      mha_utils::launch_mqa_gqa_reduction(
+          dv_expanded_ptr, dv_ret->untyped_data(),
+          is_varlen ? 1 : batch_size, seqlen_k, num_heads, num_heads_k,
+          head_size_v, groups, v.element_type(), stream);
+    }
 
     // dk/dv expanded buffers managed by pool -- no free needed
   }
@@ -426,6 +485,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>() // alibi_slopes_ (optional)
         .Arg<ffi::AnyBuffer>() // rng_state_ (optional)
         .Arg<ffi::AnyBuffer>() // gen_ (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_q_logical (optional)
+        .Arg<ffi::AnyBuffer>() // cu_seqlens_k_logical (optional)
         .Ret<ffi::AnyBuffer>() // dq_ret
         .Ret<ffi::AnyBuffer>() // dk_ret
         .Ret<ffi::AnyBuffer>() // dv_ret

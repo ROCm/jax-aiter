@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Baseline for the nightly 8-GPU MXFP4 gate. Only mean_tflops_per_device and",
+    "mean_loss are read by ci/perf/parse_perf_log.py; every other key is",
+    "provenance for whoever has to decide whether a red night is real.",
+    "",
+    "PROVISIONAL. This value came from a SOURCE build in the dev image on",
+    "smci355-ccs-aus-m15-29. The nightly measures the shipped WHEEL on a",
+    "linux-jax-aiter-mi355-8 runner, which is an org-managed ARC ephemeral",
+    "pool, NOT the fixed host n15-13 an earlier version of this note named. So",
+    "two things differ from the number below and neither is pinned down:",
+    "packaging, and which node of that pool the night lands on. Leave",
+    "`gate: false` until several nights are on record, then replace the numbers",
+    "below with the median of those nights and turn the gate on.",
+    "",
+    "2026-08-31, the packaging half, measured: the +full wheel was run on",
+    "m15-29 -- the SAME host as the 1840.6644 source figure -- and landed at",
+    "1822.2915 (tail 40-49, mean 2.0824 s), -1.00%. N=1 on both sides. Note",
+    "this is NOT a dev-vs-manylinux clang comparison: the wheel's attention",
+    "libs (librmsnorm_fwd, libmha_fwd, libmha_bwd) are built in the dev image",
+    "and only packaged by manylinux, so both sides carry the same attention",
+    "objects. Related: areas/analysis.md records an rv_release (dev-image)",
+    "wheel at 1827.3868, -0.72%. The node-to-node half is still unmeasured --",
+    "the nightly perf leg has not yet completed a green run.",
+    "",
+    "Do NOT compare a ci_regression (FSDP4, batch 4, global 16) number against",
+    "this file. That profile's own baseline is ~1784.68 and reading it against",
+    "1840 shows a 3% regression that does not exist."
+  ],
+  "label": "8b_fp4_fsdp8",
+  "recipe_profile": "blog_batch9",
+  "ici_fsdp_parallelism": 8,
+  "per_device_batch": 9,
+  "global_batch_size": 72,
+  "measurement_window": "completed_steps_40_49",
+
+  "mean_tflops_per_device": 1840.6644,
+  "mean_seconds": 2.0617,
+  "mean_loss": 4.7325,
+
+  "provenance": {
+    "status": "provisional-source-build",
+    "run": "docs/runs/llama3_8b/analysis/20260824_8b_mxfp4_fp8_bf16_perf_b9_fsdp8_097_s50/mxfp4/train.log",
+    "recorded": "2026-08-24",
+    "n": 1,
+    "build": "source, ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14, clang 22",
+    "host": "smci355-ccs-aus-m15-29 (container rv_rock)",
+    "owner": ".cursor/memory_bank/areas/analysis.md",
+    "note": "Frozen blog MXFP4 figure. Three further source runs of the same recipe gave 1837.1388 / 1838.1214 / 1840.0823 (mean 1839.00, sd 0.09%), so run-to-run spread on a quiet box is well under the 5% gate threshold."
+  }
+}

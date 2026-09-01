@@ -1,0 +1,2928 @@
+diff --git a/src/maxtext/common/metric_logger.py b/src/maxtext/common/metric_logger.py
+index f475afa1154b07275eba4596cc5d55528692a5da..8af10929da92cdddef5cb44c119ccf527ae05edc 100644
+--- a/src/maxtext/common/metric_logger.py
++++ b/src/maxtext/common/metric_logger.py
+@@ -30,6 +30,7 @@ from maxtext.utils.globals import EPS
+ from maxtext.common.gcloud_stub import mldiagnostics_modules
+ from maxtext.common.gcloud_stub import workload_monitor
+ from maxtext.common.managed_mldiagnostics import ManagedMLDiagnostics
++from maxtext.common.mlperf_logger import MLPerfLogger
+ from maxtext.utils import exceptions
+ from maxtext.utils import gcs_utils
+ from maxtext.utils import max_logging
+@@ -108,6 +109,10 @@ class MetricLogger:
+     # Number of eval steps accumulated since the last reset_eval_metrics(). Used by
+     # buffer_and_write_metrics to detect the eval→train transition and trigger finalization.
+     self._pending_eval_step_count = 0
++    # Optional MLPerf-compliance MLLOG emitter (default-off; no-op unless enabled).
++    self._last_train_step = 0
++    self.mlperf = MLPerfLogger(config)
++    self.mlperf.log_init()
+     if self.config.managed_mldiagnostics:
+       ManagedMLDiagnostics(config)  # Initialize the MLRun instance.
+ 
+@@ -223,6 +228,18 @@ class MetricLogger:
+       log_parts.append(f"main_model_loss: {loss - mtp_loss:.3f}")
+       log_parts.append(f"mtp_loss: {mtp_loss:.3f}")
+ 
++    # Per-step optimizer diagnostics on the console (grad-norm/clip/param-norm A/B
++    # vs Megatron). Normally TB-only; surfaced here so runs without tfevents can be
++    # parsed from train.log. Keys set in trainers/pre_train/train.py:522-528.
++    for _k, _lbl in (
++        ("learning/raw_grad_norm", "raw_grad_norm"),
++        ("learning/grad_norm", "grad_norm"),
++        ("learning/param_norm", "param_norm"),
++        ("learning/current_learning_rate", "lr"),
++    ):
++      if _k in scalars:
++        log_parts.append(f"{_lbl}: {float(scalars[_k]):.6f}")
++
+     max_logging.log(", ".join(log_parts))
+ 
+   def _log_eval_metrics(self, metrics, step):
+@@ -455,6 +472,8 @@ class MetricLogger:
+ 
+   def record_train_metrics(self, metrics, step, step_time):
+     """Records training metrics for the current step."""
++    self._last_train_step = step
++    self.mlperf.maybe_start_run()
+     metrics["scalar"].update({"perf/step_time_seconds": step_time})
+     metrics["scalar"].update({"learning/current_learning_rate": self.learning_rate_schedule(step)})
+     if step >= self.config.rampup_end_step:
+@@ -484,7 +503,9 @@ class MetricLogger:
+ 
+     self.write_metrics(self.cumulative_eval_metrics, train_step, metric_type="eval")
+     self._pending_eval_step_count = 0
++    self.mlperf.log_eval(train_step, eval_loss)
+     if self.config.target_eval_loss and eval_loss <= self.config.target_eval_loss:
++      self.mlperf.log_run_stop(success=True, train_step=train_step)
+       raise exceptions.StopTraining(f"Target loss {self.config.target_eval_loss=} is achieved.")
+ 
+   def flush_metrics_and_cleanup(self):
+@@ -498,4 +519,8 @@ class MetricLogger:
+       self._flush_one_buffered_entry(entry)
+     self.buffered_metrics = []
+ 
++    # Fallback run_stop (ABORTED) for runs that end without hitting target_eval_loss;
++    # no-op if a SUCCESS run_stop was already emitted at target.
++    self.mlperf.log_run_stop(success=False, train_step=self._last_train_step)
++
+     max_utils.close_summary_writer(self.writer)
+diff --git a/src/maxtext/common/mlperf_logger.py b/src/maxtext/common/mlperf_logger.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e425c503b3a4f95bbbf86327251b5f29290fb83
+--- /dev/null
++++ b/src/maxtext/common/mlperf_logger.py
+@@ -0,0 +1,162 @@
++# Copyright 2026 Google LLC
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#    https://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Optional MLPerf-compliance MLLOG emitter for llama3.1-8b pretraining.
++
++Default-OFF (gated by ``config.enable_mlperf_logging``). When enabled, emits the
++MLPerf Training v6.0 ``llama31_8b`` Closed key set via ``mlperf_logging.mllog`` so
++a MaxText run can be validated with ``mlperf_logging.compliance_checker`` and
++``rcp_checker``. Mirrors the reference emitter
++(``training/small_llm_pretraining/nemo/callbacks.py``) adapted to MaxText's
++metric-logger call sites.
++
++No-op unless enabled AND ``mlperf_logging`` is importable, and only emits on
++``jax.process_index() == 0``. The emitted HP values are read straight from the
++resolved config, so the log is TRUTHFUL: it only passes the checker when the run
++is configured compliantly (e.g. ``learning_rate_schedule_steps == 1_200_000`` so
++``decay_steps == 1_200_000 - warmup_steps`` and ``max_steps == 1_200_000``).
++
++Key/value contract (training_6.0.0/closed_llama31_8b.yaml + common.yaml):
++  cache_clear -> init_start -> submission_* + HP config events -> init_stop ->
++  run_start -> block_start -> [eval_start, eval_stop, eval_accuracy]* ->
++  block_stop -> run_stop(status) + train_samples + eval_samples.
++"""
++import os
++
++import jax
++
++try:
++  from mlperf_logging import mllog
++  from mlperf_logging.mllog import constants as _c
++
++  _MLLOG_AVAILABLE = True
++except Exception:  # pragma: no cover - mlperf_logging optional
++  _MLLOG_AVAILABLE = False
++
++
++class MLPerfLogger:
++  """Thin, default-off MLLOG emitter driven by the MaxText MetricLogger."""
++
++  def __init__(self, config):
++    self.config = config
++    self.enabled = (
++        bool(getattr(config, "enable_mlperf_logging", False))
++        and _MLLOG_AVAILABLE
++        and jax.process_index() == 0
++    )
++    self._run_started = False
++    self._run_stopped = False
++    self._last_consumed_samples = 0
++    if not self.enabled:
++      return
++
++    path = getattr(config, "mlperf_log_path", "") or os.path.join(
++        (getattr(config, "base_output_directory", "") or "."),
++        (getattr(config, "run_name", "") or "run"),
++        "mlperf.log",
++    )
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    self._logger = mllog.get_mllogger()
++    mllog.config(default_stack_offset=2, filename=path)
++
++  # --- helpers ---------------------------------------------------------------
++  def _gbs(self):
++    return int(self.config.global_batch_size_to_train_on)
++
++  def _consumed(self, train_step):
++    # Samples consumed after completing (0-indexed) train_step.
++    return int((train_step + 1) * self._gbs())
++
++  def _event(self, key, value=None, metadata=None):
++    self._logger.event(key=key, value=value, metadata=metadata or {})
++
++  def _start(self, key, value=None, metadata=None):
++    self._logger.start(key=key, value=value, metadata=metadata or {})
++
++  def _end(self, key, value=None, metadata=None):
++    self._logger.end(key=key, value=value, metadata=metadata or {})
++
++  # --- lifecycle -------------------------------------------------------------
++  def log_init(self):
++    """cache_clear + init_start + submission info + all HP config events."""
++    if not self.enabled:
++      return
++    cfg = self.config
++    warmup_steps = int(round(cfg.warmup_steps_fraction * cfg.learning_rate_schedule_steps))
++    decay_steps = int(cfg.learning_rate_schedule_steps) - warmup_steps
++    end_lr = float(cfg.learning_rate) * float(cfg.learning_rate_final_fraction)
++    eval_samples = int(cfg.eval_steps) * self._gbs() if int(cfg.eval_steps) > 0 else 0
++
++    self._event(_c.CACHE_CLEAR, value=True)
++    self._start(_c.INIT_START)
++    # submission info
++    self._event(_c.SUBMISSION_ORG, value=cfg.mlperf_submission_org)
++    self._event(_c.SUBMISSION_PLATFORM, value=cfg.mlperf_submission_platform)
++    self._event(_c.SUBMISSION_DIVISION, value=cfg.mlperf_submission_division)
++    self._event(_c.SUBMISSION_BENCHMARK, value=cfg.mlperf_submission_benchmark)
++    self._event(_c.SUBMISSION_STATUS, value=_c.ONPREM)
++    # HP / config events required by closed_llama31_8b.yaml
++    self._event(_c.GLOBAL_BATCH_SIZE, value=self._gbs())
++    self._event(_c.MAX_SEQUENCE_LENGTH, value=int(cfg.max_target_length))
++    self._event(_c.OPT_NAME, value="adamw")
++    self._event(_c.OPT_BASE_LR, value=float(cfg.learning_rate))
++    self._event(_c.OPT_END_LR, value=end_lr)
++    self._event(_c.OPT_LR_WARMUP_STEPS, value=warmup_steps)
++    self._event(_c.OPT_LR_DECAY_STEPS, value=decay_steps)
++    self._event(_c.OPT_LR_DECAY_SCHEDULE, value="cosine with linear warmup")
++    self._event(_c.OPT_ADAMW_BETA_1, value=float(cfg.adam_b1))
++    self._event(_c.OPT_ADAMW_BETA_2, value=float(cfg.adam_b2))
++    self._event(_c.OPT_ADAMW_EPSILON, value=float(cfg.adam_eps))
++    self._event(_c.OPT_ADAMW_WEIGHT_DECAY, value=float(cfg.adam_weight_decay))
++    self._event(_c.OPT_GRADIENT_CLIP_NORM, value=float(cfg.gradient_clipping_threshold))
++    self._event(_c.GRADIENT_ACCUMULATION_STEPS, value=int(cfg.gradient_accumulation_steps))
++    self._event(_c.EVAL_SAMPLES, value=eval_samples)
++    self._event("max_steps", value=int(cfg.learning_rate_schedule_steps))
++    if cfg.mlperf_lowest_precision_linear:
++      self._event("lowest_numerical_precision_in_linear", value=cfg.mlperf_lowest_precision_linear)
++
++  def maybe_start_run(self):
++    """init_stop + run_start + block_start (emitted once, before the first eval)."""
++    if not self.enabled or self._run_started:
++      return
++    self._end(_c.INIT_STOP)
++    self._start(_c.RUN_START)
++    self._start(_c.BLOCK_START, metadata={_c.SAMPLES_COUNT: 0})
++    self._run_started = True
++
++  def log_eval(self, train_step, eval_loss):
++    """eval_start + eval_stop + eval_accuracy(value=log-ppl, samples_count)."""
++    if not self.enabled:
++      return
++    self.maybe_start_run()
++    samples = self._consumed(train_step)
++    self._last_consumed_samples = samples
++    self._start(_c.EVAL_START, metadata={_c.SAMPLES_COUNT: samples})
++    self._end(_c.EVAL_STOP, metadata={_c.SAMPLES_COUNT: samples})
++    self._event(_c.EVAL_ACCURACY, value=float(eval_loss), metadata={_c.SAMPLES_COUNT: samples})
++
++  def log_run_stop(self, success, train_step=None):
++    """block_stop + run_stop(status) + train_samples (emitted once).
++
++    eval_samples is emitted once in ``log_init`` (it is a config HP, EXACTLY_ONE),
++    so it is NOT re-emitted here.
++    """
++    if not self.enabled or self._run_stopped:
++      return
++    self.maybe_start_run()
++    samples = self._consumed(train_step) if train_step is not None else self._last_consumed_samples
++    self._end(_c.BLOCK_STOP, metadata={_c.SAMPLES_COUNT: samples})
++    self._end(_c.RUN_STOP, metadata={"status": _c.SUCCESS if success else _c.ABORTED})
++    self._event("train_samples", value=samples)
++    self._run_stopped = True
+diff --git a/src/maxtext/configs/base.yml b/src/maxtext/configs/base.yml
+index ec2e53b2b5ca122530e6c84d2f8e68cf8fc47980..0d2d60e6de7427ff945c2e009f076d3f10e04b9e 100644
+--- a/src/maxtext/configs/base.yml
++++ b/src/maxtext/configs/base.yml
+@@ -119,6 +119,7 @@ dtype: "bfloat16"
+ # 'intmp' for mixed precision quantization for inference as described here: src/maxtext/configs/quantization/readme.md
+ # 'fp8' for 8-bit floating-point gemms on nvidia gpus.
+ # 'nanoo_fp8' for 8-bit floating-point gemms on amd mi300/mi325 gpus.
++# 'aiter_bf16' for AITER ASM BF16 GEMM on AMD MI350 (gfx950). ~1.7x faster than hipBLASLt.
+ # 'fp8_full' for fp8 quantization with static scaling.
+ quantization: ""
+ # used to configure constant_bound_config in aqt lib for static scaling, e.g. constant_bound_config='0.5, 0.5, 0.5, 0.5, 0.5, 0.5'
+@@ -192,6 +193,11 @@ logits_dot_in_fp32: false  # whether to use fp32 in logits_dense or shared_embed
+ cast_logits_to_fp32: true # whether to cast the logits to fp32. the higher precision is generally beneficial, but it can vary slightly.
+ float32_qk_product: false # in dot_product attention, whether to cast to fp32 the inputs to qk product
+ float32_logits: false # in dot_product attention, whether to cast to fp32 the inputs to softmax
++# Runtime query-pre-attention scalar (llama2 decoder only). 0.0 = disabled (default):
++# 1/sqrt(head_dim) stays FOLDED into the query kernel at init (depth_scaling). A positive value
++# (e.g. head_dim**-0.5) moves that scaling to RUNTIME (forward-equivalent) so the query-weight
++# gradient is not inflated by sqrt(head_dim) -- matching Megatron's runtime query scaling.
++query_pre_attn_scalar: 0.0
+ float32_weight_sum: true # whether to use full fp32 precision to sum expert weights for numerical stability
+ float32_gate_logits: false # whether to cast inputs to fp32 to compute MoE gate logits for numerical stability
+ 
+@@ -408,6 +414,12 @@ num_kv_shared_layers: 0
+ # for the lost K/V parameters.
+ use_double_wide_mlp: False
+ 
++# Megatron-style weight init (default OFF / byte-identical). When >0, q/k/v/wi/embedding use
++# fixed normal(0, megatron_init_std) and the residual output projections (attention out, MLP wo)
++# are shrunk by 1/sqrt(2*num_decoder_layers) (if megatron_residual_scale) for high-LR stability.
++megatron_init_std: 0.0
++megatron_residual_scale: True
++
+ 
+ # Adding Mixture of Block Attention Support (MoBA): https://github.com/MoonshotAI/MoBA/blob/master/MoBA_Tech_Report.pdf
+ moba: false
+@@ -784,6 +796,11 @@ olmo_path_remap_from: '' # rewrite index paths starting with this prefix...
+ olmo_path_remap_to: ''   # ...to this one (e.g. gs://bucket/ -> /mnt/.../ for gcsfuse).
+ olmo_apply_ngram_filter: true # mask instances with repetitive n-grams (OLMo-core filter)
+ 
++# Exact-batch replay pipeline (dataset_type=megatron_replay): directory of pre-dumped
++# Megatron/Primus per-step global batches (input_ids/labels/loss_mask .npy, shape (N,GBS,S))
++# produced by mega_analysis/code/dump_megatron_batches.py. Replays them verbatim, in order.
++megatron_replay_path: ''
++
+ # Training loop
+ steps: 150_001 # If set to -1 then will inherit value from learning_rate_schedule_steps
+ log_period: 100 # The frequency of Tensorboard flush, gcs metrics writing, and managed profiler metrics updating.
+@@ -987,6 +1004,17 @@ target_eval_loss: 0.  # early stop once reaching target eval_loss
+ abort_on_nan_loss: true # Check for NaN and abort if found in training loss
+ abort_on_inf_loss: true # Check for Inf and abort if found in training loss
+ 
++# MLPerf-compliance MLLOG emitter (default OFF). When enabled, emits the MLPerf
++# training MLLOG key set (mllog) alongside normal metrics so a run can be validated
++# with mlperf_logging.compliance_checker. No-op unless mlperf_logging is importable.
++enable_mlperf_logging: false
++mlperf_log_path: ""  # explicit MLLOG output path; empty => <base_output_directory>/<run_name>/mlperf.log
++mlperf_submission_org: ""        # required non-empty for a compliant log
++mlperf_submission_platform: ""   # required non-empty for a compliant log
++mlperf_submission_division: "closed"  # closed | open
++mlperf_submission_benchmark: "llama31_8b"
++mlperf_lowest_precision_linear: ""  # optional key, e.g. mxfp4 | fp8 | bfloat16 (empty => not emitted)
++
+ # Goodput parameters
+ enable_goodput_recording: false
+ monitor_goodput: false
+diff --git a/src/maxtext/configs/pyconfig.py b/src/maxtext/configs/pyconfig.py
+index a23c3e3eb8017ae1fad73ab617fd26a6cada9ccc..ceeaaa0879ab137ca8dd93613248a411e372b0d0 100644
+--- a/src/maxtext/configs/pyconfig.py
++++ b/src/maxtext/configs/pyconfig.py
+@@ -555,6 +555,25 @@ def _initialize_pydantic(argv: list[str] | None = None, **kwargs) -> MaxTextConf
+   pydantic_config = types.MaxTextConfig(**pydantic_kwargs)
+   explicit_keys = set((cli_keys | kwargs_keys | env_keys) & frozenset(types.MaxTextConfig.model_fields.keys()))
+   object.__setattr__(pydantic_config, "__pydantic_fields_set__", explicit_keys)
++
++  # The validated Llama 3/3.1 8B MXFP4 recipe uses the repository-owned
++  # JAX-AITER MHA path by default. Apply this *after* computing explicit_keys so either
++  # `attention=cudnn_flash_te` or `aiter_attention=False` remains a deliberate
++  # rollback. Keep the auto-route narrow: AITER FP4, global/full attention, and
++  # dropout disabled. Other AITER precisions and attention variants retain
++  # their existing backend.
++  if (
++      pydantic_config.quantization == types.QuantizationType.AITER_FP4
++      and pydantic_config.model_name in ("llama3-8b", "llama3.1-8b")
++      and pydantic_config.attention_type in ("global", "full")
++      and not pydantic_config.enable_dropout
++      and "attention" not in explicit_keys
++      and "aiter_attention" not in explicit_keys
++  ):
++    pydantic_config.attention = "aiter_flash"
++    pydantic_config.aiter_attention = True
++    pydantic_config.use_jax_aiter = True
++
+   config = HyperParameters(pydantic_config)
+ 
+   if config.log_config:
+diff --git a/src/maxtext/configs/types.py b/src/maxtext/configs/types.py
+index 0da0650006b148f760fb63a2efe3b1422a4fd76b..ad3b52971bc9e2bfd114685fe1efd79730dd72ac 100644
+--- a/src/maxtext/configs/types.py
++++ b/src/maxtext/configs/types.py
+@@ -91,6 +91,13 @@ class QuantizationType(str, Enum):
+   FP8_E4M3 = "fp8_e4m3"
+   FP8 = "fp8"
+   NANOO_FP8 = "nanoo_fp8"
++  AITER_BF16 = "aiter_bf16"
++  AITER_FP8 = "aiter_fp8"
++  AITER_FP8_DELAYED = "aiter_fp8_delayed"
++  AITER_FP8_QDQ = "aiter_fp8_qdq"
++  AITER_FP8_MLP_ONLY = "aiter_fp8_mlp_only"
++  AITER_NANOO_FP8 = "aiter_nanoo_fp8"
++  AITER_FP4 = "aiter_fp4"
+   FP8_NANO_V2 = "fp8_nanoo"
+   FP8_GPU = "fp8_gpu"
+   FP8_FULL = "fp8_full"
+@@ -180,6 +187,8 @@ class DatasetType(str, Enum):
+   TFDS = "tfds"
+   C4MLPERF = "c4_mlperf"
+   OLMO_GRAIN = "olmo_grain"
++  MEGATRON = "megatron"
++  MEGATRON_REPLAY = "megatron_replay"
+ 
+ 
+ class SamplingStrategy(str, Enum):
+@@ -475,6 +484,35 @@ class Quantization(BaseModel):
+   )
+ 
+ 
++class Aiter(BaseModel):
++  """Configuration for AITER kernel integration (ROCm MI350/MI355X).
++
++  AITER provides hand-tuned ASM kernels that can replace hipBLASLt for specific
++  operations. The tiered strategy automatically selects FFI kernels on 1-GPU and
++  XLA-compatible pure-JAX implementations on multi-GPU.
++  """
++
++  use_jax_aiter: bool = Field(False, description="Master flag: enable all AITER kernel optimizations.")
++  aiter_gemm: bool = Field(True, description="AITER ASM GEMM for forward matmuls (requires use_jax_aiter=True).")
++  aiter_rmsnorm: bool = Field(True, description="Fused add+RMSNorm (requires use_jax_aiter=True).")
++  aiter_silu_and_mul: bool = Field(False, description="Fused silu(gate)*up activation via FFI. DISABLED by default — FFI inside scan+remat serializes backward, causing ~55% regression. Only useful for non-scan or single-GPU. (requires use_jax_aiter=True).")
++  aiter_attention: bool = Field(
++      False,
++      description="AITER CK flash attention via jax-aiter FFI. "
++      "The validated global, dropout-free Llama 3/3.1 8B aiter_fp4 recipe "
++      "auto-enables this unless attention or aiter_attention was explicitly set. "
++      "Set attention=cudnn_flash_te or aiter_attention=False for the TE rollback "
++      "(requires use_jax_aiter=True).",
++  )
++  aiter_moe: bool = Field(
++      False,
++      description="AITER MXFP4 fused-MoE forward via jax-aiter MoeFwdJA FFI. "
++      "Bypasses MaxText's default ragged_dot/gmm sparse_matmul path; routes "
++      "MoE expert GEMMs through AITER's fmoe_bf16_pertokenMXfp4_g1u1_silu "
++      "ASM kernel. Inference-only (forward pass). Requires use_jax_aiter=True.",
++  )
++
++
+ class ModelArchitecture(BaseModel):
+   """Core model architecture parameters."""
+ 
+@@ -553,6 +591,18 @@ class Logits(BaseModel):
+       description="Soft-cap value for the final logits. None or 0.0 means no cap.",
+   )
+   z_loss_multiplier: float = Field(0.0, description="The multiplier for the z-loss (e.g., 1e-4). 0.0 to disable.")
++  megatron_init_std: float = Field(
++      0.0,
++      description=(
++          "If >0, use Megatron-style fixed normal(0, std) weight init for q/k/v/wi/embedding, "
++          "with residual output projections (attention out, MLP wo) scaled by 1/sqrt(2*num_decoder_layers) "
++          "when megatron_residual_scale is True. 0.0 = MaxText default fan-in variance-scaling init (off, byte-identical)."
++      ),
++  )
++  megatron_residual_scale: bool = Field(
++      True,
++      description="When megatron_init_std>0, shrink residual output projections (attn out, MLP wo) by 1/sqrt(2*num_decoder_layers).",
++  )
+ 
+ 
+ class Attention(BaseModel):
+@@ -612,6 +662,17 @@ class Attention(BaseModel):
+   attn_logits_soft_cap: None | NonNegativeFloat = Field(
+       None, description="Soft-cap value for attention logits. None means no cap."
+   )
++  query_pre_attn_scalar: NonNegativeFloat = Field(
++      0.0,
++      description=(
++          "Optional runtime query-pre-attention scalar for the llama-style decoder block. "
++          "0.0 (default) = disabled: keep MaxText's default behavior of folding 1/sqrt(head_dim) "
++          "into the query projection KERNEL at init (depth_scaling). Setting a positive value "
++          "(e.g. head_dim**-0.5 = 1/sqrt(head_dim)) moves that scaling from the WEIGHT to RUNTIME "
++          "(query *= scalar), which is FORWARD-EQUIVALENT but un-inflates the query-weight gradient "
++          "(matches Megatron's runtime query scaling). Default-off; only the llama2 decoder reads it."
++      ),
++  )
+   use_post_attn_norm: bool = Field(False, description="Apply LayerNorm after the attention block.")
+   use_post_ffw_norm: bool = Field(False, description="Apply LayerNorm after the feed-forward block.")
+   use_ragged_attention: bool = Field(False, description="Whether to use ragged attention kernels.")
+@@ -1380,6 +1441,23 @@ class OlmoGrainDataset(BaseModel):
+   olmo_apply_ngram_filter: bool = Field(True, description="Mask repetitive instances per OLMo-core's repetition filter.")
+ 
+ 
++class MegatronReplayDataset(BaseModel):
++  """Configuration for the exact-batch replay pipeline (dataset_type=megatron_replay).
++
++  Replays a directory of pre-dumped Megatron/Primus per-step global batches
++  verbatim (input_ids/labels/loss_mask/position_ids stored as .npy with shape
++  (N, GBS, S)), bypassing every data-pipeline difference. Used to separate a
++  MaxText data-pipeline mismatch from an optimizer/update-path mismatch by
++  feeding MaxText the IDENTICAL batches Megatron trained on, in order.
++  """
++
++  megatron_replay_path: PathStr = Field(
++      "",
++      description="Directory containing input_ids.npy/labels.npy/loss_mask.npy/meta.json "
++      "produced by mega_analysis/code/dump_megatron_batches.py.",
++  )
++
++
+ class DPO(BaseModel):
+   """Configuration for DPO and ORPO preference optimization algorithms."""
+ 
+@@ -1561,6 +1639,23 @@ class TrainingLoop(BaseModel):
+   enable_data_shuffling: bool = Field(True, description="Enables shuffling of the training data.")
+   data_shuffle_seed: int = Field(0, description="Seed for data shuffling.")
+   init_weights_seed: int = Field(0, description="Seed for model weight initialization.")
++  enable_mlperf_logging: bool = Field(
++      False,
++      description="Emit the MLPerf training MLLOG key set (mllog) for compliance checking. No-op if disabled.",
++  )
++  mlperf_log_path: str = Field(
++      "",
++      description="Explicit MLLOG output path; empty => <base_output_directory>/<run_name>/mlperf.log.",
++  )
++  mlperf_submission_org: str = Field("", description="MLPerf submission_org (must be non-empty for a compliant log).")
++  mlperf_submission_platform: str = Field(
++      "", description="MLPerf submission_platform (must be non-empty for a compliant log)."
++  )
++  mlperf_submission_division: str = Field("closed", description="MLPerf submission_division: 'closed' or 'open'.")
++  mlperf_submission_benchmark: str = Field("llama31_8b", description="MLPerf submission_benchmark name.")
++  mlperf_lowest_precision_linear: str = Field(
++      "", description="Optional MLPerf lowest_numerical_precision_in_linear value (empty => not emitted)."
++  )
+ 
+ 
+ class ManifoldConstrainedHyperConnections(BaseModel):
+@@ -2492,6 +2587,7 @@ class MaxTextConfig(
+     # Data Types and Quantization
+     DataTypes,
+     Quantization,
++    Aiter,
+     # Core Model Architecture
+     ModelArchitecture,
+     Engram,
+@@ -2544,6 +2640,7 @@ class MaxTextConfig(
+     HfDataset,
+     GrainDataset,
+     OlmoGrainDataset,
++    MegatronReplayDataset,
+     Tokenizer,
+     # Inference
+     InferenceGeneral,
+@@ -2918,6 +3015,16 @@ class MaxTextConfig(
+       except RuntimeError:
+         self.quantization_local_shard_count = 1
+ 
++    # AITER <-> config flag sync.
++    if self.quantization in ("aiter_bf16", "aiter_fp8", "aiter_fp8_delayed", "aiter_fp8_qdq", "aiter_fp8_mlp_only", "aiter_fp4") and not self.use_jax_aiter:
++      self.use_jax_aiter = True
++    if self.attention == "aiter_flash" and not self.use_jax_aiter:
++      self.use_jax_aiter = True
++    if self.use_jax_aiter and self.aiter_gemm and not self.quantization:
++      self.quantization = QuantizationType.AITER_BF16
++    if self.use_jax_aiter and self.aiter_attention and self.attention not in ("aiter_flash",):
++      self.attention = "aiter_flash"
++
+     # F. CALCULATE BATCH SIZES
+     def calculate_global_batch_sizes(per_device_batch_size, expansion_factor, num_devices, grad_accum_steps):
+       """Helper to calculate global and micro batch sizes for training and loading."""
+diff --git a/src/maxtext/input_pipeline/input_pipeline_interface.py b/src/maxtext/input_pipeline/input_pipeline_interface.py
+index 4a0b37532f0d063f79718c65f79372fa8edd5b0e..e766036a0c39e51d7a8d9d3d92c56ef42bcea4bc 100644
+--- a/src/maxtext/input_pipeline/input_pipeline_interface.py
++++ b/src/maxtext/input_pipeline/input_pipeline_interface.py
+@@ -78,8 +78,21 @@ def create_data_iterator(config: pyconfig.HyperParameters, mesh):
+     dataset_type_to_train_eval_iterator["tfds"] = (make_tfds_train_iterator, make_tfds_eval_iterator)
+     dataset_type_to_train_eval_iterator["c4_mlperf"] = (make_c4_mlperf_train_iterator, make_c4_mlperf_eval_iterator)
+ 
++  if config.dataset_type == "megatron":
++    from maxtext.input_pipeline.megatron_data_processing import make_megatron_train_iterator, make_megatron_eval_iterator  # pylint: disable=import-outside-toplevel
++
++    dataset_type_to_train_eval_iterator["megatron"] = (make_megatron_train_iterator, make_megatron_eval_iterator)
++
++  if config.dataset_type == "megatron_replay":
++    from maxtext.input_pipeline.megatron_replay_processing import make_megatron_replay_train_iterator, make_megatron_replay_eval_iterator  # pylint: disable=import-outside-toplevel
++
++    dataset_type_to_train_eval_iterator["megatron_replay"] = (
++        make_megatron_replay_train_iterator,
++        make_megatron_replay_eval_iterator,
++    )
++
+   # Collect train and eval iterators
+-  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf", "olmo_grain"]:
++  if config.dataset_type in ["tfds", "grain", "hf", "c4_mlperf", "olmo_grain", "megatron", "megatron_replay"]:
+     if config.dataset_type == "c4_mlperf":
+       assert config.packing, "c4_mlperf dataloader only works with packing. For padded version, use tfds dataloader"
+     train_iterator, eval_iterator = dataset_type_to_train_eval_iterator[config.dataset_type]
+diff --git a/src/maxtext/input_pipeline/megatron_data_processing.py b/src/maxtext/input_pipeline/megatron_data_processing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8cb99eccc27375cb618e78181f7454672b759f77
+--- /dev/null
++++ b/src/maxtext/input_pipeline/megatron_data_processing.py
+@@ -0,0 +1,79 @@
++# Copyright 2026
++# Licensed under the Apache License, Version 2.0.
++"""Input pipeline for MLPerf Megatron-indexed (.bin/.idx) preprocessed C4.
++
++The MLPerf llama3.1-8b preprocessed dataset is a Megatron `MMapIndexedDataset`:
++a flat concatenation of int32 token ids (the `.bin`) over documents (boundaries
++in the `.idx`). Standard GPT pretraining builds samples by chunking the
++concatenated token stream into fixed `max_target_length`-token blocks with FULL
++causal attention across document boundaries (no per-doc reset). We replicate that:
++
++  sample i = bin[i*S : i*S + S + 1]  (stride S = max_target_length; read S+1 for
++             the next-token shift), inputs = sample[:-1], targets = sample[1:].
++
++Train: shuffle the sample order (seeded). Eval: MLPerf protocol = first 1024
++chunks of the validation stream (~8.4M tokens), no shuffle.
++
++The .bin paths are passed via config.grain_train_files / config.grain_eval_files
++(reused as generic path strings). Tokens are pre-tokenized (the MLPerf Llama-3.1
++tokenizer), so there is NO tokenization at load time (cheap memmap slicing).
++"""
++import numpy as np
++import tensorflow as tf
++import jax
++
++from maxtext.input_pipeline import multihost_dataloading
++
++EVAL_NUM_SEQUENCES = 1024  # MLPerf eval protocol: first 1024 sequences (~8.4M tokens)
++
++
++def _make_dataset(bin_path, seq_len, global_batch_to_load, shuffle, seed,
++                  num_epoch=1, max_samples=None):
++  arr = np.memmap(bin_path, dtype=np.int32, mode="r")
++  n_samples = (arr.shape[0] - 1) // seq_len
++  if max_samples is not None:
++    n_samples = min(n_samples, max_samples)
++
++  def gen():
++    order = np.arange(n_samples)
++    for ep in range(num_epoch):
++      if shuffle:
++        np.random.default_rng(seed + ep).shuffle(order)
++      for i in order:
++        s = int(i) * seq_len
++        yield np.asarray(arr[s:s + seq_len + 1], dtype=np.int32)
++
++  ds = tf.data.Dataset.from_generator(
++      gen, output_signature=tf.TensorSpec(shape=[seq_len + 1], dtype=tf.int32))
++
++  def _fmt(x):
++    inputs = x[:-1]
++    targets = x[1:]
++    seg = tf.ones([seq_len], dtype=tf.int32)        # full causal: one segment per row
++    pos = tf.range(seq_len, dtype=tf.int32)
++    return {
++        "inputs": inputs, "targets": targets,
++        "inputs_segmentation": seg, "targets_segmentation": seg,
++        "inputs_position": pos, "targets_position": pos,
++    }
++
++  ds = ds.map(_fmt, num_parallel_calls=tf.data.AUTOTUNE)
++  ds = ds.batch(global_batch_to_load // jax.process_count(), drop_remainder=True)
++  ds = ds.prefetch(tf.data.AUTOTUNE)
++  return ds
++
++
++def make_megatron_train_iterator(config, global_mesh, process_indices):
++  ds = _make_dataset(
++      config.grain_train_files, config.max_target_length,
++      config.global_batch_size_to_load, shuffle=config.enable_data_shuffling,
++      seed=config.data_shuffle_seed, num_epoch=max(1, config.num_epoch))
++  return multihost_dataloading.MultiHostDataLoadIterator(ds, global_mesh)
++
++
++def make_megatron_eval_iterator(config, global_mesh, process_indices):
++  ds = _make_dataset(
++      config.grain_eval_files, config.max_target_length,
++      config.global_batch_size_to_load_eval, shuffle=False,
++      seed=config.data_shuffle_seed, num_epoch=1, max_samples=EVAL_NUM_SEQUENCES)
++  return multihost_dataloading.MultiHostDataLoadIterator(ds, global_mesh)
+diff --git a/src/maxtext/input_pipeline/megatron_replay_processing.py b/src/maxtext/input_pipeline/megatron_replay_processing.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2081176ef2a100b5f2ca34047477f22b01ba2845
+--- /dev/null
++++ b/src/maxtext/input_pipeline/megatron_replay_processing.py
+@@ -0,0 +1,112 @@
++# Copyright 2026
++# Licensed under the Apache License, Version 2.0.
++"""Exact-batch REPLAY input pipeline (dataset_type=megatron_replay).
++
++Replays a directory of pre-dumped Megatron/Primus per-step global batches
++VERBATIM, in order, bypassing every data-pipeline difference (sample
++construction, document handling, shuffle RNG). This isolates a MaxText
++data-pipeline mismatch from an optimizer / update-path mismatch: feed MaxText
++the IDENTICAL batches Megatron trained on and overlay per-step loss.
++
++The dump is produced by ``mega_analysis/code/dump_megatron_batches.py`` and
++contains, with shape ``(N, GBS, S)``:
++  input_ids.npy   int32   GPTDataset 'tokens'  (text[:-1])
++  labels.npy      int32   GPTDataset 'labels'  (text[1:])
++  loss_mask.npy   uint8   GPTDataset 'loss_mask' (1 = scored token)
++  position_ids.npy (S,) int32  single-segment arange
++  meta.json
++
++MaxText weights the loss by ``(targets_segmentation != 0)`` (train.py), so we
++map Megatron's per-token ``loss_mask`` directly onto the segmentation field:
++this reproduces Megatron's exact loss normalization (sum over scored tokens).
++For the MLPerf megatron .bin path loss_mask is all-ones (every token scored),
++so segmentation is all-ones => standard full causal attention.
++"""
++import json
++import os
++
++import jax
++import numpy as np
++import tensorflow as tf
++
++from maxtext.input_pipeline import multihost_dataloading
++from maxtext.utils import max_logging
++
++
++def _load_meta(replay_dir):
++  with open(os.path.join(replay_dir, "meta.json"), "r") as f:
++    return json.load(f)
++
++
++def _make_dataset(replay_dir, seq_len, global_batch_to_load, num_epoch=1):
++  input_ids = np.load(os.path.join(replay_dir, "input_ids.npy"), mmap_mode="r")
++  labels = np.load(os.path.join(replay_dir, "labels.npy"), mmap_mode="r")
++  loss_mask = np.load(os.path.join(replay_dir, "loss_mask.npy"), mmap_mode="r")
++  n_steps, gbs, s = input_ids.shape
++  assert s == seq_len, f"dump seq_len {s} != config max_target_length {seq_len}"
++  meta = _load_meta(replay_dir)
++  max_logging.log(
++      f"[megatron_replay] {replay_dir}: N={n_steps} GBS={gbs} S={s} "
++      f"(meta hash={meta.get('unique_description_hash')}, "
++      f"loss_mask_all_ones={meta.get('loss_mask_all_ones')})"
++  )
++
++  def gen():
++    for _ in range(max(1, num_epoch)):
++      for step in range(n_steps):
++        for b in range(gbs):
++          yield (
++              np.asarray(input_ids[step, b], dtype=np.int32),
++              np.asarray(labels[step, b], dtype=np.int32),
++              np.asarray(loss_mask[step, b], dtype=np.int32),
++          )
++
++  output_signature = (
++      tf.TensorSpec(shape=[seq_len], dtype=tf.int32),
++      tf.TensorSpec(shape=[seq_len], dtype=tf.int32),
++      tf.TensorSpec(shape=[seq_len], dtype=tf.int32),
++  )
++  ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
++
++  pos = tf.range(seq_len, dtype=tf.int32)
++
++  def _fmt(inputs, targets, lmask):
++    # Megatron loss_mask -> segmentation so MaxText's (segmentation != 0) loss
++    # weighting reproduces Megatron's exact token normalization.
++    seg = lmask
++    return {
++        "inputs": inputs,
++        "targets": targets,
++        "inputs_segmentation": seg,
++        "targets_segmentation": seg,
++        "inputs_position": pos,
++        "targets_position": pos,
++    }
++
++  ds = ds.map(_fmt, num_parallel_calls=tf.data.AUTOTUNE)
++  ds = ds.batch(global_batch_to_load // jax.process_count(), drop_remainder=True)
++  ds = ds.prefetch(tf.data.AUTOTUNE)
++  return ds
++
++
++def make_megatron_replay_train_iterator(config, global_mesh, process_indices):
++  assert config.megatron_replay_path, "megatron_replay requires megatron_replay_path"
++  ds = _make_dataset(
++      config.megatron_replay_path,
++      config.max_target_length,
++      config.global_batch_size_to_load,
++      num_epoch=max(1, config.num_epoch),
++  )
++  return multihost_dataloading.MultiHostDataLoadIterator(ds, global_mesh)
++
++
++def make_megatron_replay_eval_iterator(config, global_mesh, process_indices):
++  # The exact-batch experiment compares per-step TRAIN loss; eval is normally
++  # disabled (eval_interval=0). If enabled, replay the same batches.
++  ds = _make_dataset(
++      config.megatron_replay_path,
++      config.max_target_length,
++      config.global_batch_size_to_load_eval,
++      num_epoch=1,
++  )
++  return multihost_dataloading.MultiHostDataLoadIterator(ds, global_mesh)
+diff --git a/src/maxtext/layers/attention_op.py b/src/maxtext/layers/attention_op.py
+index b3f22fc336aaf0e46d0eef078f113a2cc5ac2bab..83cc2f5b1d6d8377d24494e34d37719d81fb68da 100644
+--- a/src/maxtext/layers/attention_op.py
++++ b/src/maxtext/layers/attention_op.py
+@@ -18,6 +18,7 @@ import dataclasses
+ import functools
+ from functools import partial
+ import math
++import os
+ from typing import Any, Callable, Optional, Tuple
+ 
+ from flax import linen as nn
+@@ -481,7 +482,14 @@ class AttentionOp(nnx.Module):
+     self.kv_quant = kv_quant
+     self.attention_type = attention_type
+     # Block sizes are only used by TPU splash attention kernels. Exclude non-splash kernels
+-    if self.attention_kernel not in ("dot_product", "paged", "vllm_rpa", "cudnn_flash_te", "cudnn_flash_jax"):
++    if self.attention_kernel not in (
++        "dot_product",
++        "paged",
++        "vllm_rpa",
++        "cudnn_flash_te",
++        "cudnn_flash_jax",
++        "aiter_flash",
++    ):
+       if self.attention_type == AttentionType.LOCAL_SLIDING:
+         self.block_q = self.config.local_sa_block_q
+         self.block_kv = self.config.local_sa_block_kv
+@@ -1087,6 +1095,26 @@ class AttentionOp(nnx.Module):
+           qk_product_einsum=qk_product_einsum,
+           wv_product_einsum=wv_product_einsum,
+       )
++    elif self.attention_kernel == "aiter_flash":
++      # Direct jax-aiter AITER flash (varlen/THD for packed real data). Same
++      # aiter::mha_fwd/bwd kernels TE's CK backend calls, but invoked leanly
++      # (no TE pad-remove/re-pad / SequenceDescriptor overhead).
++      if model_mode == MODEL_MODE_AUTOREGRESSIVE:
++        return self.apply_attention_dot(
++            query, key, value, decoder_segment_ids, model_mode, previous_chunk,
++            segment_positions=segment_positions,
++            bidirectional_mask=bidirectional_mask, sinks=sinks, indexer_mask=indexer_mask,
++            compressed_mask=compressed_mask,
++            record_max_logits=record_max_logits,
++            qk_product_einsum=qk_product_einsum, wv_product_einsum=wv_product_einsum,
++        )
++      return (
++          self.aiter_flash_attention(
++              query, key, value, decoder_segment_ids, segment_positions
++          ),
++          None,
++          None,
++      )
+     elif self.attention_kernel in ("flash", "autoselected"):
+       if target_hardware == "tpu":
+         if isinstance(key, KVTensor):
+@@ -1856,6 +1884,171 @@ class AttentionOp(nnx.Module):
+     )
+     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
+ 
++  def _aiter_packed_metadata(self, segment_ids: Array, seq_len: int) -> tuple[Array, Array]:
++    """THD sequence metadata for one device-local ``[b_local, seq_len]`` shard.
++
++    Mirrors what TE derives for its CK backend
++    (`transformer_engine/jax/attention.py::_get_seqlens_and_offsets` plus the
++    compaction in `cpp_extensions/attention.py`), so both attention backends
++    describe the same segments to the same AITER kernels:
++
++    * ``seqstart``  -- cumulative **physical** token offsets, padding included.
++    * ``cu_seqlen`` -- cumulative **logical** lengths, padding excluded.
++
++    Segment id ``0`` is padding, never a sequence
++    (`input_pipeline/packing/sequence_packing.py`). Both arrays are statically
++    sized at ``b_local * max_segments_per_seq + 1`` slots; unused slots get a
++    zero logical length, which is how AITER is told to skip them.
++
++    Assumes MaxText's packing invariants: ids are monotonic within a row and
++    each id forms one contiguous run, with padding only between/after segments.
++    """
++    max_seg = self.config.max_segments_per_seq
++    b_local = segment_ids.shape[0]
++    n_slots = b_local * max_seg
++    total = b_local * seq_len
++    sid = segment_ids.astype(jnp.int32)
++
++    # Logical length of every (row, id) pair; drop the id-0 (padding) bucket.
++    lengths = jax.vmap(partial(jnp.bincount, length=max_seg + 1))(sid)[:, 1:]
++
++    # First token of each non-padding run, as a flattened offset.
++    starts_row = jnp.concatenate(
++        [
++            sid[:, :1] != 0,
++            jnp.logical_and(sid[:, 1:] != sid[:, :-1], sid[:, 1:] != 0),
++        ],
++        axis=1,
++    )
++    offsets = jax.vmap(partial(jnp.argwhere, size=max_seg + 1, fill_value=-1))(starts_row)
++    offsets = offsets.squeeze(-1)
++    offsets = jnp.where(offsets >= 0, offsets + (jnp.arange(b_local) * seq_len)[:, None], -1)
++
++    def _compact(x, keep, fill):
++      """Move kept entries of a [b, k] array to the front of one flat array."""
++      flat = x.reshape(-1)
++      idx = jnp.nonzero(keep.reshape(-1), size=flat.size, fill_value=flat.size)[0]
++      return jnp.take(flat, idx, fill_value=fill)
++
++    # Real segments first, in token order; unused slots are empty (length 0) and
++    # point one past the end of the buffer.
++    lengths = _compact(lengths, lengths > 0, fill=0)[:n_slots]
++    seqstart = _compact(offsets, offsets >= 0, fill=total)[:n_slots]
++
++    seqstart = jnp.concatenate([seqstart, jnp.full((1,), total, jnp.int32)]).astype(jnp.int32)
++    cu_seqlen = jnp.concatenate(
++        [jnp.zeros((1,), jnp.int32), jnp.cumsum(lengths).astype(jnp.int32)]
++    )
++    return seqstart, cu_seqlen
++
++  def aiter_flash_attention(
++      self,
++      query: Array,
++      key: Array | KVTensor,
++      value: Array | KVTensor,
++      decoder_segment_ids: Array | None,
++      segment_positions: Array | None = None,
++  ) -> Array:
++    """Direct jax-aiter AITER flash attention.
++
++    Route selection matches `cudnn_flash_attention` so the two backends are
++    comparable: real packed data uses THD/varlen, everything else uses batched
++    attention. Synthetic data reports all-ones segment ids rather than ``None``,
++    so branching on the ids alone would push a plain batch of full-length
++    sequences down the varlen path.
++
++    MaxText pre-scales the query in the projection (depth_scaling), so the
++    softmax scale here is 1.0, as on the `cudnn_flash_te` path.
++
++    `segment_positions` is accepted for interface parity with TE but is not
++    needed here: TE's position-based seqlen/offset correction
++    (`_fast_causal_adjust_seqlen_and_offsets`) compares the first and last
++    position of the Q and KV segments, and for self-attention those are the same
++    tensor, so both corrections are identically zero.
++    """
++    del segment_positions
++    # pylint: disable=import-outside-toplevel
++    from jax_aiter.mha import flash_attn_func, flash_attn_varlen_raw  # pytype: disable=import-error
++    from jax.experimental.shard_map import shard_map  # pytype: disable=import-error
++    from jax.sharding import PartitionSpec as P
++
++    if isinstance(key, KVTensor):
++      key = key.dequant()
++    if isinstance(value, KVTensor):
++      value = value.dequant()
++
++    if self.attention_type not in (AttentionType.GLOBAL, AttentionType.FULL):
++      raise NotImplementedError(
++          f"attention=aiter_flash supports global causal attention only, got {self.attention_type}. "
++          "Use attention=cudnn_flash_te for sliding-window or chunked attention."
++      )
++    if self.dropout_rate and self.dropout_rate > 0.0:
++      raise NotImplementedError("attention=aiter_flash does not implement attention dropout.")
++
++    # Same predicate as cudnn_flash_attention: packing is inert for synthetic
++    # data, which MaxText warns about and which keeps TE on the batched layout.
++    use_packed = bool(self.config.packing) and self.config.dataset_type != "synthetic"
++
++    if not use_packed or decoder_segment_ids is None:
++      # Full-length causal sequences. Row padding is not expressible on either
++      # route (TE covers that case with an explicit mask), so it stays on TE.
++      #
++      # Batched attention and one tight varlen segment per row compute the same
++      # function here, but they do not reach the same kernels: at this shape AITER
++      # has no batch-mode ASM v3 backward and silently falls back to CK, while
++      # group mode reaches `bwd_hd128_bf16_causal_br_a32_psskddv_group`. Since the
++      # newer ASM backward is the whole reason to route through jax-aiter, the
++      # default is one tight segment per row. `JA_MHA_NONPACKED_ROUTE=batch`
++      # selects the batched layout TE uses for this input, for a layout-matched
++      # comparison. Dispatch and per-call evidence:
++      # docs/runs/llama3_8b/kernels/20260730_8b_bf16_mha_packed_contract_097_i1/
++      #
++      # Without segment ids there is nothing to shard-map over, so batched is the
++      # only option.
++      if decoder_segment_ids is None or os.environ.get("JA_MHA_NONPACKED_ROUTE", "varlen") == "batch":
++        return flash_attn_func(query, key, value, causal=True, softmax_scale=1.0)[0]
++
++    mesh = self.mesh
++    # The activation batch dim is sharded over these mesh axes (base.yml
++    # logical_axis_rules: activation_batch -> data/fsdp/fsdp_transpose/expert).
++    # shard_map makes each device hold a fully-LOCAL [b_local, s, h, d] shard so
++    # we can build device-local metadata and call the raw varlen FFI per-shard
++    # (global-offset metadata cannot be used on a token-sharded q).
++    batch_axes = tuple(
++        ax for ax in ("data", "fsdp", "fsdp_transpose", "expert")
++        if ax in mesh.axis_names and mesh.shape[ax] > 1
++    )
++    in_specs = (
++        P(batch_axes, None, None, None),
++        P(batch_axes, None, None, None),
++        P(batch_axes, None, None, None),
++        P(batch_axes, None),
++    )
++    out_specs = P(batch_axes, None, None, None)
++
++    def _local_varlen(q_l, k_l, v_l, sid_l):
++      bl, sl, hq_l, d_l = q_l.shape
++      n = bl * sl
++      if use_packed:
++        seqstart, cu_seqlen = self._aiter_packed_metadata(sid_l, sl)
++      else:
++        # One full-length segment per row: physical and logical agree, so the
++        # logical array is omitted (AITER's group mode without padding).
++        seqstart = jnp.arange(bl + 1, dtype=jnp.int32) * sl
++        cu_seqlen = None
++      qf = q_l.reshape(n, hq_l, d_l)
++      kf = k_l.reshape(n, k_l.shape[2], d_l)
++      vf = v_l.reshape(n, v_l.shape[2], v_l.shape[3])
++      out = flash_attn_varlen_raw(
++          qf, kf, vf, seqstart, seqstart, cu_seqlen, cu_seqlen,
++          sl, sl, 0.0, 1.0, True, (-1, -1),
++      )
++      return out.reshape(bl, sl, hq_l, vf.shape[-1])
++
++    return shard_map(
++        _local_varlen, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
++    )(query, key, value, decoder_segment_ids)
++
+   def cudnn_jax_flash_attention(
+       self,
+       query: Array,
+diff --git a/src/maxtext/layers/attentions.py b/src/maxtext/layers/attentions.py
+index b78eb24355a4366150639e94851dd47fcaa326b5..4407e0b8c732c5a6296cd0c0ceec2900273ae15f 100644
+--- a/src/maxtext/layers/attentions.py
++++ b/src/maxtext/layers/attentions.py
+@@ -61,7 +61,13 @@ from maxtext.layers.embeddings import (
+     PartialRotaryEmbedding,
+     Gemma4PartialRotaryEmbedding,
+ )
+-from maxtext.layers.initializers import nd_dense_init, NdInitializer, variable_to_logically_partitioned, default_bias_init
++from maxtext.layers.initializers import (
++    nd_dense_init,
++    NdInitializer,
++    variable_to_logically_partitioned,
++    default_bias_init,
++    megatron_normal_nd_init,
++)
+ from maxtext.layers.linears import DenseGeneral, canonicalize_tuple, normalize_axes
+ from maxtext.layers.normalizations import RMSNorm, Qwen3NextRMSNorm, GlobalRMSNorm
+ from maxtext.layers.quantizations import AqtQuantization as Quant
+@@ -383,6 +389,11 @@ class Attention(nnx.Module):
+     self.max_prefill_predict_length = max_prefill_predict_length
+     self.dropout_rate = dropout_rate
+     self.kernel_init = kernel_init
++    # Megatron-style fixed-std init (default off). q/k/v use normal(0, std); the residual
++    # output projection (init_out_w) uses std/sqrt(2*num_decoder_layers). See initializers.py.
++    _mt_std = getattr(config, "megatron_init_std", 0.0)
++    if _mt_std and _mt_std > 0:
++      self.kernel_init = megatron_normal_nd_init(_mt_std)
+     self.float32_qk_product = float32_qk_product
+     self.float32_logits = float32_logits
+     self.quant = quant
+@@ -713,11 +724,16 @@ class Attention(nnx.Module):
+       out_kernel_axis = ("mlp", "embed")
+       axis = (-1,)
+ 
++    out_kernel_init = self.kernel_init
++    _mt_std = getattr(self.config, "megatron_init_std", 0.0)
++    if _mt_std and _mt_std > 0:
++      _scale = (2.0 * self.config.num_decoder_layers) ** 0.5 if getattr(self.config, "megatron_residual_scale", True) else 1.0
++      out_kernel_init = megatron_normal_nd_init(_mt_std / _scale)
+     return DenseGeneral(
+         in_features_shape=in_features,
+         out_features_shape=out_features,
+         axis=axis,
+-        kernel_init=self.kernel_init,
++        kernel_init=out_kernel_init,
+         kernel_axes=out_kernel_axis,  # trade speed with memory
+         dtype=self.dtype,
+         weight_dtype=self.weight_dtype,
+diff --git a/src/maxtext/layers/decoders.py b/src/maxtext/layers/decoders.py
+index 4689ee55005376d5fcf45784809bbaed9a385541..91b14e87fd77203655faf03cb67970e0a05248e7 100644
+--- a/src/maxtext/layers/decoders.py
++++ b/src/maxtext/layers/decoders.py
+@@ -74,6 +74,47 @@ from maxtext.utils import sharding
+ # ------------------------------------------------------------------------------
+ 
+ 
++def _maybe_depth_tail_quant(default_quant, lyr, num_layers):
++  """Depth-tail high-precision lever (NVFP4 2509.25149), default-OFF / reversible.
++
++  For full-scope MXFP4 (AiterFp4Quantization) ONLY, optionally run the last N
++  and/or first M decoder layers fully in bf16 (both MLP and attention
++  projections) by swapping in AiterBf16Quantization for those layers. NVIDIA
++  showed the final layers carry the largest Wgrad/Dgrad FP4 quant error;
++  keeping a small high-precision tail recovers accuracy at low perf cost.
++
++  Env knobs (read at trace time; unset/0 => identity, full FP4):
++    AITER_FP4_BF16_TAIL_LAYERS  int, last N decoder layers -> bf16
++    AITER_FP4_BF16_HEAD_LAYERS  int, first M decoder layers -> bf16
++    AITER_FP4_BF16_TAIL_SCOPE   'all' (default, this swap) | 'attn'
++                                ('attn' is a no-op here; handled op-side in
++                                 quantizations.AiterFp4DotGeneralOp)
++
++  Only applies to the unscanned decoder loop (scan_layers=False), which the
++  accuracy harness uses; under scan_layers=True the layers share one traced
++  body so per-layer swapping is not expressed and this is a no-op.
++  """
++  import os
++
++  if not isinstance(default_quant, quantizations.AiterFp4Quantization):
++    return default_quant
++  scope = os.environ.get("AITER_FP4_BF16_TAIL_SCOPE", "all").lower()
++  if scope != "all":
++    return default_quant
++  tail = int(os.environ.get("AITER_FP4_BF16_TAIL_LAYERS", "") or 0)
++  head = int(os.environ.get("AITER_FP4_BF16_HEAD_LAYERS", "") or 0)
++  if tail <= 0 and head <= 0:
++    return default_quant
++  in_tail = tail > 0 and lyr >= (num_layers - tail)
++  in_head = head > 0 and lyr < head
++  swap = in_tail or in_head
++  if os.environ.get("AITER_FP4_LOG_DEPTH", "0") == "1":
++    print(f"FP4_DEPTH_SWAP: layer={lyr}/{num_layers} -> {'bf16' if swap else 'fp4'} (tail={tail} head={head})")
++  if swap:
++    return quantizations.AiterBf16Quantization()
++  return default_quant
++
++
+ class DecoderLayer(nn.Module):
+   """
+   Transformer decoder layer that attends to the encoder.
+@@ -322,8 +363,8 @@ class Decoder(nn.Module):
+           config=self.config, layers=build_pipeline_stage_layers, mesh=self.mesh, remat_policy=remat_policy
+       )
+ 
+-  def minimal_policy(self, with_context=False, with_quantization=False):
+-    """Helper for creating minimal checkpoint policies."""
++  def _minimal_names(self, with_context=False, with_quantization=False):
++    """The intermediate names saved by the 'minimal' family of remat policies."""
+     names = [
+         "query_proj",
+         "value_proj",
+@@ -340,7 +381,13 @@ class Decoder(nn.Module):
+       names.append("context")
+     if with_quantization:
+       names.append("quantization")
+-    return jax.checkpoint_policies.save_only_these_names(*names)
++    return names
++
++  def minimal_policy(self, with_context=False, with_quantization=False):
++    """Helper for creating minimal checkpoint policies."""
++    return jax.checkpoint_policies.save_only_these_names(
++        *self._minimal_names(with_context=with_context, with_quantization=with_quantization)
++    )
+ 
+   def get_remat_policy(self):
+     """Get remat policy"""
+@@ -353,6 +400,27 @@ class Decoder(nn.Module):
+           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
+           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
+         policy = self.minimal_policy(with_context=True)
++      elif cfg.remat_policy in (
++          "minimal_flash_save_fp4_wtcol",
++          "minimal_flash_save_fp4col",
++      ):
++        # minimal_flash (== minimal_with_context) PLUS save the jax-aiter MXFP4
++        # columnwise dual-cast residuals so the backward dgrad/wgrad reuse them
++        # instead of re-firing CastMxfp4DualJA (the rematerialized re-casts, see
++        # mxfp4_analysis/parsed/remat_recast_sizing.md). jax-aiter tags those
++        # residuals via checkpoint_name when JA_FP4_REMAT_SAVE_COL is set
++        # ('wt' / 'act' / 'both'); the names must match here. Saving (vs
++        # recompute) is a graph-scheduling change only -> numerics are
++        # byte-identical. '_wtcol' saves only the small weight-col residual
++        # (~6 ms/step floor at 8B, lowest extra memory); the full variant also
++        # saves the larger activation-col residual.
++        fp4_names = ["mxfp4_wt_col"]
++        if cfg.remat_policy == "minimal_flash_save_fp4col":
++          fp4_names.append("mxfp4_act_col")
++        policy = jax.checkpoint_policies.save_only_these_names(
++            *self._minimal_names(with_context=True),
++            *fp4_names,
++        )
+       elif cfg.remat_policy == "minimal":
+         # save all except context
+         policy = self.minimal_policy()
+@@ -1240,8 +1308,9 @@ class Decoder(nn.Module):
+               layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
+             if cfg.decoder_block == DecoderBlockType.OLMO3:
+               layer_kwargs = {"attention_type": olmo3.get_attention_type(layer_id=lyr)}
++            layer_quant = _maybe_depth_tail_quant(self.quant, lyr, cfg.num_decoder_layers)
+             layer = RemattedBlockLayer(
+-                config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=self.model_mode, **layer_kwargs
++                config=cfg, mesh=mesh, name=f"layers_{lyr}", quant=layer_quant, model_mode=self.model_mode, **layer_kwargs
+             )
+             y, returned_cache = layer(
+                 y,
+diff --git a/src/maxtext/layers/embeddings.py b/src/maxtext/layers/embeddings.py
+index b4328a47d5cd0a2f8efa9062f50be4cfb7683fd2..2db483004d49263fcf3e5e5d2258a0cf072c6f91 100644
+--- a/src/maxtext/layers/embeddings.py
++++ b/src/maxtext/layers/embeddings.py
+@@ -127,6 +127,11 @@ class Embed(nnx.Module):
+     self.dtype = dtype
+     self.attend_dtype = attend_dtype
+ 
++    # Megatron-style fixed-std embedding init (default off): normal(0, megatron_init_std).
++    _mt_std = getattr(config, "megatron_init_std", 0.0)
++    if _mt_std and _mt_std > 0:
++      embedding_init = jax.nn.initializers.normal(stddev=_mt_std)
++
+     self.embedding = nnx.Param(
+         embedding_init(
+             rngs.params(),
+diff --git a/src/maxtext/layers/initializers.py b/src/maxtext/layers/initializers.py
+index bbc6605057d4bf38090fb3f6547c0e79d72708bf..3f9eab656a65433d76be1ac99080ef7e7fc5aeaa 100644
+--- a/src/maxtext/layers/initializers.py
++++ b/src/maxtext/layers/initializers.py
+@@ -60,6 +60,22 @@ def nd_dense_init(scale, mode, distribution):
+   return init_fn
+ 
+ 
++def megatron_normal_nd_init(std):
++  """NdInitializer that draws from a fixed normal(0, std), ignoring fan-in/out axes.
++
++  Matches Megatron-LM's `init_method_normal` (fixed std, e.g. 0.02). Used (behind the
++  `megatron_init_std` config flag) to replace MaxText's fan-in variance-scaling init so the
++  high-LR (8e-4) MLPerf recipe trains stably. Residual output projections pass std/sqrt(2*L)
++  to mirror Megatron's `scaled_init_method_normal`.
++  """
++
++  def init_fn(key, shape, dtype, in_axis, out_axis):  # NdInitializer signature
++    del in_axis, out_axis
++    return jax.random.normal(key, shape, dtype) * std
++
++  return init_fn
++
++
+ def variable_to_logically_partitioned(variable: nnx.Variable):
+   """Wraps an NNX variable's value in `nn.LogicallyPartitioned`.
+ 
+diff --git a/src/maxtext/layers/linears.py b/src/maxtext/layers/linears.py
+index efeb085d4a9abaaa240e58c0cbfaeaf0a02cf97d..6ae33292487125adb14965a04b6ee6581f2ed1fb 100644
+--- a/src/maxtext/layers/linears.py
++++ b/src/maxtext/layers/linears.py
+@@ -33,7 +33,13 @@ from maxtext.common.common_types import DecoderBlockType, ShardMode, DType, Arra
+ from maxtext.common.common_types import MODEL_MODE_PREFILL
+ from maxtext.layers import nnx_wrappers, quantizations
+ from maxtext.layers import normalizations
+-from maxtext.layers.initializers import NdInitializer, nd_dense_init, default_bias_init, variable_to_logically_partitioned
++from maxtext.layers.initializers import (
++    NdInitializer,
++    nd_dense_init,
++    default_bias_init,
++    variable_to_logically_partitioned,
++    megatron_normal_nd_init,
++)
+ from maxtext.layers.quantizations import AqtQuantization as Quant
+ from maxtext.utils import max_logging
+ from maxtext.utils import max_utils
+@@ -121,6 +127,7 @@ class DenseGeneral(nnx.Module):
+       shard_mode: ShardMode = ShardMode.AUTO,
+       matmul_precision: str = "default",
+       parameter_memory_host_offload: bool = False,
++      module_context: str = "",
+       *,  # Following arguments are keyword-only
+       rngs: nnx.Rngs = None,
+   ):
+@@ -140,6 +147,7 @@ class DenseGeneral(nnx.Module):
+       shard_mode: auto or explicit shard mode.
+       matmul_precision: Precision for matrix multiplication.
+       parameter_memory_host_offload: Determines whether to offload params to host
++      module_context: context string passed to quantization ops (e.g., "mlp" for MLP layers).
+       rngs: RNG state for initialization in nnx.
+     """
+     self.in_features_shape = canonicalize_tuple(in_features_shape)
+@@ -184,7 +192,12 @@ class DenseGeneral(nnx.Module):
+ 
+     if quant:
+       dot_general_cls = quant.dot_general_cls(mesh_axes=kernel_axes)
+-      dot_general_linen = dot_general_cls()
++      # Pass module_context to quant ops that support it (e.g., FP8 MLP-only).
++      # Falls back to no-arg construction for ops that don't accept it.
++      try:
++        dot_general_linen = dot_general_cls(module_context=module_context)
++      except TypeError:
++        dot_general_linen = dot_general_cls()
+       quant_dot_general = nnx_wrappers.ToNNX(dot_general_linen, rngs=rngs)
+       self._quant_dot_general_name = f"{type(dot_general_linen).__name__}_0"
+       setattr(self, self._quant_dot_general_name, quant_dot_general)
+@@ -386,6 +399,15 @@ class MlpBlock(nnx.Module):
+     self.intermediate_dim = intermediate_dim
+     self.activations = activations
+     self.kernel_init = kernel_init
++    # Megatron-style fixed-std init (default off). wi (gate/up) use normal(0, std); the residual
++    # down projection (wo) uses std/sqrt(2*num_decoder_layers). See initializers.py.
++    _mt_std = getattr(config, "megatron_init_std", 0.0)
++    if _mt_std and _mt_std > 0:
++      self.kernel_init = megatron_normal_nd_init(_mt_std)
++      _scale = (2.0 * config.num_decoder_layers) ** 0.5 if getattr(config, "megatron_residual_scale", True) else 1.0
++      self._wo_kernel_init = megatron_normal_nd_init(_mt_std / _scale)
++    else:
++      self._wo_kernel_init = self.kernel_init
+     self.intermediate_dropout_rate = intermediate_dropout_rate
+     self.dtype = dtype
+     self.weight_dtype = weight_dtype
+@@ -422,11 +444,15 @@ class MlpBlock(nnx.Module):
+           use_bias=self.use_bias,
+           shard_mode=self.config.shard_mode,
+           matmul_precision=self.config.matmul_precision,
++          module_context="mlp_fused",
+           rngs=rngs,
+       )
+     else:
++      # Llama-style gated MLP: wi_0=gate_proj (SiLU), wi_1=up_proj (linear)
++      _mlp_proj_names = ["mlp_gate", "mlp_up", "mlp_wi"]  # gate, up, fallback
+       for idx in range(len(self.activations)):
+         dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
++        proj_context = _mlp_proj_names[idx] if idx < len(_mlp_proj_names) else f"mlp_wi_{idx}"
+         module = DenseGeneral(
+             in_features_shape=in_features,
+             out_features_shape=self.intermediate_dim,
+@@ -438,6 +464,7 @@ class MlpBlock(nnx.Module):
+             use_bias=self.use_bias,
+             shard_mode=self.config.shard_mode,
+             matmul_precision=self.config.matmul_precision,
++            module_context=proj_context,
+             rngs=rngs,
+         )
+         setattr(self, dense_name, module)
+@@ -447,12 +474,13 @@ class MlpBlock(nnx.Module):
+         out_features_shape=in_features,
+         dtype=self.dtype,
+         weight_dtype=self.weight_dtype,
+-        kernel_init=self.kernel_init,
++        kernel_init=self._wo_kernel_init,
+         kernel_axes=("mlp", "embed"),
+         quant=self.quant,
+         use_bias=self.use_bias,
+         shard_mode=self.config.shard_mode,
+         matmul_precision=self.config.matmul_precision,
++        module_context="mlp_down",
+         rngs=rngs,
+     )
+ 
+@@ -503,31 +531,75 @@ class MlpBlock(nnx.Module):
+ 
+     # Iterate over specified MLP input activation functions.
+     # e.g. ('relu',) or ('gelu', 'linear') for gated-gelu.
+-    activations = []
+-    if cfg.fused_mlp:
+-      x = self.wi(inputs, out_sharding=intermediate_sharding)
+-
+-      # Enforce fused activations don't shard on num_activations axis
+-      fused_intermediate_logical = self.intermediate_logical[:2] + (None,) + self.intermediate_logical[2:]
+-      x = self._maybe_shard_with_logical(x, fused_intermediate_logical)
+-
+-      x = checkpoint_name(x, "mlpwi")
+-      for idx, act_fn in enumerate(self.activations):
+-        y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
+-        activations.append(y)
++    # Check if AITER fused silu_and_mul can be used:
++    # - use_jax_aiter and aiter_silu_and_mul must be enabled
++    # - activations must be ("silu", "linear") (gated SiLU MLP, e.g. Llama)
++    # - must not be fused_mlp mode
++    # - must not use activations_in_float32
++    _use_aiter_silu = (
++        not cfg.fused_mlp
++        and getattr(cfg, "use_jax_aiter", False)
++        and getattr(cfg, "aiter_silu_and_mul", False)
++        and list(self.activations) == ["silu", "linear"]
++        and not cfg.activations_in_float32
++    )
++
++    if _use_aiter_silu:
++      # AITER fused path: compute gate and up projections, then fuse silu(gate)*up.
++      from jax_aiter.activation import silu_and_mul as aiter_silu_and_mul
++      gate = self.wi_0(inputs, out_sharding=intermediate_sharding)
++      gate = checkpoint_name(gate, "mlpwi_0")
++      up = self.wi_1(inputs, out_sharding=intermediate_sharding)
++      up = checkpoint_name(up, "mlpwi_1")
++      x = aiter_silu_and_mul(gate, up).astype(self.dtype)
+     else:
+-      for idx, act_fn in enumerate(self.activations):
+-        dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
+-        module = getattr(self, dense_name)
+-        x = module(inputs, out_sharding=intermediate_sharding)
+-        x = checkpoint_name(x, "mlp" + dense_name)
+-        if cfg.activations_in_float32:
+-          x = x.astype(jnp.float32)
+-        x = _convert_to_activation_function(act_fn)(x)
+-        activations.append(x)
+-
+-    # Take elementwise product of above intermediate activations.
+-    x = functools.reduce(operator.mul, activations).astype(self.dtype)
++      activations = []
++      if cfg.fused_mlp:
++        x = self.wi(inputs, out_sharding=intermediate_sharding)
++
++        # Enforce fused activations don't shard on num_activations axis
++        fused_intermediate_logical = self.intermediate_logical[:2] + (None,) + self.intermediate_logical[2:]
++        x = self._maybe_shard_with_logical(x, fused_intermediate_logical)
++
++        x = checkpoint_name(x, "mlpwi")
++        for idx, act_fn in enumerate(self.activations):
++          y = _convert_to_activation_function(act_fn)(x[:, :, idx, ...])
++          activations.append(y)
++      else:
++        for idx, act_fn in enumerate(self.activations):
++          dense_name = "wi" if len(self.activations) == 1 else f"wi_{idx}"
++          module = getattr(self, dense_name)
++          x = module(inputs, out_sharding=intermediate_sharding)
++          x = checkpoint_name(x, "mlp" + dense_name)
++          if cfg.activations_in_float32:
++            x = x.astype(jnp.float32)
++          x = _convert_to_activation_function(act_fn)(x)
++          activations.append(x)
++
++      # Take elementwise product of above intermediate activations.
++      x = functools.reduce(operator.mul, activations).astype(self.dtype)
++    # --- MLP hidden trace (AITER_FP8_TRACE_MLP=1) ---
++    import os as _os
++    if _os.environ.get("AITER_FP8_TRACE_MLP", "0") == "1":
++      _x_f32 = x.astype(jnp.float32)
++      _abs = jnp.abs(_x_f32)
++      jax.debug.print(
++          "MLP_HIDDEN: max_abs={mx:.4f} p99_abs={p99:.4f} nonfinite={nf} shape={sh}",
++          mx=jnp.max(_abs), p99=jnp.percentile(_abs.reshape(-1), 99.0),
++          nf=jnp.sum(~jnp.isfinite(_x_f32)), sh=x.shape,
++      )
++    # --- MLP boundary stabilizer (AITER_FP8_CLIP_MLP) ---
++    # "1" = full clip to BF16 max (±65504)
++    # "2" = inf/nan only — replace non-finite with 0 (lightest)
++    # "3" = tight threshold clamp (±1024)
++    import os
++    _clip_mode = os.environ.get("AITER_FP8_CLIP_MLP", "0")
++    if _clip_mode == "1":
++      x = jnp.clip(x, -65504.0, 65504.0)
++    elif _clip_mode == "2":
++      x = jnp.where(jnp.isfinite(x), x, jnp.zeros_like(x))
++    elif _clip_mode == "3":
++      x = jnp.clip(x, -1024.0, 1024.0)
+     # Apply dropout and final dense output projection.
+     x = self.dropout(x, deterministic=deterministic)  # Broadcast along length.
+     x = self._maybe_shard_with_logical(x, self.intermediate_logical)
+diff --git a/src/maxtext/layers/moe.py b/src/maxtext/layers/moe.py
+index c0e5bebbe36802ab60841646ed87bc15e9c57799..e79e7a960ecd0e92b177d201544065f91fcd2436 100644
+--- a/src/maxtext/layers/moe.py
++++ b/src/maxtext/layers/moe.py
+@@ -2887,6 +2887,16 @@ class RoutedMoE(nnx.Module):
+       output, lb_loss, bias_updates = self.fused_moe_matmul(
+           inputs, gate_logits, wo_kernel, w0_kernel=w0_kernel, w1_kernel=w1_kernel, fused_kernel=fused_kernel
+       )
++    elif cfg.use_jax_aiter and getattr(cfg, "aiter_moe", False):
++      # Forward-only AITER MXFP4 fused-MoE path. Bypasses MaxText's
++      # default ragged_dot/gmm sparse_matmul scheme and routes the expert
++      # GEMMs through jax-aiter's MoeFwdJA FFI handler. See
++      # `docs/perf/moe_bring_up/H1_fix_report_20260519.md` for the
++      # binding's correctness + perf evidence.
++      output = self._aiter_moe_forward(
++          inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel
++      )
++      lb_loss, bias_updates = None, None
+     elif cfg.sparse_matmul:
+       if quantizations.in_serve_mode(self.quant):
+         w0_kernel, w1_kernel, wo_kernel = self.retrieve_quantized_weight(
+@@ -2909,6 +2919,71 @@ class RoutedMoE(nnx.Module):
+       )
+     return output, lb_loss, bias_updates
+ 
++  def _aiter_moe_forward(self, inputs, gate_logits, w0_kernel, w1_kernel, wo_kernel):
++    """AITER MXFP4 fused-MoE forward (use_jax_aiter + aiter_moe).
++
++    Forward only. Layout adapter between MaxText's (separate w0/w1/wo,
++    [E, hidden, inter] gate+up + [E, inter, hidden] down) and AITER's
++    (fused W1 [E, 2*inter, hidden] + W2 [E, hidden, inter]; MXFP4-packed
++    with per-32-element E8M0 scales). Routing weights taken from
++    softmax(gate_logits) top-k -- mirrors MaxText's permute() top-k
++    semantics without going through the permute/unpermute scatter.
++    """
++    from jax_aiter.moe import aiter_moe_fwd, cast_mxfp4_moe_weight
++
++    batch, seq, hidden = inputs.shape
++    num_experts = self.num_experts
++    top_k = self.num_experts_per_tok
++
++    # 1) Top-k routing from gate_logits. MaxText computes pre-bias logits
++    #    and a separate routing function; for the AITER smoke we use a
++    #    plain softmax + top_k which matches the per-token semantics of
++    #    Mixtral's standard router.
++    probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
++    topk_w_raw, topk_ids = jax.lax.top_k(probs, top_k)
++    topk_w = (topk_w_raw / jnp.sum(topk_w_raw, axis=-1, keepdims=True)
++              ).astype(jnp.float32)
++    topk_ids = topk_ids.astype(jnp.int32)
++
++    # Flatten the (batch, seq) axes -- AITER MoE works on [M, hidden].
++    M = batch * seq
++    hs = inputs.reshape(M, hidden).astype(jnp.bfloat16)
++    topk_w = topk_w.reshape(M, top_k)
++    topk_ids = topk_ids.reshape(M, top_k)
++
++    # 2) Weight layout adapter. MaxText: wi_0/wi_1 are [E, hidden, inter]
++    #    (separate gate + up), wo is [E, inter, hidden]. AITER: w1 is
++    #    fused gate+up [E, 2*inter, hidden], w2 is down [E, hidden,
++    #    inter]. Transpose the (hidden, inter) axes and concat g/u on N.
++    w0_t = jnp.transpose(w0_kernel.astype(jnp.bfloat16), (0, 2, 1))
++    w1_t = jnp.transpose(w1_kernel.astype(jnp.bfloat16), (0, 2, 1))
++    w1_fused = jnp.concatenate([w0_t, w1_t], axis=1)             # [E, 2*inter, hidden]
++    w2_aiter = jnp.transpose(wo_kernel.astype(jnp.bfloat16), (0, 2, 1))  # [E, hidden, inter]
++
++    # 3) MXFP4 cast (per-expert; preserves the e8m0_shuffle 32-row
++    #    granularity that the ASM kernel reads at ptr_GUQ + e*eGUQs).
++    w1_packed_p, w1_scale_p = cast_mxfp4_moe_weight(
++        w1_fused, shuffle_fp4=True, shuffle_scales=True, use_hadamard=False)
++    w2_packed_p, w2_scale_p = cast_mxfp4_moe_weight(
++        w2_aiter, shuffle_fp4=True, shuffle_scales=True, use_hadamard=False)
++    two_inter = 2 * self.intermediate_dim
++    sn_g = hidden // 32
++    sn_d = self.intermediate_dim // 32
++    w1_packed = w1_packed_p[:, :two_inter, :]
++    w1_scale  = w1_scale_p[:, :two_inter, :sn_g]
++    w2_packed = w2_packed_p[:, :hidden, :]
++    w2_scale  = w2_scale_p[:, :hidden, :sn_d]
++
++    # 4) FFI call. MoeFwdJA does activation cast + MoE-sort + fused
++    #    GEMM-1 + SiLU*up + GEMM-2 + per-(token,top-k) atomic-add into
++    #    the output buffer.
++    out_flat = aiter_moe_fwd(
++        hs, w1_packed, w2_packed, w1_scale, w2_scale,
++        topk_w, topk_ids,
++        top_k=top_k, num_experts=num_experts, block_m=32,
++    )
++    return out_flat.reshape(batch, seq, hidden).astype(self.dtype)
++
+ 
+ class RoutedAndSharedMoE(nnx.Module):
+   """Implements a block which combines shared and routed experts."""
+diff --git a/src/maxtext/layers/quantizations.py b/src/maxtext/layers/quantizations.py
+index 4dd5989ff45c637cff973d6a8473beb455e2031d..c9f3a291dbaf5105e6ba7be2d55349997adf88d3 100644
+--- a/src/maxtext/layers/quantizations.py
++++ b/src/maxtext/layers/quantizations.py
+@@ -385,6 +385,1048 @@ class NANOOFp8Quantization(Quantization):
+     return nn.NANOOFp8DotGeneralOp
+ 
+ 
++class AiterBf16DotGeneralOp(nn.Module):
++  """Drop-in dot_general replacement using AITER ASM BF16 GEMM.
++
++  Uses AITER hand-tuned ASM kernels via FFI for all GEMM operations.
++  Supports multi-GPU via custom_partitioning (sharding_rule="m k, n k -> m n").
++  """
++
++  @nn.compact
++  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
++    from jax_aiter.gemm import gemm as aiter_gemm
++
++    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
++    lhs_contract = tuple(lhs_contract)
++    rhs_contract = tuple(rhs_contract)
++
++    inp_shape = inputs.shape
++    ker_shape = kernel.shape
++    inp_ndim = len(inp_shape)
++    ker_ndim = len(ker_shape)
++
++    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
++    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
++
++    K = 1
++    for ax in lhs_contract:
++      K *= inp_shape[ax]
++    M = 1
++    for ax in m_axes:
++      M *= inp_shape[ax]
++    N = 1
++    for ax in n_axes:
++      N *= ker_shape[ax]
++
++    perm_lhs = m_axes + list(lhs_contract)
++    is_identity_lhs = perm_lhs == list(range(inp_ndim))
++    if is_identity_lhs:
++      a_2d = jnp.reshape(inputs, (M, K))
++    else:
++      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
++
++    perm_rhs = n_axes + list(rhs_contract)
++    is_identity_rhs = perm_rhs == list(range(ker_ndim))
++    if is_identity_rhs:
++      b_nk = jnp.reshape(kernel, (N, K))
++    else:
++      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
++
++    a_2d = a_2d.astype(jnp.bfloat16)
++    b_nk = b_nk.astype(jnp.bfloat16)
++
++    out_2d = aiter_gemm(a_2d, b_nk)
++
++    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
++    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
++    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
++
++
++@dataclass
++class AiterBf16Quantization(Quantization):
++  """AITER ASM BF16 GEMM for AMD MI350 (gfx950).
++
++  Uses hand-tuned assembly kernels via FFI.
++  Set quantization='aiter_bf16' to enable.
++  """
++
++  quant_mode = "train"
++
++  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
++    return AiterBf16DotGeneralOp
++
++
++AITER_FP8_AMAX_HISTORY_LEN = 1024
++
++
++def _aiter_fp8_compute_scale(amax_history, prev_scale, fp8_max=448.0):
++  """Compute FP8 scale from amax history (delayed scaling).
++
++  Returns amax / fp8_max (a DIVISOR scale: x_quantized = x / scale).
++  When history has no valid entries (all zeros, e.g. first step), falls back
++  to prev_scale (initialized to 1.0) so the full FP8 range is usable.
++  """
++  amax = jnp.max(amax_history)
++  safe_fallback = prev_scale
++  new_scale = jnp.where(amax > 0, amax / fp8_max, safe_fallback)
++  new_scale = jnp.where(jnp.isfinite(amax), new_scale, safe_fallback)
++  return new_scale
++
++
++def _aiter_fp8_update_history(x, amax_history):
++  """Update rolling amax history with current tensor's max."""
++  amax_update = jnp.max(jnp.abs(x)).astype(amax_history.dtype)
++  return jnp.roll(amax_history, shift=-1).at[-1].set(amax_update)
++
++
++class AiterFp8DotGeneralOp(nn.Module):
++  """Drop-in dot_general replacement using AITER FP8 block-scale GEMM for MI350.
++
++  Uses per-call scaling (scale computed from current tensor amax each call).
++  Quantization + weight shuffle happen inside custom_partitioning so they
++  operate on local shard shapes under FSDP. Automatic BF16 fallback when
++  kernel constraints (N%256, K%128, M>=16, K>=512) are not met on the local
++  shard. Backward uses BF16 GEMM (STE pattern via lax.dot_general).
++  """
++
++  @nn.compact
++  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
++    from jax_aiter.gemm_fp8 import gemm_fp8_mi350 as aiter_fp8_gemm
++    from jax_aiter.gemm_fp8 import fp8_supported_for_shape
++    from jax_aiter.gemm import gemm as aiter_gemm
++
++    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
++    lhs_contract = tuple(lhs_contract)
++    rhs_contract = tuple(rhs_contract)
++
++    inp_shape = inputs.shape
++    ker_shape = kernel.shape
++    inp_ndim = len(inp_shape)
++    ker_ndim = len(ker_shape)
++
++    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
++    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
++
++    K = 1
++    for ax in lhs_contract:
++      K *= inp_shape[ax]
++    M = 1
++    for ax in m_axes:
++      M *= inp_shape[ax]
++    N = 1
++    for ax in n_axes:
++      N *= ker_shape[ax]
++
++    perm_lhs = m_axes + list(lhs_contract)
++    is_identity_lhs = perm_lhs == list(range(inp_ndim))
++    if is_identity_lhs:
++      a_2d = jnp.reshape(inputs, (M, K))
++    else:
++      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
++
++    perm_rhs = n_axes + list(rhs_contract)
++    is_identity_rhs = perm_rhs == list(range(ker_ndim))
++    if is_identity_rhs:
++      b_nk = jnp.reshape(kernel, (N, K))
++    else:
++      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
++
++    a_bf16 = a_2d.astype(jnp.bfloat16)
++    b_bf16 = b_nk.astype(jnp.bfloat16)
++
++    # Pre-dispatch: check shape support BEFORE entering FP8 custom_partitioning.
++    # Never mix lax.dot_general fallback inside FP8 custom_partitioning (breaks FSDP).
++    if fp8_supported_for_shape(M, N, K):
++      out_2d = aiter_fp8_gemm(a_bf16, b_bf16)
++    else:
++      out_2d = aiter_gemm(a_bf16, b_bf16)
++
++    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
++    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
++    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
++
++
++# ---------------------------------------------------------------------------
++# Delayed scaling GEMM with custom_vjp following Flax fp8_ops.in_qdq pattern.
++# The backward returns updated scale/history as "gradients" so the optimizer
++# overwrites the _overwrite_with_gradient variables with the new values.
++# ---------------------------------------------------------------------------
++
++def _aiter_delayed_compute_scale(amax_history, prev_scale, fp8_max=448.0):
++  """Compute FP8 scale from amax history (Flax convention: divisor scale).
++
++  scale = max(amax_history) / fp8_max
++  When history is all zeros, falls back to prev_scale.
++  """
++  amax = jnp.max(amax_history)
++  sf = jnp.where(amax > 0.0, amax / fp8_max, prev_scale)
++  sf = jnp.where(jnp.isfinite(amax), sf, prev_scale)
++  return sf
++
++
++def _aiter_delayed_update_history(x, amax_history):
++  """Update amax history: roll left, insert current amax at end."""
++  amax_update = jnp.max(jnp.abs(x)).astype(amax_history.dtype)
++  return jnp.roll(amax_history, shift=-1, axis=0).at[-1].set(amax_update)
++
++
++@functools.partial(jax.custom_vjp, nondiff_argnums=())
++def _aiter_fp8_gemm_delayed(
++    a_bf16, b_bf16,
++    input_scale, kernel_scale,
++    input_history, kernel_history
++):
++  """FP8 GEMM with delayed scaling — forward uses scale from amax history.
++
++  This function participates in jax.grad. The backward returns updated
++  scale/history as "gradients" for _overwrite_with_gradient variables.
++  """
++  from jax_aiter.gemm_fp8.gemm_fp8_mi350 import _gemm_fp8_delayed_partitioned
++
++  # Compute new scale from history (delayed: based on PREVIOUS steps' amax)
++  new_input_scale = _aiter_delayed_compute_scale(input_history, input_scale)
++  new_kernel_scale = _aiter_delayed_compute_scale(kernel_history, kernel_scale)
++
++  # Run FP8 GEMM with delayed scales
++  out = _gemm_fp8_delayed_partitioned(
++      a_bf16, b_bf16,
++      new_input_scale.reshape(1), new_kernel_scale.reshape(1))
++  return out
++
++
++def _aiter_fp8_gemm_delayed_fwd(
++    a_bf16, b_bf16,
++    input_scale, kernel_scale,
++    input_history, kernel_history
++):
++  from jax_aiter.gemm_fp8.gemm_fp8_mi350 import _gemm_fp8_delayed_partitioned
++
++  # Compute new scale from history
++  new_input_scale = _aiter_delayed_compute_scale(input_history, input_scale)
++  new_kernel_scale = _aiter_delayed_compute_scale(kernel_history, kernel_scale)
++
++  # Run FP8 GEMM
++  out = _gemm_fp8_delayed_partitioned(
++      a_bf16, b_bf16,
++      new_input_scale.reshape(1), new_kernel_scale.reshape(1))
++
++  # Update histories with current tensor amax (for next step)
++  new_input_history = _aiter_delayed_update_history(a_bf16, input_history)
++  new_kernel_history = _aiter_delayed_update_history(b_bf16, kernel_history)
++
++  # Recompute scales from updated history (these are what the optimizer stores)
++  final_input_scale = _aiter_delayed_compute_scale(new_input_history, new_input_scale)
++  final_kernel_scale = _aiter_delayed_compute_scale(new_kernel_history, new_kernel_scale)
++
++  # Save residuals for backward
++  return out, (a_bf16, b_bf16,
++               final_input_scale, final_kernel_scale,
++               new_input_history, new_kernel_history)
++
++
++def _aiter_fp8_gemm_delayed_bwd(res, g):
++  (a_bf16, b_bf16,
++   new_input_scale, new_kernel_scale,
++   new_input_history, new_kernel_history) = res
++
++  g = g.astype(jnp.bfloat16)
++
++  # BF16 backward for activations and weights (same as per-call version)
++  da = jax.lax.dot_general(g, b_bf16, (((1,), (0,)), ((), ())))
++  db = jax.lax.dot_general(g, a_bf16, (((0,), (0,)), ((), ()))).astype(jnp.bfloat16)
++
++  # Return updated scale/history as "gradients" — the optimizer overwrites
++  # _overwrite_with_gradient variables with these values
++  return (da, db,
++          new_input_scale, new_kernel_scale,
++          new_input_history, new_kernel_history)
++
++
++_aiter_fp8_gemm_delayed.defvjp(_aiter_fp8_gemm_delayed_fwd, _aiter_fp8_gemm_delayed_bwd)
++
++
++class AiterFp8DelayedDotGeneralOp(nn.Module):
++  """Drop-in dot_general replacement using AITER FP8 GEMM with delayed scaling.
++
++  Uses TE-style delayed scaling following the Flax fp8_ops.in_qdq pattern:
++  the FP8 scale is computed from a rolling amax_history, and the backward
++  pass returns updated scale/history as "gradients" so the optimizer's
++  _overwrite_with_gradient mechanism carries them across training steps.
++
++  This provides:
++    1. Smooth scale transitions between steps (scale from history, not current tensor)
++    2. Consistent forward/backward behavior
++    3. Proper state persistence via the gradient mechanism (no mutable collections needed)
++
++  Backward uses BF16 GEMM (STE pattern via lax.dot_general).
++  """
++  amax_history_length: int = AITER_FP8_AMAX_HISTORY_LEN
++
++  @nn.compact
++  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
++    OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
++
++    scale_args = (
++        flax_initializers.ones_init(), jax.random.PRNGKey(0),
++        (1,), jnp.float32,
++    )
++    amax_history_args = (
++        flax_initializers.zeros_init(), jax.random.PRNGKey(0),
++        (self.amax_history_length,), jnp.float32,
++    )
++
++    # Delayed scaling state — persisted via _overwrite_with_gradient
++    input_scale = self.variable(OVERWRITE_WITH_GRADIENT, "input_scale", *scale_args)
++    kernel_scale = self.variable(OVERWRITE_WITH_GRADIENT, "kernel_scale", *scale_args)
++    input_history = self.variable(OVERWRITE_WITH_GRADIENT, "input_amax_history", *amax_history_args)
++    kernel_history = self.variable(OVERWRITE_WITH_GRADIENT, "kernel_amax_history", *amax_history_args)
++
++    # --- Reshape inputs to 2D for GEMM ---
++    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
++    lhs_contract = tuple(lhs_contract)
++    rhs_contract = tuple(rhs_contract)
++
++    inp_shape = inputs.shape
++    ker_shape = kernel.shape
++    inp_ndim = len(inp_shape)
++    ker_ndim = len(ker_shape)
++
++    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
++    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
++
++    K = 1
++    for ax in lhs_contract:
++      K *= inp_shape[ax]
++    M = 1
++    for ax in m_axes:
++      M *= inp_shape[ax]
++    N = 1
++    for ax in n_axes:
++      N *= ker_shape[ax]
++
++    perm_lhs = m_axes + list(lhs_contract)
++    is_identity_lhs = perm_lhs == list(range(inp_ndim))
++    if is_identity_lhs:
++      a_2d = jnp.reshape(inputs, (M, K))
++    else:
++      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
++
++    perm_rhs = n_axes + list(rhs_contract)
++    is_identity_rhs = perm_rhs == list(range(ker_ndim))
++    if is_identity_rhs:
++      b_nk = jnp.reshape(kernel, (N, K))
++    else:
++      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
++
++    a_bf16 = a_2d.astype(jnp.bfloat16)
++    b_bf16 = b_nk.astype(jnp.bfloat16)
++
++    # --- Forward with delayed scaling ---
++    # Scale/history variables participate in jax.grad via custom_vjp.
++    # The backward returns updated values as "gradients" for _overwrite_with_gradient.
++    from jax_aiter.gemm_fp8 import fp8_supported_for_shape
++    if fp8_supported_for_shape(M, N, K):
++      out_2d = _aiter_fp8_gemm_delayed(
++          a_bf16, b_bf16,
++          input_scale.value, kernel_scale.value,
++          input_history.value, kernel_history.value)
++    else:
++      from jax_aiter.gemm import gemm as aiter_gemm
++      out_2d = aiter_gemm(a_bf16, b_bf16)
++
++    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
++    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
++    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
++
++
++@dataclass
++class AiterFp8Quantization(Quantization):
++  """AITER FP8 block-scale GEMM for AMD MI350 (gfx950) with per-call scaling.
++
++  Forward in FP8 (2x compute throughput), backward in BF16 (accuracy).
++  Set quantization='aiter_fp8' to enable.
++  """
++
++  quant_mode = "train"
++
++  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
++    return AiterFp8DotGeneralOp
++
++
++@dataclass
++class AiterFp8DelayedQuantization(Quantization):
++  """AITER FP8 GEMM with TE-style delayed scaling for AMD MI350 (gfx950).
++
++  Uses rolling amax history to compute smooth FP8 scales across training steps.
++  This prevents NaN from quantization error accumulation through deep
++  transformer stacks (32+ layers) at large batch sizes.
++
++  Forward in FP8 with delayed scales, backward in BF16 (accuracy).
++  Set quantization='aiter_fp8_delayed' to enable.
++  """
++
++  quant_mode = "train"
++
++  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
++    return AiterFp8DelayedDotGeneralOp
++
++
++class AiterNanooFp8DotGeneralOp(nn.Module):
++  """Drop-in dot_general using AITER FP8 GEMM with module_context gating.
++
++  Follows the BF16-style architecture:
++    Forward + dA: AITER FP8 FFI (auto-dispatches ASM vs CK by shape)
++    dB: lax.dot_general -> hipBLASLt (native XLA, zero overhead)
++
++  Scope control via AITER_NANOO_FP8_SCOPE env var:
++    "all"      — FP8 for all projections (may NaN from error accumulation)
++    "mlp"      — FP8 for MLP only (gate, up, down), BF16 for attention
++    "mlp_down" — FP8 for down_proj only (most conservative, proven stable)
++    Default: "mlp" (balances throughput and stability)
++
++  Non-MLP projections always use BF16 AITER ASM GEMM.
++  """
++  module_context: str = ""
++
++  @nn.compact
++  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
++    import os
++    from jax_aiter.gemm_fp8 import gemm_fp8
++    from jax_aiter.gemm import gemm as bf16_gemm
++
++    scope = os.environ.get("AITER_NANOO_FP8_SCOPE", "mlp").lower()
++
++    if scope == "all":
++      use_fp8 = True
++    elif scope == "mlp":
++      use_fp8 = "mlp" in self.module_context
++    elif scope == "mlp_down":
++      use_fp8 = self.module_context == "mlp_down"
++    else:
++      allowed = set(p.strip() for p in scope.split(","))
++      use_fp8 = self.module_context in allowed
++
++    depth_limit = os.environ.get("AITER_NANOO_FP8_DEPTH", "")
++    if use_fp8 and depth_limit:
++      import re
++      max_layer = int(depth_limit)
++      scope_path = "/".join(self.scope.path)
++      layer_match = re.search(r'layers_(\d+)', scope_path)
++      if layer_match:
++        layer_idx = int(layer_match.group(1))
++        if layer_idx >= max_layer:
++          use_fp8 = False
++
++    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
++    lhs_contract = tuple(lhs_contract)
++    rhs_contract = tuple(rhs_contract)
++
++    inp_shape = inputs.shape
++    ker_shape = kernel.shape
++    inp_ndim = len(inp_shape)
++    ker_ndim = len(ker_shape)
++
++    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
++    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
++
++    K = 1
++    for ax in lhs_contract:
++      K *= inp_shape[ax]
++    M = 1
++    for ax in m_axes:
++      M *= inp_shape[ax]
++    N = 1
++    for ax in n_axes:
++      N *= ker_shape[ax]
++
++    perm_lhs = m_axes + list(lhs_contract)
++    is_identity_lhs = perm_lhs == list(range(inp_ndim))
++    if is_identity_lhs:
++      a_2d = jnp.reshape(inputs, (M, K))
++    else:
++      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
++
++    perm_rhs = n_axes + list(rhs_contract)
++    is_identity_rhs = perm_rhs == list(range(ker_ndim))
++    if is_identity_rhs:
++      b_nk = jnp.reshape(kernel, (N, K))
++    else:
++      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
++
++    a_bf16 = a_2d.astype(jnp.bfloat16)
++    b_bf16 = b_nk.astype(jnp.bfloat16)
++
++    if use_fp8:
++      out_2d = gemm_fp8(a_bf16, b_bf16)
++      out_clip = float(os.environ.get("AITER_FP8_OUT_CLIP", "0"))
++      if out_clip > 0:
++        out_2d = jnp.clip(out_2d, -out_clip, out_clip)
++      clip_scope = os.environ.get("AITER_FP8_OUT_CLIP_SCOPE", "")
++      if clip_scope:
++        clip_val = float(clip_scope.split(":")[1]) if ":" in clip_scope else 64.0
++        clip_projs = set(p.strip() for p in clip_scope.split(":")[0].split(",")) if ":" in clip_scope else {"all"}
++        if "all" in clip_projs or self.module_context in clip_projs:
++          out_2d = jnp.clip(out_2d, -clip_val, clip_val)
++    else:
++      out_2d = bf16_gemm(a_bf16, b_bf16)
++
++    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
++    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
++    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
++
++
++@dataclass
++class AiterNanooFp8Quantization(Quantization):
++  """Unified AITER FP8 GEMM with hipBLASLt FP8 backward (nanoo-style).
++
++  Forward: AITER FP8 FFI (ASM block-scale or CK per-token, auto-dispatched)
++  Backward dA: AITER FP8 FFI (same dispatch)
++  Backward dB: native dot_general -> hipBLASLt FP8
++
++  Set quantization='aiter_nanoo_fp8' to enable.
++  """
++
++  quant_mode = "train"
++
++  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
++    return AiterNanooFp8DotGeneralOp
++
++
++# ---------------------------------------------------------------------------
++# FP8 Quantize-Dequantize (QDQ) — noise injection with AITER BF16 GEMM compute.
++#
++# Forward: quantize inputs to FP8 e4m3 → dequantize back to BF16 (noise injection)
++#          → compute GEMM using AITER BF16 ASM kernel (not FP8 kernel).
++# Backward: STE through QDQ; AITER GEMM handles its own custom_vjp backward.
++# Scale/history tracked via _overwrite_with_gradient variables (Flax convention).
++# ---------------------------------------------------------------------------
++
++AITER_QDQ_AMAX_HISTORY_LEN = 1024
++
++
++class AiterFp8QdqDotGeneralOp(nn.Module):
++  """Drop-in dot_general replacement using FP8 QDQ noise + AITER BF16 GEMM.
++
++  Quantize-Dequantize (QDQ) injects FP8 quantization noise into BF16 tensors
++  before computing the GEMM with AITER's fast BF16 ASM kernel. This gives:
++    1. FP8-aware training (model learns robustness to FP8 quantization)
++    2. AITER BF16 GEMM performance (~846 TFLOP/s, beats TE by ~0.6%)
++    3. No NaN — BF16 compute precision prevents error accumulation
++
++  Scale/history are tracked via _overwrite_with_gradient variables following
++  the Flax fp8_ops.in_qdq pattern. The backward pass returns updated
++  scale/history as "gradients" so the optimizer carries them across steps.
++  """
++  amax_history_length: int = AITER_QDQ_AMAX_HISTORY_LEN
++
++  @nn.compact
++  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
++    from jax_aiter.gemm import gemm as aiter_gemm
++
++    OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
++
++    scale_args = (
++        flax_initializers.ones_init(), jax.random.PRNGKey(0),
++        (1,), jnp.float32,
++    )
++    amax_history_args = (
++        flax_initializers.zeros_init(), jax.random.PRNGKey(0),
++        (self.amax_history_length,), jnp.float32,
++    )
++
++    # Delayed scaling state — persisted via _overwrite_with_gradient
++    input_scale = self.variable(OVERWRITE_WITH_GRADIENT, "input_scale", *scale_args)
++    kernel_scale = self.variable(OVERWRITE_WITH_GRADIENT, "kernel_scale", *scale_args)
++    input_history = self.variable(OVERWRITE_WITH_GRADIENT, "input_amax_history", *amax_history_args)
++    kernel_history = self.variable(OVERWRITE_WITH_GRADIENT, "kernel_amax_history", *amax_history_args)
++
++    # --- Reshape inputs to 2D for GEMM (same as AiterBf16DotGeneralOp) ---
++    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
++    lhs_contract = tuple(lhs_contract)
++    rhs_contract = tuple(rhs_contract)
++
++    inp_shape = inputs.shape
++    ker_shape = kernel.shape
++    inp_ndim = len(inp_shape)
++    ker_ndim = len(ker_shape)
++
++    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
++    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
++
++    K = 1
++    for ax in lhs_contract:
++      K *= inp_shape[ax]
++    M = 1
++    for ax in m_axes:
++      M *= inp_shape[ax]
++    N = 1
++    for ax in n_axes:
++      N *= ker_shape[ax]
++
++    perm_lhs = m_axes + list(lhs_contract)
++    is_identity_lhs = perm_lhs == list(range(inp_ndim))
++    if is_identity_lhs:
++      a_2d = jnp.reshape(inputs, (M, K))
++    else:
++      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
++
++    perm_rhs = n_axes + list(rhs_contract)
++    is_identity_rhs = perm_rhs == list(range(ker_ndim))
++    if is_identity_rhs:
++      b_nk = jnp.reshape(kernel, (N, K))
++    else:
++      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
++
++    a_bf16 = a_2d.astype(jnp.bfloat16)
++    b_bf16 = b_nk.astype(jnp.bfloat16)
++
++    # --- Apply QDQ noise injection using Flax's in_qdq ---
++    # in_qdq: quantize to FP8 e4m3 → dequantize back to BF16 (noise injection)
++    # The custom_vjp in in_qdq handles:
++    #   - Forward: updates scale from history, does QDQ round-trip
++    #   - Backward: STE (passes gradient through), returns updated scale/history
++    compute_dtype = jnp.bfloat16
++    e4m3_dtype = jnp.float8_e4m3fn
++
++    a_qdq = fp8_ops.in_qdq(
++        compute_dtype, e4m3_dtype,
++        a_bf16, input_scale.value, input_history.value)
++    b_qdq = fp8_ops.in_qdq(
++        compute_dtype, e4m3_dtype,
++        b_bf16, kernel_scale.value, kernel_history.value)
++
++    # --- Compute GEMM using AITER BF16 ASM kernel ---
++    # aiter_gemm expects (M, K) @ (N, K)^T → (M, N) and has its own custom_vjp
++    out_2d = aiter_gemm(a_qdq, b_qdq)
++
++    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
++    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
++    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
++
++
++class AiterFp8MlpOnlyDotGeneralOp(nn.Module):
++  """Drop-in dot_general using FP8 GEMM for MLP layers, BF16 GEMM for attention.
++
++  Uses the `module_context` attribute (set by DenseGeneral from the parent
++  module context) to decide which kernel to use:
++    - module_context contains "mlp" → FP8 GEMM (gate_proj, up_proj, down_proj)
++    - Otherwise → BF16 ASM GEMM (q_proj, k_proj, v_proj, o_proj, logits)
++
++  This reduces FP8 error accumulation through the residual chain by roughly
++  half (3 FP8 GEMMs per layer instead of 7), while still getting FP8 speedup
++  on the largest GEMMs (MLP layers account for ~57% of FLOP).
++
++  Forward: FP8 or BF16 depending on layer type.
++  Backward: Always BF16 via the underlying kernel's custom_vjp.
++  """
++  module_context: str = ""
++
++  @nn.compact
++  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
++    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
++    lhs_contract = tuple(lhs_contract)
++    rhs_contract = tuple(rhs_contract)
++
++    inp_shape = inputs.shape
++    ker_shape = kernel.shape
++    inp_ndim = len(inp_shape)
++    ker_ndim = len(ker_shape)
++
++    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
++    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
++
++    K = 1
++    for ax in lhs_contract:
++      K *= inp_shape[ax]
++    M = 1
++    for ax in m_axes:
++      M *= inp_shape[ax]
++    N = 1
++    for ax in n_axes:
++      N *= ker_shape[ax]
++
++    perm_lhs = m_axes + list(lhs_contract)
++    is_identity_lhs = perm_lhs == list(range(inp_ndim))
++    if is_identity_lhs:
++      a_2d = jnp.reshape(inputs, (M, K))
++    else:
++      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
++
++    perm_rhs = n_axes + list(rhs_contract)
++    is_identity_rhs = perm_rhs == list(range(ker_ndim))
++    if is_identity_rhs:
++      b_nk = jnp.reshape(kernel, (N, K))
++    else:
++      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
++
++    a_bf16 = a_2d.astype(jnp.bfloat16)
++    b_bf16 = b_nk.astype(jnp.bfloat16)
++
++    # Decide FP8 vs BF16 based on module_context (set by DenseGeneral from parent).
++    # module_context is one of: "mlp_gate", "mlp_up", "mlp_down", "mlp_fused", or ""
++    #
++    # AITER_FP8_MLP_PROJECTIONS env var controls which projections get FP8.
++    # Default (unset or "all"): all MLP projections.
++    # Example: "mlp_gate" = only gate_proj, "mlp_gate,mlp_up" = gate + up.
++    import os
++    fp8_projs = os.environ.get("AITER_FP8_MLP_PROJECTIONS", "all")
++    if fp8_projs == "all":
++      use_fp8 = "mlp" in self.module_context
++    elif fp8_projs.startswith("all_except_"):
++      # FP8 for ALL projections (MLP + attention) EXCEPT the listed ones.
++      # Example: "all_except_mlp_down" = FP8 for gate, up, q, k, v, o; BF16 for down.
++      excluded = set(p.strip() for p in fp8_projs[len("all_except_"):].split(","))
++      use_fp8 = self.module_context not in excluded
++    else:
++      allowed = set(p.strip() for p in fp8_projs.split(","))
++      use_fp8 = self.module_context in allowed
++
++    if use_fp8:
++      from jax_aiter.gemm_fp8 import gemm_fp8_mi350 as aiter_fp8_gemm
++      from jax_aiter.gemm_fp8 import fp8_supported_for_shape
++      from jax_aiter.gemm import gemm as aiter_gemm
++      # Clip activations BEFORE entering FP8 custom_vjp boundary.
++      # This ensures JAX autograd applies the clip gradient mask
++      # (zero gradient where |x| >= threshold), preventing weight
++      # explosion from extreme activation outliers at the gated MLP
++      # boundary (silu(gate)*up) and other FP8 GEMM inputs.
++      _act_clip = float(os.environ.get("AITER_FP8_ACT_CLIP", "0"))
++      # AITER_FP8_ACT_CLIP_PROJS controls which projections get the clip.
++      # Default "all" = all MLP projections. E.g. "mlp_down" or "mlp_down,mlp_gate".
++      _clip_projs = os.environ.get("AITER_FP8_ACT_CLIP_PROJS", "all")
++      if _act_clip > 0:
++        _should_clip = (_clip_projs == "all" and "mlp" in self.module_context) or \
++                       (self.module_context in set(p.strip() for p in _clip_projs.split(",")))
++        if _should_clip:
++          clip_val = jnp.asarray(_act_clip, dtype=a_bf16.dtype)
++          a_bf16 = jax.lax.clamp(-clip_val, a_bf16, clip_val)
++
++      # --- Per-projection internal FWD_CLIP override ---
++      # AITER_FP8_FWD_CLIP_DOWN: If set, overrides AITER_FP8_FWD_CLIP for
++      # mlp_down only. This clips silu(gate)*up INSIDE the custom_vjp
++      # boundary (invisible to outer autograd), enabling raw da (no a_bf16
++      # dependency) while still protecting the FP8 quantization from outliers.
++      # The override is set at trace time, so each projection bakes in its
++      # own clip value.
++      _fwd_clip_down = os.environ.get("AITER_FP8_FWD_CLIP_DOWN", "")
++      _saved_fwd_clip = None
++      if _fwd_clip_down and self.module_context == "mlp_down":
++        _saved_fwd_clip = os.environ.get("AITER_FP8_FWD_CLIP", None)
++        os.environ["AITER_FP8_FWD_CLIP"] = _fwd_clip_down
++
++      # Pre-dispatch: check shape support BEFORE entering FP8 custom_partitioning.
++      fp8_ok = fp8_supported_for_shape(M, N, K)
++      if os.environ.get("AITER_FP8_LOG_DISPATCH", "0") == "1":
++        print(f"FP8_DISPATCH: context={self.module_context} fp8={fp8_ok} M={M} N={N} K={K}"
++              f" fwd_clip={os.environ.get('AITER_FP8_FWD_CLIP', 'unset')}")
++      if fp8_ok:
++        out_2d = aiter_fp8_gemm(a_bf16, b_bf16)
++      else:
++        out_2d = aiter_gemm(a_bf16, b_bf16)
++
++      # Restore original FWD_CLIP after trace
++      if _saved_fwd_clip is not None:
++        os.environ["AITER_FP8_FWD_CLIP"] = _saved_fwd_clip
++      elif _fwd_clip_down and self.module_context == "mlp_down":
++        if "AITER_FP8_FWD_CLIP" in os.environ and _saved_fwd_clip is None:
++          del os.environ["AITER_FP8_FWD_CLIP"]
++    else:
++      from jax_aiter.gemm import gemm as aiter_gemm
++      if os.environ.get("AITER_FP8_LOG_DISPATCH", "0") == "1":
++        print(f"FP8_DISPATCH: context={self.module_context} fp8=False(not_mlp) M={M} N={N} K={K}")
++      out_2d = aiter_gemm(a_bf16, b_bf16)
++
++    # --- NaN guard (AITER_FP8_NAN_GUARD) ---
++    # "1" = Replace NaN with 0 in FP8 output
++    # "2" = Force FP8 output to all zeros (graph structure test)
++    nan_guard = os.environ.get("AITER_FP8_NAN_GUARD", "0")
++    if nan_guard == "1" and use_fp8:
++      out_2d = jnp.where(out_2d == out_2d, out_2d, jnp.zeros_like(out_2d))
++    elif nan_guard == "2" and use_fp8:
++      out_2d = jnp.zeros_like(out_2d)
++
++    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
++    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
++    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
++
++
++@dataclass
++class AiterFp8MlpOnlyQuantization(Quantization):
++  """AITER FP8 for MLP layers only, BF16 for attention (AMD MI350 gfx950).
++
++  Uses FP8 GEMM for MLP projections (gate, up, down — ~57% of FLOPs) and
++  AITER BF16 ASM GEMM for attention projections (q, k, v, o — ~28% of FLOPs).
++  This halves the number of consecutive FP8 GEMMs in the residual chain
++  (3 per layer instead of 7), preventing NaN from quantization error
++  accumulation through 32 transformer layers at large batch sizes.
++
++  Expected throughput: between FP8-all (~866 TFLOP/s) and BF16-all (~846),
++  targeting above TE baseline (841 TFLOP/s).
++
++  Set quantization='aiter_fp8_mlp_only' to enable.
++  """
++
++  quant_mode = "train"
++
++  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
++    return AiterFp8MlpOnlyDotGeneralOp
++
++
++@dataclass
++class AiterFp8QdqQuantization(Quantization):
++  """AITER FP8 QDQ (Quantize-Dequantize) for AMD MI350 (gfx950).
++
++  Injects FP8 quantization noise into BF16 tensors before computing with
++  AITER's fast BF16 ASM GEMM kernel. This provides:
++    1. FP8-aware training (model learns robustness to quantization)
++    2. Higher throughput than TE baseline via AITER BF16 GEMM
++    3. Convergence at all batch sizes (no NaN from error accumulation)
++
++  Set quantization='aiter_fp8_qdq' to enable.
++  """
++
++  quant_mode = "train"
++
++  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
++    return AiterFp8QdqDotGeneralOp
++
++
++# Dedup set: warn once per (scope, K) when an in-scope FP4 GEMM silently falls
++# back to bf16 because K is not a multiple of 64 (AITER a4w4 alignment need).
++_FP4_KALIGN_FALLBACK_WARNED = set()
++
++
++def _fp4_module_context_layer_idx(module_context):
++  """Parse the optional ``#<idx>`` depth tag appended to module_context.
++
++  Returns the integer decoder-layer index threaded in by the per-layer
++  attention/MLP construction, or None when no tag is present (e.g. scanned
++  layers or models that do not thread it) — callers treat None as "no
++  op-level depth gating".
++  """
++  if not module_context:
++    return None
++  m = re.search(r"#(\d+)$", module_context)
++  return int(m.group(1)) if m else None
++
++
++def _fp4_depth_forces_bf16(module_context, is_mlp):
++  """Return True if depth-tail high-precision should force this projection bf16.
++
++  Op-level "attn-only" path: keeps MLP in FP4 but drops attention projections
++  to bf16 in the kept (tail/head) layers. Requires the layer index threaded
++  via the module_context ``#<idx>`` tag. Default-OFF / reversible. Env knobs:
++    AITER_FP4_BF16_TAIL_LAYERS  int, last N decoder layers high-precision (0/unset=off)
++    AITER_FP4_BF16_HEAD_LAYERS  int, first M decoder layers high-precision (0/unset=off)
++    AITER_FP4_NUM_LAYERS        int, total decoder layers (default 32, for tail math)
++    AITER_FP4_BF16_TAIL_SCOPE   'attn' (only attention projections bf16; MLP stays FP4)
++  Note: the 'all' scope (MLP+attn bf16 in the kept layers) is handled more
++  robustly by a per-layer quant swap in decoders.py, not here.
++  """
++  import os
++  scope = os.environ.get("AITER_FP4_BF16_TAIL_SCOPE", "all").lower()
++  if scope != "attn":
++    return False
++  tail = int(os.environ.get("AITER_FP4_BF16_TAIL_LAYERS", "") or 0)
++  head = int(os.environ.get("AITER_FP4_BF16_HEAD_LAYERS", "") or 0)
++  if tail <= 0 and head <= 0:
++    return False
++  layer_idx = _fp4_module_context_layer_idx(module_context)
++  if layer_idx is None or is_mlp:
++    return False
++  nlayers = int(os.environ.get("AITER_FP4_NUM_LAYERS", "32"))
++  in_tail = tail > 0 and layer_idx >= (nlayers - tail)
++  in_head = head > 0 and layer_idx < head
++  return bool(in_tail or in_head)
++
++
++class AiterFp4DotGeneralOp(nn.Module):
++  """Drop-in dot_general using AITER FP4 (MXFP4) ASM GEMM.
++
++  Single FP4 recipe (TE parity, MI350/MI355X gfx950):
++
++    Forward:  Activation and weight are dual-cast to MXFP4 (E2M1 packed FP4
++              + E8M0 per-block scales) via the fused ``CastMxfp4DualJA`` HIP
++              kernel. The FP4 GEMM is ``GemmFp4FwdJA``.
++    Backward: dA via FP4 ASM with the saved columnwise weight; dB via FP4
++              wgrad GEMM (NT layout) with FSDP-aware ``jax.lax.psum``
++              sharding. ``grad_out`` is dual-cast WITH Hadamard transform
++              applied inside the fused HIP kernel (decorrelates outliers in
++              the gradient distribution).
++
++  FP4 is applied to all projections whose contraction K is a multiple of 64.
++  Attention projections (Q/K/V/O) opt in via ``AITER_FP4_ATTN=1``; without it
++  they use AITER BF16 ASM. MLP projections always use FP4.
++
++  Set ``quantization='aiter_fp4'`` to enable.
++  """
++  module_context: str = ""
++
++  @nn.compact
++  def __call__(self, inputs, kernel, dimension_numbers, precision=None, **kwargs):
++    import os
++
++    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
++    lhs_contract = tuple(lhs_contract)
++    rhs_contract = tuple(rhs_contract)
++
++    inp_shape = inputs.shape
++    ker_shape = kernel.shape
++    inp_ndim = len(inp_shape)
++    ker_ndim = len(ker_shape)
++
++    m_axes = [i for i in range(inp_ndim) if i not in lhs_contract]
++    n_axes = [i for i in range(ker_ndim) if i not in rhs_contract]
++
++    K = 1
++    for ax in lhs_contract:
++      K *= inp_shape[ax]
++    M = 1
++    for ax in m_axes:
++      M *= inp_shape[ax]
++    N = 1
++    for ax in n_axes:
++      N *= ker_shape[ax]
++
++    perm_lhs = m_axes + list(lhs_contract)
++    if perm_lhs == list(range(inp_ndim)):
++      a_2d = jnp.reshape(inputs, (M, K))
++    else:
++      a_2d = jnp.reshape(jnp.transpose(inputs, perm_lhs), (M, K))
++
++    perm_rhs = n_axes + list(rhs_contract)
++    if perm_rhs == list(range(ker_ndim)):
++      b_nk = jnp.reshape(kernel, (N, K))
++    else:
++      b_nk = jnp.reshape(jnp.transpose(kernel, perm_rhs), (N, K))
++
++    a_bf16 = a_2d.astype(jnp.bfloat16)
++    b_bf16 = b_nk.astype(jnp.bfloat16)
++
++    fp4_attn = os.environ.get("AITER_FP4_ATTN", "0") == "1"
++    # Default-ON MLP gate. Set AITER_FP4_MLP=0 to keep the MLP GEMMs in bf16 for
++    # an attn-only-FP4 isolation A/B (complement of mlp-only). With the default
++    # (=1) this is byte-identical to the prior "MLP always FP4" behavior.
++    fp4_mlp = os.environ.get("AITER_FP4_MLP", "1") == "1"
++    is_mlp = "mlp" in self.module_context
++    # Depth-tail high-precision (NVFP4 2509.25149): keep the last/first few
++    # decoder layers' ATTENTION projections in bf16 (default-OFF via
++    # AITER_FP4_BF16_TAIL_SCOPE=attn). The 'all' scope is handled by the
++    # per-layer quant swap in decoders.py.
++    force_bf16_depth = _fp4_depth_forces_bf16(self.module_context, is_mlp)
++    fp4_in_scope = (
++        ((is_mlp and fp4_mlp) or ((not is_mlp) and fp4_attn)) and not force_bf16_depth
++    )
++    use_fp4 = (K % 64 == 0) and fp4_in_scope
++    # Footgun guard: an in-scope FP4 GEMM whose contraction dim K is not a
++    # multiple of 64 SILENTLY runs bf16 (the a4w4 kernel needs K%64==0). Warn
++    # once per (scope, K) so a new model/config never loses FP4 unnoticed.
++    if fp4_in_scope and (K % 64 != 0):
++      _kalign_key = ("mlp" if is_mlp else "attn", K)
++      if _kalign_key not in _FP4_KALIGN_FALLBACK_WARNED:
++        _FP4_KALIGN_FALLBACK_WARNED.add(_kalign_key)
++        print(
++            f"[AITER_FP4] WARNING: {'MLP' if is_mlp else 'attn'} GEMM has K={K} "
++            f"(not a multiple of 64); MXFP4 a4w4 requires K%64==0, so this GEMM "
++            f"SILENTLY FALLS BACK to bf16 (module={self.module_context}). Set "
++            f"AITER_FP4_LOG_DEPTH=1 for the full per-GEMM breakdown."
++        )
++
++    if os.environ.get("AITER_FP4_LOG_DEPTH", "0") == "1":
++      print(
++          f"FP4_DEPTH: ctx={self.module_context} "
++          f"layer={_fp4_module_context_layer_idx(self.module_context)} "
++          f"is_mlp={is_mlp} force_bf16_depth={force_bf16_depth} use_fp4={use_fp4} "
++          f"M={M} N={N} K={K}"
++      )
++
++    if use_fp4:
++      from jax_aiter.gemm_fp4 import gemm_fp4_bf16 as aiter_fp4_gemm
++      sr_tokens = {
++          token.strip().lower()
++          for token in os.environ.get("JA_FP4_SR_PASSES", "").split(",")
++          if token.strip()
++      }
++      sr_enabled = (
++          os.environ.get("AITER_FP4_SR", "0") == "1"
++          or bool(
++              sr_tokens
++              & {
++                  "dgrad_grad",
++                  "grad",
++                  "dgrad",
++                  "dgrad_row",
++                  "dgrad_grad_row",
++                  "wgrad_col",
++                  "wgrad_grad_col",
++                  "act",
++                  "fprop",
++                  "fprop_act",
++                  "wt",
++                  "weight",
++              }
++          )
++      )
++      if sr_enabled:
++        if not self.has_rng("params"):
++          raise ValueError(
++              "AITER FP4 stochastic rounding requires the runtime 'params' RNG"
++          )
++        site_key = self.make_rng("params")
++        sr_key = jax.random.key_data(site_key)
++        if sr_key.dtype != jnp.uint32:
++          raise ValueError(
++              f"AITER FP4 SR key data must be uint32, got {sr_key.dtype}"
++          )
++        if sr_key.shape == (2,):
++          sr_key = jnp.concatenate(
++              (
++                  sr_key,
++                  sr_key ^ jnp.array([0x9E3779B9, 0xD1B54A35], dtype=jnp.uint32),
++              )
++          )
++        elif sr_key.shape != (4,):
++          raise ValueError(
++              "AITER FP4 deterministic SR requires uint32[2] or uint32[4] "
++              f"site key data, got shape={sr_key.shape}"
++          )
++        out_2d = aiter_fp4_gemm(a_bf16, b_bf16, sr_key=sr_key)
++      else:
++        out_2d = aiter_fp4_gemm(a_bf16, b_bf16)
++    elif os.environ.get("AITER_BF16_HIPBLASLT", "0") == "1":
++      # Default-OFF A/B knob (20260616): route the non-FP4 (bf16) attention
++      # projections + logits through XLA lax.dot_general (hipBLASLt) for
++      # fwd+dA+dB, instead of the AITER bf16 ASM custom_vjp. Lets XLA fuse the
++      # transposes and pipeline the GEMMs across the scanned decoder layers.
++      # a_2d[M,K] @ b_nk[N,K]^T -> [M,N] (contract K = axis 1 of both).
++      out_2d = jax.lax.dot_general(a_bf16, b_bf16, (((1,), (1,)), ((), ())))
++    else:
++      from jax_aiter.gemm import gemm as aiter_gemm
++      out_2d = aiter_gemm(a_bf16, b_bf16)
++
++    out_m_shape = tuple(inp_shape[ax] for ax in m_axes)
++    out_n_shape = tuple(ker_shape[ax] for ax in n_axes)
++    return jnp.reshape(out_2d, out_m_shape + out_n_shape)
++
++
++@dataclass
++class AiterFp4Quantization(Quantization):
++  """AITER FP4 (MXFP4) for AMD MI350/MI355X gfx950.
++
++  All MLP projections (gate, up, down) use FP4 ASM GEMM. Attention
++  projections (Q, K, V, O) use FP4 too when ``AITER_FP4_ATTN=1``. Forward
++  + dA + dB all run in FP4 (no FP8 fallback). ``grad_out`` is cast with
++  Hadamard transform (TE parity) for tighter convergence.
++
++  Set ``quantization='aiter_fp4'`` to enable.
++  """
++
++  quant_mode = "train"
++
++  def dot_general_cls(self, mesh_axes: Tuple[str, ...] = ()):
++    return AiterFp4DotGeneralOp
++
++
+ def _get_int8_quant_config(config):
+   """Get int8 quantization configuration."""
+   drhs_bits = None
+@@ -616,6 +1658,20 @@ def _get_quant_config(config):
+     return "fp8"
+   if config.quantization == "nanoo_fp8":
+     return "nanoo_fp8"
++  if config.quantization == "aiter_bf16":
++    return "aiter_bf16"
++  if config.quantization == "aiter_fp8":
++    return "aiter_fp8"
++  if config.quantization == "aiter_fp8_delayed":
++    return "aiter_fp8_delayed"
++  if config.quantization == "aiter_fp8_qdq":
++    return "aiter_fp8_qdq"
++  if config.quantization == "aiter_fp8_mlp_only":
++    return "aiter_fp8_mlp_only"
++  if config.quantization == "aiter_nanoo_fp8":
++    return "aiter_nanoo_fp8"
++  if config.quantization == "aiter_fp4":
++    return "aiter_fp4"
+   if config.quantization == "aqt_fp8":
+     return _get_aqt_fp8_quant_config(config)
+   if config.quantization == "aqt_fp8_full":
+@@ -666,6 +1722,20 @@ def configure_quantization(config: Config, quant_mode_str: str = "train"):
+       return Fp8Quantization()
+     elif quant_cfg == "nanoo_fp8":
+       return NANOOFp8Quantization()
++    elif quant_cfg == "aiter_bf16":
++      return AiterBf16Quantization()
++    elif quant_cfg == "aiter_fp8":
++      return AiterFp8Quantization()
++    elif quant_cfg == "aiter_fp8_delayed":
++      return AiterFp8DelayedQuantization()
++    elif quant_cfg == "aiter_fp8_qdq":
++      return AiterFp8QdqQuantization()
++    elif quant_cfg == "aiter_fp8_mlp_only":
++      return AiterFp8MlpOnlyQuantization()
++    elif quant_cfg == "aiter_nanoo_fp8":
++      return AiterNanooFp8Quantization()
++    elif quant_cfg == "aiter_fp4":
++      return AiterFp4Quantization()
+     elif isinstance(quant_cfg, str) and quant_cfg.startswith("te_"):
+       return TransformerEngineQuantization(config)
+     quant_mode = get_quant_mode(quant_mode_str)
+diff --git a/src/maxtext/models/llama2.py b/src/maxtext/models/llama2.py
+index fa0f8b85e566307abd8582e3c047ad5b6e1c4f09..d5793be7af39a201fbbe04853ff8e396f1c3de28 100644
+--- a/src/maxtext/models/llama2.py
++++ b/src/maxtext/models/llama2.py
+@@ -74,6 +74,12 @@ class LlamaDecoderLayer(nnx.Module):
+         rngs=rngs,
+     )
+ 
++    # Default-off (0.0 -> None): keeps MaxText's folded depth_scaling init. A positive
++    # value moves 1/sqrt(head_dim) from the query kernel to a runtime multiply
++    # (forward-equivalent), un-inflating the query-weight gradient (Megatron-like).
++    _qpas = getattr(config, "query_pre_attn_scalar", 0.0)
++    _query_pre_attn_scalar = _qpas if _qpas and _qpas > 0.0 else None
++
+     self.self_attention = Attention(
+         config=config,
+         num_query_heads=config.num_query_heads,
+@@ -100,6 +106,7 @@ class LlamaDecoderLayer(nnx.Module):
+         ragged_block_size=config.ragged_block_size,
+         model_mode=model_mode,
+         attn_logits_soft_cap=config.attn_logits_soft_cap,
++        query_pre_attn_scalar=_query_pre_attn_scalar,
+         rngs=rngs,
+     )
+ 
+diff --git a/src/maxtext/optimizers/optimizers.py b/src/maxtext/optimizers/optimizers.py
+index 9992d7674f97d03ed315ab1506d3039199fc2bee..6dade08b443412ec146020f93f839afee137bb0d 100644
+--- a/src/maxtext/optimizers/optimizers.py
++++ b/src/maxtext/optimizers/optimizers.py
+@@ -43,9 +43,39 @@ def _get_path_mask_fn(patterns, match_returns_true=True):
+   return mask_fn
+ 
+ 
++_ADAMW_MASK_DUMPED = [False]
++
++
+ def get_adamw_mask(config):
+   """Create a mask function for AdamW optimizer to exclude certain parameters from weight decay."""
+-  return _get_path_mask_fn(getattr(config, "adamw_mask", None), match_returns_true=False)
++  base_fn = _get_path_mask_fn(getattr(config, "adamw_mask", None), match_returns_true=False)
++  if base_fn is None:
++    return None
++
++  def _verifying_mask(params):
++    tree = base_fn(params)
++    # One-time eager dump (path strings + shapes are static at trace time) to VERIFY
++    # the adamw_mask regex excludes only the intended (1-D norm scale) params from
++    # weight decay. mask=False => EXCLUDED from wd. AIMA-164 adamw_mask A/B.
++    if not _ADAMW_MASK_DUMPED[0]:
++      _ADAMW_MASK_DUMPED[0] = True
++      try:
++        import jax as _jax  # local import to avoid top-level cycle concerns
++        excl = []
++        def _rec(path, leaf, m):
++          ps = _jax.tree_util.keystr(path, simple=True, separator="/")
++          shp = getattr(leaf, "shape", None)
++          if m is False:
++            excl.append((ps, tuple(shp) if shp is not None else None))
++        _jax.tree_util.tree_map_with_path(_rec, params, tree)
++        print(f"[adamw_mask] patterns={getattr(config,'adamw_mask',None)} -> {len(excl)} params EXCLUDED from weight decay:", flush=True)
++        for ps, shp in excl:
++          print(f"[adamw_mask]   EXCL ndim={len(shp) if shp else '?'} shape={shp} {ps}", flush=True)
++      except Exception as _e:  # never break training on a logging helper
++        print(f"[adamw_mask] dump skipped: {_e}", flush=True)
++    return tree
++
++  return _verifying_mask
+ 
+ 
+ def _compute_rolling_stats(arr: jax.Array, count: jax.Array, interval: int):
+diff --git a/tests/unit/attention_test.py b/tests/unit/attention_test.py
+index 754c526b2f961b37d23404c77c20770a4a7a2dad..18f05b21ac63913ec4a29f3c0376e5faef40140c 100644
+--- a/tests/unit/attention_test.py
++++ b/tests/unit/attention_test.py
+@@ -14,7 +14,9 @@
+ 
+ """Tests for Attentions."""
+ 
++import functools
+ import itertools
++import os
+ import random
+ import sys
+ import types
+@@ -572,6 +574,156 @@ class CudnnTePackedSequenceDescriptorTest(unittest.TestCase):
+       )
+ 
+ 
++class AiterPackedMetadataTest(unittest.TestCase):
++  """THD metadata handed to the jax-aiter varlen kernels.
++
++  `seqstart` is cumulative physical offsets (padding included) and `cu_seqlen`
++  is cumulative logical lengths (padding excluded), matching what TE derives for
++  the same segment ids. Runs on CPU: no kernel is invoked.
++  """
++
++  def _metadata(self, segment_ids, max_segments_per_seq):
++    fake_self = types.SimpleNamespace(
++        config=types.SimpleNamespace(max_segments_per_seq=max_segments_per_seq)
++    )
++    segment_ids = jnp.asarray(segment_ids, dtype=jnp.int32)
++    build = functools.partial(
++        AttentionOp._aiter_packed_metadata,  # pylint: disable=protected-access
++        fake_self,
++    )
++    seqstart, cu_seqlen = jax.jit(build, static_argnums=(1,))(segment_ids, segment_ids.shape[1])
++    return np.asarray(seqstart), np.asarray(cu_seqlen)
++
++  def test_trailing_padding_is_excluded_from_logical_lengths(self):
++    # Row 0: ids 1,1,1 then 2,2 then padding. Row 1: one segment, then padding.
++    segment_ids = [[1, 1, 1, 2, 2, 0, 0, 0], [1, 1, 1, 1, 0, 0, 0, 0]]
++    seqstart, cu_seqlen = self._metadata(segment_ids, max_segments_per_seq=4)
++
++    total = 16
++    # Physical starts: row 0 at 0 and 3, row 1 at 8; unused slots point past the end.
++    np.testing.assert_array_equal(seqstart[:3], [0, 3, 8])
++    np.testing.assert_array_equal(seqstart[3:], [total] * (len(seqstart) - 3))
++    # Logical lengths 3, 2, 4 then nothing.
++    np.testing.assert_array_equal(cu_seqlen[:4], [0, 3, 5, 9])
++    np.testing.assert_array_equal(cu_seqlen[4:], [9] * (len(cu_seqlen) - 4))
++
++  def test_static_slot_count_is_independent_of_real_segment_count(self):
++    max_seg = 4
++    one = [[1, 1, 1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1, 1]]
++    many = [[1, 1, 2, 2, 3, 3, 4, 4], [1, 1, 2, 2, 3, 3, 4, 4]]
++    seqstart_one, cu_one = self._metadata(one, max_seg)
++    seqstart_many, cu_many = self._metadata(many, max_seg)
++
++    expected_slots = 2 * max_seg + 1
++    for arr in (seqstart_one, cu_one, seqstart_many, cu_many):
++      self.assertEqual(arr.shape, (expected_slots,))
++
++    # Unpadded rows: physical spans and logical lengths agree.
++    np.testing.assert_array_equal(seqstart_one[:3], [0, 8, 16])
++    np.testing.assert_array_equal(cu_one[:3], [0, 8, 16])
++    np.testing.assert_array_equal(seqstart_many[:9], [0, 2, 4, 6, 8, 10, 12, 14, 16])
++    np.testing.assert_array_equal(cu_many[:9], [0, 2, 4, 6, 8, 10, 12, 14, 16])
++
++  def test_all_ones_segmentation_is_one_sequence_per_row(self):
++    # The shape synthetic data produces; every token is real.
++    segment_ids = np.ones((4, 8), dtype=np.int32)
++    seqstart, cu_seqlen = self._metadata(segment_ids, max_segments_per_seq=32)
++
++    np.testing.assert_array_equal(seqstart[:5], [0, 8, 16, 24, 32])
++    np.testing.assert_array_equal(cu_seqlen[:5], [0, 8, 16, 24, 32])
++    # Tail slots are empty, so AITER skips them.
++    np.testing.assert_array_equal(seqstart[5:], [32] * (len(seqstart) - 5))
++    np.testing.assert_array_equal(cu_seqlen[5:], [32] * (len(cu_seqlen) - 5))
++
++  def test_segment_ids_are_monotonic_offsets_in_token_order(self):
++    segment_ids = [[1, 1, 0, 2, 2, 2, 0, 0], [1, 0, 0, 0, 0, 0, 0, 0]]
++    seqstart, cu_seqlen = self._metadata(segment_ids, max_segments_per_seq=4)
++
++    self.assertTrue(np.all(np.diff(seqstart) >= 0), msg=f"seqstart not sorted: {seqstart}")
++    self.assertTrue(np.all(np.diff(cu_seqlen) >= 0), msg=f"cu_seqlen not sorted: {cu_seqlen}")
++    np.testing.assert_array_equal(seqstart[:3], [0, 3, 8])
++    np.testing.assert_array_equal(cu_seqlen[:4], [0, 2, 5, 6])
++
++
++class AiterAttentionRoutingTest(parameterized.TestCase):
++  """Which jax-aiter entry point each input shape selects.
++
++  Non-packed input must not be described as packed with phantom segments, and
++  must still reach the group-mode ASM backward: batched attention at this shape
++  has no ASM v3 backward and falls back to CK. Real packed input carries genuine
++  segments and needs the varlen route with its logical lengths.
++  """
++
++  def _route_for(self, packing, dataset_type, segment_ids_present, nonpacked_route=None):
++    calls = []
++
++    def fake_flash_attn_func(*args, **kwargs):  # pylint: disable=unused-argument
++      calls.append("batch")
++      return (jnp.zeros((1, 4, 2, 2), dtype=jnp.float32),)
++
++    def fake_flash_attn_varlen_raw(*args, **kwargs):  # pylint: disable=unused-argument
++      calls.append("varlen")
++      return jnp.zeros((4, 2, 2), dtype=jnp.float32)
++
++    mha_module = types.ModuleType("jax_aiter.mha")
++    mha_module.flash_attn_func = fake_flash_attn_func
++    mha_module.flash_attn_varlen_raw = fake_flash_attn_varlen_raw
++    fake_modules = {
++        "jax_aiter": types.ModuleType("jax_aiter"),
++        "jax_aiter.mha": mha_module,
++    }
++
++    config = types.SimpleNamespace(
++        context_sharding="context",
++        context_parallel_strategy="ring",
++        context_parallel_load_balance=False,
++        packing=packing,
++        dataset_type=dataset_type,
++        max_segments_per_seq=2,
++        head_dim=2,
++        attention_kernel="aiter_flash",
++    )
++    mesh = Mesh(np.array(jax.devices()[:1]), ("fsdp",))
++    attention = AttentionOp(
++        config=config,
++        mesh=mesh,
++        attention_kernel="aiter_flash",
++        max_target_length=4,
++        num_query_heads=2,
++        num_kv_heads=2,
++        dtype=jnp.float32,
++    )
++    query = jnp.zeros((1, 4, 2, 2), dtype=jnp.float32)
++    key = jnp.zeros((1, 4, 2, 2), dtype=jnp.float32)
++    value = jnp.zeros((1, 4, 2, 2), dtype=jnp.float32)
++    segment_ids = jnp.ones((1, 4), dtype=jnp.int32) if segment_ids_present else None
++
++    env = {} if nonpacked_route is None else {"JA_MHA_NONPACKED_ROUTE": nonpacked_route}
++    with mock.patch.dict(sys.modules, fake_modules), mock.patch.dict(os.environ, env):
++      attention.aiter_flash_attention(query, key, value, segment_ids)
++    return calls
++
++  @parameterized.named_parameters(
++      {"testcase_name": "synthetic_with_packing", "packing": True, "dataset_type": "synthetic"},
++      {"testcase_name": "no_packing", "packing": False, "dataset_type": "grain"},
++  )
++  def test_non_packed_inputs_use_one_tight_segment_per_row(self, packing, dataset_type):
++    calls = self._route_for(packing, dataset_type, segment_ids_present=True)
++    self.assertEqual(calls, ["varlen"])
++
++  def test_non_packed_inputs_can_be_forced_to_batched_layout(self):
++    calls = self._route_for(True, "synthetic", segment_ids_present=True, nonpacked_route="batch")
++    self.assertEqual(calls, ["batch"])
++
++  def test_real_packed_input_uses_varlen(self):
++    calls = self._route_for(True, "grain", segment_ids_present=True)
++    self.assertEqual(calls, ["varlen"])
++
++  def test_missing_segment_ids_use_batched_attention(self):
++    calls = self._route_for(True, "grain", segment_ids_present=False)
++    self.assertEqual(calls, ["batch"])
++
++
+ class AttentionTest(parameterized.TestCase):
+   """Test for the Attention"""
+ 
+diff --git a/tests/unit/pyconfig_test.py b/tests/unit/pyconfig_test.py
+index dcfb1ec242dc5a3db357ec8e3ad0c2e4f715cd27..9a00f25eb839ab212bab39a38ec661ab91dd29d6 100644
+--- a/tests/unit/pyconfig_test.py
++++ b/tests/unit/pyconfig_test.py
+@@ -37,6 +37,52 @@ class PyconfigTest(unittest.TestCase):
+ 
+     self.assertTrue(config.quantization is None or config.quantization == "")
+ 
++  def test_aiter_fp4_defaults_to_direct_mha(self):
++    config = pyconfig.initialize(
++        [
++            os.path.join(MAXTEXT_PKG_DIR, "train.py"),
++            os.path.join(MAXTEXT_CONFIGS_DIR, "gpu", "models", "llama3_8b.yml"),
++        ],
++        skip_jax_distributed_system=True,
++        quantization="aiter_fp4",
++    )
++
++    self.assertEqual(config.attention, "aiter_flash")
++    self.assertTrue(config.aiter_attention)
++    self.assertTrue(config.use_jax_aiter)
++
++  def test_aiter_fp4_explicit_attention_preserves_te_rollback(self):
++    config = pyconfig.initialize(
++        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
++        skip_jax_distributed_system=True,
++        quantization="aiter_fp4",
++        attention="cudnn_flash_te",
++    )
++
++    self.assertEqual(config.attention, "cudnn_flash_te")
++
++  def test_aiter_fp4_flag_preserves_te_rollback(self):
++    config = pyconfig.initialize(
++        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
++        skip_jax_distributed_system=True,
++        quantization="aiter_fp4",
++        aiter_attention=False,
++    )
++
++    self.assertNotEqual(config.attention, "aiter_flash")
++    self.assertFalse(config.aiter_attention)
++
++  def test_aiter_fp4_unvalidated_model_does_not_auto_route_mha(self):
++    config = pyconfig.initialize(
++        [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
++        skip_jax_distributed_system=True,
++        quantization="aiter_fp4",
++        enable_dropout=False,
++    )
++
++    self.assertNotIn(config.model_name, ("llama3-8b", "llama3.1-8b"))
++    self.assertNotEqual(config.attention, "aiter_flash")
++
+   def test_multiple_unmodifiable_configs(self):
+     config_train = pyconfig.initialize(
+         [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+diff --git a/tests/unit/quantizations_test.py b/tests/unit/quantizations_test.py
+index c11f5ea3b792ff350a362a47df49ab2f3419a14b..61ff54408ac842ad0b93ce5570fc35320d828386 100644
+--- a/tests/unit/quantizations_test.py
++++ b/tests/unit/quantizations_test.py
+@@ -17,6 +17,7 @@
+ import functools
+ import os.path
+ import sys
++import types
+ from typing import Any
+ import unittest
+ from aqt.jax.v2 import aqt_tensor
+@@ -42,6 +43,43 @@ _QUERY_REGEX = ".*/query"
+ _VALUE_REGEX = ".*/value"
+ 
+ 
++def test_aiter_fp4_sr_uses_replayable_runtime_site_key(monkeypatch):
++  captured_keys = []
++  fake_module = types.ModuleType("jax_aiter.gemm_fp4")
++
++  def fake_gemm(a, b, *, sr_key=None):
++    captured_keys.append(np.asarray(sr_key))
++    return jnp.zeros((a.shape[0], b.shape[0]), dtype=jnp.bfloat16)
++
++  fake_module.gemm_fp4_bf16 = fake_gemm
++  monkeypatch.setitem(sys.modules, "jax_aiter.gemm_fp4", fake_module)
++  monkeypatch.setenv("JA_FP4_SR_PASSES", "wgrad_col")
++  monkeypatch.setenv("AITER_FP4_SR", "0")
++
++  module = quantizations.AiterFp4DotGeneralOp(module_context="mlp_gate")
++  inputs = jnp.ones((64, 64), dtype=jnp.bfloat16)
++  kernel = jnp.ones((32, 64), dtype=jnp.bfloat16)
++  dims = (((1,), (1,)), ((), ()))
++  variables = module.init(
++      {"params": jax.random.PRNGKey(0)}, inputs, kernel, dims
++  )
++
++  captured_keys.clear()
++  for seed in (17, 17, 18):
++    module.apply(
++        variables,
++        inputs,
++        kernel,
++        dims,
++        rngs={"params": jax.random.PRNGKey(seed)},
++    )
++
++  np.testing.assert_array_equal(captured_keys[0], captured_keys[1])
++  assert captured_keys[0].shape == (4,)
++  assert captured_keys[0].dtype == np.uint32
++  assert np.any(captured_keys[0] != captured_keys[2])
++
++
+ class QuantTestModule(nnx.Module):
+   """Test module for einsum."""
+ 

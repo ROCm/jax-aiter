@@ -125,8 +125,18 @@ def e8m0_shuffle(scales: jnp.ndarray) -> jnp.ndarray:
     m_pad = ((m + 255) // 256) * 256
     n_pad = ((n + 7) // 8) * 8
 
-    padded = jnp.zeros((m_pad, n_pad), dtype=jnp.uint8)
-    padded = padded.at[:m, :n].set(scales)
+    if m_pad == m and n_pad == n:
+        # Already 256x8-aligned -> the pad is a no-op. Skip the jnp.zeros
+        # allocation so this function materializes NO constant array: that lets
+        # e8m0_shuffle run inside a custom_partitioning base body (the
+        # shardy-correct fwd K-gather primitive) without tripping JAX's
+        # "no consts in the partitioned callable" restriction. Byte-identical
+        # to the padded path whenever the input is aligned (always true for the
+        # 256-aligned MXFP4 weight/scale shapes on the packed-AG path).
+        padded = scales
+    else:
+        padded = jnp.zeros((m_pad, n_pad), dtype=jnp.uint8)
+        padded = padded.at[:m, :n].set(scales)
 
     sm, sn = padded.shape
     reshaped = padded.reshape(sm // 32, 2, 16, sn // 8, 2, 4)

@@ -60,7 +60,6 @@ coverage.xml
 build/
 third_party/*
 !third_party/aiter
-!third_party/pytorch
 
 # Python cache.
 __pycache__/
@@ -81,10 +80,23 @@ jax_aiter/_hsa/
 jax_aiter/_lib/
 
 # Local-only experimental modules (not committed upstream).
-jax_aiter/gemm_fp8/
 jax_aiter/triton/
-csrc/ffi/gemm_fp8_mi350/
 
 # HLO dumps and investigation logs.
 hlo_dumps/
-docs/logs/
+
+# CI perf run outputs (ephemeral; produced by ci/perf/run_8b_fp4.sh).
+ci_perf_out/
+# Ignore local doc artifacts (runs/, perf/, logs/, ...) but keep committed
+# release notes and public recipes trackable (a file can't be re-included if
+# its parent dir is excluded, so ignore docs/* contents rather than docs/).
+docs/*
+!docs/RELEASE_NOTES_v0.1.0-alpha.md
+!docs/RELEASE_NOTES_v0.1.0-alpha2.md
+!docs/architecture.md
+!docs/development.md
+!docs/recipes/
+!docs/recipes/*.md
+!docs/release/
+!docs/release/RELEASE_PLAYBOOK.md
+.rocprofv3/

@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Minimal PEP 517 shim. setup.py remains authoritative for all package
+# metadata (name, version, package_data, custom build_py/bdist_wheel that
+# stage the prebuilt *.so + HSA kernels, and the JA_WHEEL_VARIANT logic).
+# Do NOT migrate metadata here.
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# Pytest configuration only. Package metadata stays in setup.py (see above).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Without this, pytest's default `*_test.py` glob also collects the smoke
+# scripts, which import jax_aiter and initialise the backend just to report
+# zero tests.
+python_files = ["test_*.py"]
+markers = [
+    "gpu: needs a GPU (an AITER FFI kernel actually executes)",
+    "multigpu: needs at least 4 visible devices; skipped on a single-GPU runner",
+    "slow: exhaustive sweeps and large shapes; nightly only, not on the PR path",
+]

@@ -17,15 +17,16 @@ are on different levels of the call stack.
 
 from __future__ import annotations
 import logging
+import os
 from typing import Tuple, Optional
 from functools import partial
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.custom_partitioning import custom_partitioning, SdyShardingRule
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from ..ja_compat import dtypes
 from ..ja_compat.chip_info import get_gfx
 from ..ops.mha import (
     mha_fwd as _mha_fwd_raw,
@@ -36,6 +37,113 @@ from ..ops.mha import (
 )
 
 log = logging.getLogger("jax-aiter.mha_v2")
+
+
+# ---------------------------------------------------------------------------
+# Backward dispatch resolution
+# ---------------------------------------------------------------------------
+#
+# Two classes of reason to decline the ASM v3 backward, kept apart because they
+# carry very different confidence:
+#
+#   hard    -- no ASM binary exists for the config (dropout, bias, sliding
+#              window). Never overridable.
+#   suspect -- ``c5bc2e2`` (2026-03-11) measured wrong gradients for causal
+#              gfx950 and fell back to CK: batched ``seqlen_q > seqlen_k``, and
+#              varlen ``max_seqlen_k > 256`` in group mode. That measurement was
+#              taken against AITER ``v0.1.11.post1-14-g3baf198aa``; 76 backward
+#              ASM binaries changed between that pin and the v0.1.19 we now ship.
+#              Overridable via ``JA_MHA_BWD_FORCE_ASM_V3`` so it stays testable.
+#
+# The varlen half of the suspect set was retested on v0.1.19 and does not
+# reproduce, so it no longer blocks. 30 cells at the llama3-8b shape (hd128,
+# bf16, 32 query / 8 KV heads, causal group) across seqlen 256/512/2048/8192,
+# single-segment and 32-segment packing, against an independent FP32 oracle:
+# fp32 atomics match the CK backward to six decimal places everywhere, and
+# 16-bit atomics stay within 1.5x of CK on dQ at worst (single 8192 segment;
+# identical to CK at production packing). Evidence, including the loaded code
+# objects proving ASM really dispatched:
+# docs/runs/llama3_8b/kernels/20260730_8b_bf16_mha_asm_accuracy_097_i1/
+#
+# The batched ``seqlen_q > seqlen_k`` half was NOT retested and still blocks.
+# AITER's own smoke_test_bwd_v3.sh skips atomic16 whenever ``sq != sk``, so at
+# least the a16 form of it is a documented upstream restriction.
+#
+# Environment knobs, all defaulting to historical behaviour:
+#
+#   JA_MHA_BWD_USE_ASM_V3=0    force the CK/v2 backward (FAv3-vs-FAv2 A/B)
+#   JA_MHA_BWD_FORCE_ASM_V3=1  bypass the *suspect* guard only
+#   JA_MHA_BWD_ATOMIC_FP32=0|1 dQ atomic width, independent of the ASM decision.
+#                              Unset keeps the historical tie to use_asm_v3, so
+#                              ASM implies fp32 atomics. TE runs a16 for the same
+#                              shape, which this makes reachable.
+#   JA_MHA_BWD_BF16_CVT=0|1|2  0=RTNE, 1=RTNA, 2=RTZ. Unset keeps the arch
+#                              default (0 on gfx950). TE uses 2.
+
+# ---------------------------------------------------------------------------
+# Rematerialisation tagging
+# ---------------------------------------------------------------------------
+#
+# A framework layer-remat policy can only *save* a value it can name. TE names
+# its attention output, softmax LSE and RNG state ``context``
+# (transformer_engine/jax/attention.py, ``context_checkpoint_name``), which is
+# exactly what MaxText's ``minimal_with_context`` / ``minimal_flash`` /
+# ``minimal_flash_save_fp4col`` policies list
+# (maxtext/src/maxtext/layers/decoders.py, ``_minimal_names``). Leaving our
+# residuals untagged makes the same policy recompute the whole attention
+# forward inside the backward pass, which is why the reroute lost time while
+# *reducing* compiled memory. Tagging costs nothing when the enclosing graph is
+# not rematerialised.
+_CONTEXT_CKPT_NAME = "context"
+
+
+def _has_padding(cu_logical) -> bool:
+    """True when the caller described padding via cumulative logical lengths."""
+    return cu_logical is not None and getattr(cu_logical, "size", 0) > 0
+
+
+def _zero_pad(cu_logical) -> bool:
+    """Whether to clear output/gradient buffers before the kernel runs.
+
+    AITER writes only the logical tokens of each segment, so in a padded layout
+    the padding rows of o/lse/dq/dk/dv keep whatever the buffer already held.
+    Those rows are still part of the tensor MaxText hands to the next op, so they
+    must start at a defined value. TE solves this the same way and gates it on
+    ``NVTE_CK_ZERO_OUT_PAD`` (default on); ``JA_MHA_ZERO_PAD=0`` is the matching
+    escape for measuring what the clear costs. Tight packings have no padding
+    rows and never pay for it.
+    """
+    if not _has_padding(cu_logical):
+        return False
+    return os.environ.get("JA_MHA_ZERO_PAD", "1") != "0"
+
+
+def _tag_context(*vals):
+    """Name attention residuals so a layer-remat policy can save them."""
+    if os.environ.get("JA_MHA_REMAT_CONTEXT", "1") == "0":
+        return vals if len(vals) > 1 else vals[0]
+    tagged = tuple(
+        v if v is None else checkpoint_name(v, _CONTEXT_CKPT_NAME) for v in vals
+    )
+    return tagged if len(tagged) > 1 else tagged[0]
+
+
+def _resolve_bwd_dispatch(hard_block: bool, suspect_block: bool):
+    """Return ``(use_asm_v3, is_v3_atomic_fp32, how_v3_bf16_cvt)``."""
+    if os.environ.get("JA_MHA_BWD_USE_ASM_V3", "1") == "0" or hard_block:
+        use_v3 = False
+    elif suspect_block:
+        use_v3 = os.environ.get("JA_MHA_BWD_FORCE_ASM_V3", "0") == "1"
+    else:
+        use_v3 = True
+
+    atomic_env = os.environ.get("JA_MHA_BWD_ATOMIC_FP32")
+    atomic = use_v3 if atomic_env is None else atomic_env == "1"
+
+    cvt_env = os.environ.get("JA_MHA_BWD_BF16_CVT")
+    bf16_cvt = (0 if get_gfx() == "gfx950" else 1) if cvt_env is None else int(cvt_env)
+
+    return use_v3, atomic, bf16_cvt
 
 
 # ---------------------------------------------------------------------------
@@ -63,13 +171,12 @@ def _get_rank(t):
 # custom_partitioning: forward
 # ---------------------------------------------------------------------------
 
-@partial(custom_partitioning, static_argnums=(12,))
+@partial(custom_partitioning, static_argnums=(14,))
 def _mha_fwd_partitioned(q, k, v, cu_sq, cu_skv, out_prov,
-                         bias, alibi, gen,
-                         q_descale, k_descale, v_descale,
-                         config):
+                         bias, alibi, gen, cu_sq_log, cu_skv_log,
+                         q_descale, k_descale, v_descale, config):
     return _mha_fwd_raw(q, k, v, cu_sq, cu_skv, out_prov,
-                        bias, alibi, gen, config,
+                        bias, alibi, gen, cu_sq_log, cu_skv_log, config,
                         q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale)
@@ -82,7 +189,10 @@ def _mha_fwd_infer_sharding(config, mesh, arg_shapes, result_shapes):
     out_sharding = NamedSharding(mesh, P(*q_spec))
 
     if is_varlen:
-        lse_sh = NamedSharding(mesh, P(*((None,) * result_shapes[1].ndim)))
+        # lse is [hq, total_q]: shard the token dim (dim1) like q's token dim
+        # (q dim0) and the head dim (dim0) like q's head dim (q dim1), so the
+        # partitioner-declared lse shape matches the per-shard FFI output.
+        lse_sh = NamedSharding(mesh, P(q_spec[1], q_spec[0]))
     else:
         if result_shapes[1].ndim == 3:
             lse_sh = NamedSharding(mesh, P(q_spec[0], q_spec[2], q_spec[1]))
@@ -116,9 +226,9 @@ def _mha_fwd_partition(config, mesh, arg_shapes, result_shapes):
     arg_shardings = tuple(shardings)
 
     def _lowered(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
-                 q_descale, k_descale, v_descale):
+                 cu_sq_log, cu_skv_log, q_descale, k_descale, v_descale):
         return _mha_fwd_raw(q, k, v, cu_sq, cu_skv, out_prov,
-                            bias, alibi, gen, config,
+                            bias, alibi, gen, cu_sq_log, cu_skv_log, config,
                             q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale)
@@ -172,13 +282,13 @@ _mha_fwd_partitioned.def_partition(
 # custom_partitioning: backward
 # ---------------------------------------------------------------------------
 
-@partial(custom_partitioning, static_argnums=(15,))
+@partial(custom_partitioning, static_argnums=(17,))
 def _mha_bwd_partitioned(dout, q, k, v, out, lse, cu_sq, cu_sk,
                          dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
-                         config):
+                         cu_sq_log, cu_sk_log, config):
     return _mha_bwd_raw(dout, q, k, v, out, lse, cu_sq, cu_sk,
                         dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
-                        config)
+                        cu_sq_log, cu_sk_log, config)
 
 
 def _mha_bwd_infer_sharding(config, mesh, arg_shapes, result_shapes):
@@ -194,6 +304,9 @@ def _mha_bwd_infer_sharding(config, mesh, arg_shapes, result_shapes):
 
     if result_shapes[3].ndim == 3:
         sd_sh = NamedSharding(mesh, P(q_spec[0], q_spec[2], q_spec[1]))
+    elif result_shapes[3].ndim == 2:
+        # varlen softmax_d [hq, total_q]: shard token dim like q dim0, head like q dim1.
+        sd_sh = NamedSharding(mesh, P(q_spec[1], q_spec[0]))
     if result_shapes[4].ndim == 4:
         dbias_sh = NamedSharding(mesh, P(q_spec[0], q_spec[1], q_spec[2], None))
 
@@ -221,10 +334,11 @@ def _mha_bwd_partition(config, mesh, arg_shapes, result_shapes):
     arg_shardings = tuple(shardings)
 
     def _lowered(dout, q, k, v, out, lse, cu_sq, cu_sk,
-                 dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen):
+                 dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
+                 cu_sq_log, cu_sk_log):
         return _mha_bwd_raw(dout, q, k, v, out, lse, cu_sq, cu_sk,
                             dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
-                            config)
+                            cu_sq_log, cu_sk_log, config)
 
     return mesh, _lowered, out_shardings, arg_shardings
 
@@ -261,8 +375,12 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
                     max_seqlen_q=-1, max_seqlen_k=-1, min_seqlen_q=0,
                     logits_soft_cap=0.0, zero_tensors=False,
                     cp_axis=None, cp_size=1, cp_load_balanced=True,
+                    cu_seqlens_q_logical=None, cu_seqlens_kv_logical=None,
                     q_descale=None, k_descale=None, v_descale=None):
     """Unified forward for both batch (4D q) and varlen (3D q).
+
+    In varlen/group mode ``cu_seqlens_*`` are cumulative *physical* offsets and
+    ``cu_seqlens_*_logical`` are cumulative *logical* lengths excluding padding.
 
     For FP8 input (float8_e4m3fn / float8_e4m3fnuz), q_descale, k_descale,
     and v_descale must be provided as fp32 tensors of shape [1] (per-tensor)
@@ -272,6 +390,10 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
         cu_seqlens_q = _empty(jnp.int32)
     if cu_seqlens_kv is None:
         cu_seqlens_kv = _empty(jnp.int32)
+    if cu_seqlens_q_logical is None:
+        cu_seqlens_q_logical = _empty(jnp.int32)
+    if cu_seqlens_kv_logical is None:
+        cu_seqlens_kv_logical = _empty(jnp.int32)
     if bias is None:
         bias = _empty(q.dtype)
     if alibi_slopes is None:
@@ -290,6 +412,12 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
     is_fp8 = _is_fp8_dtype(q.dtype)
     out_dtype = jnp.bfloat16 if is_fp8 else q.dtype
 
+    # Forward uses the CK FA v3 ASM kernel by default (AITER falls back to v2 CK
+    # when use_asm_v3=False or the shape is unsupported). JA_MHA_FWD_USE_ASM_V3=0
+    # forces the v2 forward — used by the FAv3-vs-FAv2 forward numeric A/B
+    # (AIMA-164). Default 1 preserves existing behavior.
+    _fwd_use_asm_v3 = os.environ.get("JA_MHA_FWD_USE_ASM_V3", "1") != "0"
+
     config = MhaFwdConfig(
         dropout_p=float(dropout_p),
         softmax_scale=float(softmax_scale),
@@ -297,7 +425,7 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
         wl=int(wl), wr=int(wr),
         return_lse=return_lse,
         return_randval=bool(return_softmax and dropout_p > 0),
-        use_asm_v3=True,
+        use_asm_v3=_fwd_use_asm_v3,
         how_v3_bf16_cvt=int(bf16_cvt),
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_k=int(max_seqlen_k),
@@ -310,6 +438,7 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
     )
     return _mha_fwd_partitioned(q, k, v, cu_seqlens_q, cu_seqlens_kv,
                                 _empty(out_dtype), bias, alibi_slopes, gen,
+                                cu_seqlens_q_logical, cu_seqlens_kv_logical,
                                 q_desc, k_desc, v_desc,
                                 config)
 
@@ -320,12 +449,17 @@ def mha_bwd_unified(dout, q, k, v, out, lse, dropout_p, softmax_scale,
                     bias=None, alibi_slopes=None, rng_state=None,
                     cu_seqlens_q=None, cu_seqlens_k=None,
                     max_seqlen_q=-1, max_seqlen_k=-1, zero_tensors=False,
-                    cp_axis=None, cp_size=1, cp_load_balanced=True):
+                    cp_axis=None, cp_size=1, cp_load_balanced=True,
+                    cu_seqlens_q_logical=None, cu_seqlens_k_logical=None):
     """Unified backward for both batch (4D q) and varlen (3D q)."""
     if cu_seqlens_q is None:
         cu_seqlens_q = _empty(jnp.int32)
     if cu_seqlens_k is None:
         cu_seqlens_k = _empty(jnp.int32)
+    if cu_seqlens_q_logical is None:
+        cu_seqlens_q_logical = _empty(jnp.int32)
+    if cu_seqlens_k_logical is None:
+        cu_seqlens_k_logical = _empty(jnp.int32)
     if bias is None:
         bias = _empty(q.dtype)
     if alibi_slopes is None:
@@ -353,6 +487,7 @@ def mha_bwd_unified(dout, q, k, v, out, lse, dropout_p, softmax_scale,
         dout, q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k,
         _empty(q.dtype), _empty(q.dtype), _empty(q.dtype),
         bias, alibi_slopes, rng_state, _empty(jnp.int64),
+        cu_seqlens_q_logical, cu_seqlens_k_logical,
         config)
 
     dq_out, dk_out, dv_out, sd_out, dbias_expanded = results
@@ -367,32 +502,6 @@ def mha_bwd_unified(dout, q, k, v, out, lse, dropout_p, softmax_scale,
 # ---------------------------------------------------------------------------
 # Simplified forward/backward dispatch (no can_impl_* logic)
 # ---------------------------------------------------------------------------
-
-def _asm_v3_bwd_eligible(sq, sk, hq, hk, dq, dropout_p, causal, wl, wr,
-                         bias, alibi_slopes):
-    """True when gfx950 should use ASM v3 bwd (faster path for hd64/hd128)."""
-    if get_gfx() != "gfx950":
-        return False
-    if dq not in (64, 128) or dq % 8 != 0:
-        return False
-    if hq % hk != 0:
-        return False
-    if dropout_p > 0:
-        return False
-    if bias is not None and bias.size > 0:
-        return False
-    if alibi_slopes is not None and alibi_slopes.size > 0:
-        return False
-    swa = (wl > 0) or (wr >= 0 and wr != -1)
-    if swa:
-        return False
-    if causal and sq > sk:
-        return False
-    # ASM hd128 decode (sq=1, long KV) produces NaN dk after JAX gemm autotune.
-    if sq == 1 and sk > 256 and dq == 128:
-        return False
-    return True
-
 
 def _flash_attn_forward(q, k, v, dropout_p, softmax_scale, causal,
                         wl, wr, bias, alibi_slopes,
@@ -419,36 +528,22 @@ def _flash_attn_backward(dout, q, k, v, out, lse,
     _, sq, hq, dq = q.shape
     _, sk, hk, _ = k.shape
 
-    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
-
-    # v3 eligibility: exclude known-broken configs.
     swa = (wl > 0) or (wr >= 0 and wr != -1)
-    use_v3 = True
-    if dropout_p > 0:
-        use_v3 = False
-    if bias is not None and bias.size > 0:
-        use_v3 = False
-    if swa:
-        use_v3 = False
-    if causal and get_gfx() == "gfx950" and sq > sk:
-        use_v3 = False
-
-    # gfx950 1-block: sk<=256, hd in (64,128] → non-atomic ASM v3 bwd kernels.
+    # gfx950 1-block override: sk<=256 with hd in (64,128]
     is_950_1block = (
         get_gfx() == "gfx950" and sk <= 256
         and dq > 64 and dq <= 128 and dq % 8 == 0
     )
-    asm_bwd = _asm_v3_bwd_eligible(
-        sq, sk, hq, hk, dq, dropout_p, causal, wl, wr, bias, alibi_slopes)
-    if asm_bwd:
-        # ASM v3 bwd rejects is_deterministic.
-        bwd_det = False
-        use_v3_bwd = use_v3
-        bwd_atomic = False if is_950_1block else use_v3_bwd
-    else:
-        bwd_det = deterministic
-        use_v3_bwd = use_v3
-        bwd_atomic = use_v3_bwd
+    hard_block = (
+        dropout_p > 0
+        or (bias is not None and bias.size > 0)
+        or swa
+        or is_950_1block
+    )
+    suspect_block = causal and get_gfx() == "gfx950" and sq > sk
+
+    bwd_det = False if is_950_1block else deterministic
+    use_v3_bwd, bwd_atomic, bf16_cvt = _resolve_bwd_dispatch(hard_block, suspect_block)
 
     results = mha_bwd_unified(
         dout, q, k, v, out, lse,
@@ -576,6 +671,7 @@ def _flash_attn_func_fwd(q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
         q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
 
+    out_p, lse, rng_state = _tag_context(out_p, lse, rng_state)
     out = out_p[..., :hd_v_og]
     result = [out]
     if return_lse:
@@ -623,13 +719,15 @@ flash_attn_func.defvjp(_flash_attn_func_fwd, _flash_attn_func_bwd)
 # Varlen public API: flash_attn_varlen with custom_vjp
 # ---------------------------------------------------------------------------
 
-@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17))
 def flash_attn_varlen(
     q: jnp.ndarray,              # [total_q, nheads, headdim]
     k: jnp.ndarray,              # [total_k, nheads_k, headdim]
     v: jnp.ndarray,              # [total_k, nheads_k, headdim_v]
     cu_seqlens_q: jnp.ndarray,   # [batch_size + 1]
     cu_seqlens_k: jnp.ndarray,   # [batch_size + 1]
+    cu_seqlens_q_logical: Optional[jnp.ndarray] = None,
+    cu_seqlens_k_logical: Optional[jnp.ndarray] = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
     dropout_p: float = 0.0,
@@ -645,11 +743,18 @@ def flash_attn_varlen(
     """Variable-length flash attention using packed sequences.
 
     Args:
-        q: [total_q, nheads, headdim] packed query tokens. May be fp8.
-        k: [total_k, nheads_k, headdim] packed key tokens. Same dtype as q.
-        v: [total_k, nheads_k, headdim_v] packed value tokens. Same dtype as q.
-        cu_seqlens_q: [batch_size+1] cumulative sequence lengths for Q.
-        cu_seqlens_k: [batch_size+1] cumulative sequence lengths for K.
+        q: [total_q, nheads, headdim] packed query tokens.
+        k: [total_k, nheads_k, headdim] packed key tokens.
+        v: [total_k, nheads_k, headdim_v] packed value tokens.
+        cu_seqlens_q: [batch_size+1] cumulative *physical* Q offsets, i.e.
+            including any inter-segment padding (AITER ``seqstart_q_ptr``).
+        cu_seqlens_k: [batch_size+1] cumulative physical KV offsets.
+        cu_seqlens_q_logical: optional [batch_size+1] cumulative *logical* Q
+            lengths, excluding padding (AITER ``cu_seqlen_q_ptr``). Required
+            whenever the physical spans contain padding; leave ``None`` for
+            tightly packed inputs.
+        cu_seqlens_k_logical: optional [batch_size+1] cumulative logical KV
+            lengths.
         max_seqlen_q: Maximum query sequence length.
         max_seqlen_k: Maximum key sequence length.
         q_descale: fp32 descale for q, shape [1] or [batch, nheads_k] (fp8 only).
@@ -681,6 +786,9 @@ def flash_attn_varlen(
         return_lse=return_lse, return_softmax=False,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        zero_tensors=_zero_pad(cu_seqlens_q_logical),
+        cu_seqlens_q_logical=cu_seqlens_q_logical,
+        cu_seqlens_kv_logical=cu_seqlens_k_logical,
         q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
 
     out = out_p[..., :hd_v_og]
@@ -690,6 +798,7 @@ def flash_attn_varlen(
 
 
 def _flash_attn_varlen_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                           cu_seqlens_q_logical, cu_seqlens_k_logical,
                            max_seqlen_q, max_seqlen_k, dropout_p,
                            softmax_scale, causal, window_size,
                            deterministic, return_lse,
@@ -716,13 +825,18 @@ def _flash_attn_varlen_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
         return_lse=True, return_softmax=False,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        zero_tensors=_zero_pad(cu_seqlens_q_logical),
+        cu_seqlens_q_logical=cu_seqlens_q_logical,
+        cu_seqlens_kv_logical=cu_seqlens_k_logical,
         q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
 
+    out_p, lse, rng_state = _tag_context(out_p, lse, rng_state)
     out = out_p[..., :hd_v_og]
     result = (out, lse) if return_lse else (out,)
 
     residuals = (q_p, k_p, v_p, out_p, lse, rng_state,
                  cu_seqlens_q, cu_seqlens_k,
+                 cu_seqlens_q_logical, cu_seqlens_k_logical,
                  dropout_p, softmax_scale, causal, (wl, wr),
                  deterministic, hd_q_og, hd_v_og,
                  max_seqlen_q, max_seqlen_k)
@@ -735,7 +849,8 @@ def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
                            q_descale, k_descale, v_descale,
                            residuals, grad_outputs):
     (q_p, k_p, v_p, out_p, lse, rng_state,
-     cu_sq, cu_sk, res_dp, res_scale, res_causal, res_ws,
+     cu_sq, cu_sk, cu_sq_log, cu_sk_log,
+     res_dp, res_scale, res_causal, res_ws,
      res_det, hd_q_og, hd_v_og,
      res_max_sq, res_max_sk) = residuals
 
@@ -747,30 +862,11 @@ def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
     _, _, hq, dq = q_p.shape if q_p.ndim == 4 else (None, None, q_p.shape[1], q_p.shape[2])
     hk = k_p.shape[1] if k_p.ndim == 3 else k_p.shape[2]
 
-    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
-
     swa = (window_size[0] > 0) or (window_size[1] >= 0 and window_size[1] != -1)
-    use_v3 = True
-    if res_dp > 0:
-        use_v3 = False
-    if swa:
-        use_v3 = False
-    if causal and get_gfx() == "gfx950" and max_seqlen_k > 256:
-        use_v3 = False
-
-    dq_dim = q_p.shape[-1]
-    is_950_1block = (
-        get_gfx() == "gfx950" and max_seqlen_k <= 256
-        and dq_dim > 64 and dq_dim <= 128 and dq_dim % 8 == 0
-    )
-    asm_bwd = _asm_v3_bwd_eligible(
-        max_seqlen_q, max_seqlen_k, hq, hk, dq_dim, res_dp, res_causal,
-        res_ws[0], res_ws[1], None, None)
-    if asm_bwd:
-        res_det = False
-        bwd_atomic = False if is_950_1block else use_v3
-    else:
-        bwd_atomic = use_v3
+    hard_block = res_dp > 0 or swa
+    # The causal/gfx950/max_seqlen_k>256 block was retested on v0.1.19 and
+    # cleared; see the dispatch notes above.
+    use_v3, bwd_atomic, bf16_cvt = _resolve_bwd_dispatch(hard_block, suspect_block=False)
 
     results = mha_bwd_unified(
         dout, q_p, k_p, v_p, out_p, lse,
@@ -778,13 +874,92 @@ def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
         res_det, use_v3, bwd_atomic, bf16_cvt,
         rng_state=rng_state,
         cu_seqlens_q=cu_sq, cu_seqlens_k=cu_sk,
-        max_seqlen_q=res_max_sq, max_seqlen_k=res_max_sk)
+        max_seqlen_q=res_max_sq, max_seqlen_k=res_max_sk,
+        zero_tensors=_zero_pad(cu_sq_log),
+        cu_seqlens_q_logical=cu_sq_log, cu_seqlens_k_logical=cu_sk_log)
 
     dq = results[0][..., :hd_q_og]
     dk = results[1][..., :hd_q_og]
     dv = results[2][..., :hd_v_og]
 
-    return (dq, dk, dv, None, None)
+    return (dq, dk, dv, None, None, None, None)
 
 
 flash_attn_varlen.defvjp(_flash_attn_varlen_fwd, _flash_attn_varlen_bwd)
+
+
+# ---------------------------------------------------------------------------
+# Raw varlen (NO custom_partitioning) for use INSIDE shard_map.
+# custom_partitioning + shard_map (manual mode) conflict; under shard_map each
+# device already holds a fully-local shard, so we call the raw FFI ops directly
+# (ops.mha_fwd/mha_bwd = aiter::mha_fwd/bwd) with the device-LOCAL cu_seqlens.
+# Same kernel as flash_attn_varlen, just without the global partitioner.
+# ---------------------------------------------------------------------------
+
+@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12))
+def flash_attn_varlen_raw(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                          cu_seqlens_q_logical, cu_seqlens_k_logical,
+                          max_seqlen_q, max_seqlen_k,
+                          dropout_p, softmax_scale, causal, window_size):
+    """Varlen attention over a device-local shard, without custom_partitioning.
+
+    ``cu_seqlens_*`` are cumulative **physical** offsets (AITER
+    ``seqstart_*_ptr``); ``cu_seqlens_*_logical`` are cumulative **logical**
+    lengths excluding padding (AITER ``cu_seqlen_*_ptr``). Pass ``None`` for the
+    logical pair when the packing carries no padding, which is AITER's
+    "group mode without padding" contract (``mha_fwd.h`` sequence-pointer
+    notes).
+    """
+    out, _ = _favr_fwd(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                       cu_seqlens_q_logical, cu_seqlens_k_logical,
+                       max_seqlen_q, max_seqlen_k,
+                       dropout_p, softmax_scale, causal, window_size)
+    return out
+
+
+def _favr_fwd(q, k, v, cu_q, cu_k, cu_q_log, cu_k_log, max_sq, max_sk,
+              dropout_p, softmax_scale, causal, window_size):
+    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
+    wl, wr = window_size
+    cfg = MhaFwdConfig(
+        dropout_p=float(dropout_p), softmax_scale=float(softmax_scale),
+        is_causal=causal, wl=int(wl), wr=int(wr),
+        return_lse=True, return_randval=False,
+        use_asm_v3=True, how_v3_bf16_cvt=int(bf16_cvt),
+        max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk), min_seqlen_q=0,
+        logits_soft_cap=0.0, zero_tensors=_zero_pad(cu_q_log),
+        cp_axis=None, cp_size=1, cp_load_balanced=True)
+    cu_q_log = _empty(jnp.int32) if cu_q_log is None else cu_q_log
+    cu_k_log = _empty(jnp.int32) if cu_k_log is None else cu_k_log
+    out, lse, _p, rng = _mha_fwd_raw(
+        q, k, v, cu_q, cu_k, _empty(q.dtype), _empty(q.dtype),
+        _empty(jnp.float32), _empty(jnp.int64), cu_q_log, cu_k_log, cfg)
+    out, lse, rng = _tag_context(out, lse, rng)
+    return out, (q, k, v, out, lse, rng, cu_q, cu_k, cu_q_log, cu_k_log)
+
+
+def _favr_bwd(max_sq, max_sk, dropout_p, softmax_scale, causal, window_size,
+              res, dout):
+    q, k, v, out, lse, rng, cu_q, cu_k, cu_q_log, cu_k_log = res
+    wl, wr = window_size
+    swa = (wl > 0) or (wr >= 0 and wr != -1)
+    hard_block = dropout_p > 0 or swa
+    # The causal/gfx950/max_seqlen_k>256 block was retested on v0.1.19 and
+    # cleared; see the dispatch notes above.
+    use_v3, bwd_atomic, bf16_cvt = _resolve_bwd_dispatch(hard_block, suspect_block=False)
+    cfg = MhaBwdConfig(
+        dropout_p=float(dropout_p), softmax_scale=float(softmax_scale),
+        is_causal=causal, wl=int(wl), wr=int(wr), deterministic=False,
+        use_asm_v3=use_v3, is_v3_atomic_fp32=bwd_atomic, how_v3_bf16_cvt=int(bf16_cvt),
+        max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk),
+        zero_tensors=_zero_pad(cu_q_log),
+        cp_axis=None, cp_size=1, cp_load_balanced=True)
+    dq, dk, dv, _sd, _db = _mha_bwd_raw(
+        dout, q, k, v, out, lse, cu_q, cu_k,
+        _empty(q.dtype), _empty(q.dtype), _empty(q.dtype),
+        _empty(q.dtype), _empty(jnp.float32), rng, _empty(jnp.int64),
+        cu_q_log, cu_k_log, cfg)
+    return (dq, dk, dv, None, None, None, None)
+
+
+flash_attn_varlen_raw.defvjp(_favr_fwd, _favr_bwd)

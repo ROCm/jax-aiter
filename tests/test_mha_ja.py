@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from jax_aiter.mha import flash_attn_func, flash_attn_varlen
+from jax_aiter.mha.mha import _tag_context
 from jax_aiter.ja_compat.chip_info import get_gfx
 
 
@@ -236,10 +237,18 @@ VARLEN_CONFIGS = [
 # BATCH FORWARD TESTS
 # ===========================================================================
 
+@pytest.mark.slow
 @pytest.mark.parametrize("b,sq,sk,hq,hk,d,dtype", BATCH_CORE)
 @pytest.mark.parametrize("causal", [False, True], ids=["nomask", "causal"])
 def test_batch_fwd_shape(b, sq, sk, hq, hk, d, dtype, causal):
-    """Forward: correct shape, dtype, finite values for all configs."""
+    """Forward: correct shape, dtype, finite values for all configs.
+
+    Nightly only. 25 configs x 2 causal is the largest block in the suite, and
+    what it checks is covered on the PR path from several directions:
+    test_batch_fwd_accuracy over the same configs, test_padded_head_dim_fwd
+    across d=32..256, and TestRegressions for GQA/MQA routing and off-by-one
+    seqlens. This sweep earns its keep by breadth, which is a nightly job.
+    """
     q, k_t, v = make_qkv(b, sq, sk, hq, hk, d, dtype)
     out = run_fwd(q, k_t, v, causal=causal)
     assert out.shape == (b, sq, hq, d)
@@ -262,10 +271,11 @@ def test_batch_fwd_accuracy(b, sq, sk, hq, hk, d, dtype, causal):
 # BATCH BACKWARD TESTS
 # ===========================================================================
 
+@pytest.mark.slow
 @pytest.mark.parametrize("b,sq,sk,hq,hk,d,dtype", BATCH_CORE)
 @pytest.mark.parametrize("causal", [False, True], ids=["nomask", "causal"])
 def test_batch_bwd_shape(b, sq, sk, hq, hk, d, dtype, causal):
-    """Backward: gradient shapes, dtypes, finiteness."""
+    """Backward: gradient shapes, dtypes, finiteness. Nightly only, as above."""
     q, k_t, v = make_qkv(b, sq, sk, hq, hk, d, dtype, seed=1)
     dq, dk, dv = run_bwd(q, k_t, v, causal=causal)
     assert dq.shape == q.shape, f"dq {dq.shape} != {q.shape}"
@@ -277,17 +287,18 @@ def test_batch_bwd_shape(b, sq, sk, hq, hk, d, dtype, causal):
     assert jnp.all(jnp.isfinite(dv)), "dv NaN/Inf"
 
 
-_BWD_XFAIL_DIMS = {96, 111, 128}
-
 @pytest.mark.parametrize("b,sq,sk,hq,hk,d,dtype", BATCH_ACCURACY)
 def test_batch_bwd_accuracy(b, sq, sk, hq, hk, d, dtype):
     """Backward accuracy: gradients vs JAX reference (10x relaxed tolerance).
 
-    Head dims >= 96 are xfailed due to known CK/ASM backward accuracy
-    limitations on gfx950 (large dq errors at these dims).
+    Head dims 96 / 111 / 128 used to be xfailed here for a CK/ASM backward
+    accuracy limitation on gfx950, via an imperative pytest.xfail() that skipped
+    the body outright. With the body actually running, all of them pass -- 5/5
+    XPASS, stable over three repeats despite the backward's atomics -- so the
+    limitation no longer holds on this stack and the exemption is gone. The
+    varlen max_sk>256 xfails in TestRegressions are a different code path and
+    still stand.
     """
-    if d in _BWD_XFAIL_DIMS:
-        pytest.xfail(f"Known backward accuracy issue for d={d} on gfx950")
     q, k_t, v = make_qkv(b, sq, sk, hq, hk, d, dtype, seed=2)
     scale = d ** (-0.5)
     bwd_kw = _bwd_kwargs_for_config(
@@ -552,6 +563,298 @@ def test_many_heads():
 
 
 # ===========================================================================
+# PADDED GROUP MODE (physical seqstart + logical cu_seqlen)
+# ===========================================================================
+#
+# AITER's group mode takes two arrays when the packing contains padding
+# (mha_fwd.h / mha_bwd.h sequence-pointer notes): seqstart_* are cumulative
+# PHYSICAL offsets and cu_seqlen_* are cumulative LOGICAL lengths. Supplying
+# only the physical array claims every physical token is real, so a framework
+# that keeps its segments at fixed offsets would attend into the padding. TE
+# passes both; these tests pin the same behaviour for jax-aiter.
+
+def _padded_layout(rows, row_len, seg_lens):
+    """Segments at fixed row offsets, each followed by padding.
+
+    Returns ``(seqstart, cu_seqlen, real_index)`` where ``real_index`` lists the
+    token positions that carry actual data.
+    """
+    total = rows * row_len
+    seqstart, lengths, real_index = [], [], []
+    for r in range(rows):
+        off = r * row_len
+        for ln in seg_lens[r]:
+            seqstart.append(off)
+            lengths.append(ln)
+            real_index.extend(range(off, off + ln))
+            off += ln
+        # Remaining tokens in the row are padding, owned by the last segment's
+        # physical span.
+    seqstart.append(total)
+    cu = [0]
+    for ln in lengths:
+        cu.append(cu[-1] + ln)
+    return (
+        jnp.array(seqstart, jnp.int32),
+        jnp.array(cu, jnp.int32),
+        jnp.array(real_index, jnp.int32),
+    )
+
+
+def _segment_ref(q, k, v, seqstart, cu_seqlen, scale):
+    """FP32 per-segment causal attention over the logical tokens only."""
+    seqstart = np.asarray(seqstart)
+    cu = np.asarray(cu_seqlen)
+    out = np.zeros(q.shape[:1] + q.shape[1:2] + v.shape[2:], dtype=np.float32)
+    q32 = np.asarray(q, dtype=np.float32)
+    k32 = np.asarray(k, dtype=np.float32)
+    v32 = np.asarray(v, dtype=np.float32)
+    hq, hk = q.shape[1], k.shape[1]
+    ratio = hq // hk
+    for i in range(len(cu) - 1):
+        ln = int(cu[i + 1] - cu[i])
+        if ln == 0:
+            continue
+        beg = int(seqstart[i])
+        sl = slice(beg, beg + ln)
+        for h in range(hq):
+            logits = q32[sl, h] @ k32[sl, h // ratio].T * scale
+            mask = np.tril(np.ones((ln, ln), dtype=bool))
+            logits = np.where(mask, logits, -np.inf)
+            probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs /= probs.sum(axis=-1, keepdims=True)
+            out[sl, h] = probs @ v32[sl, h // ratio]
+    return out
+
+
+class TestPaddedGroupMode:
+    """Physical/logical metadata pair for packed sequences with padding."""
+
+    ROWS, ROW_LEN, HQ, HK, D = 2, 256, 4, 4, 64
+    SEG_LENS = [[100, 56], [200]]  # each row keeps trailing padding
+
+    def _inputs(self, seed=50):
+        n = self.ROWS * self.ROW_LEN
+        key = jax.random.PRNGKey(seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        q = jax.random.normal(k1, (n, self.HQ, self.D), jnp.float32).astype(jnp.bfloat16)
+        k_t = jax.random.normal(k2, (n, self.HK, self.D), jnp.float32).astype(jnp.bfloat16)
+        v = jax.random.normal(k3, (n, self.HK, self.D), jnp.float32).astype(jnp.bfloat16)
+        dout = jax.random.normal(k4, (n, self.HQ, self.D), jnp.float32).astype(jnp.bfloat16)
+        return q, k_t, v, dout
+
+    def test_padding_is_not_attended(self):
+        """Logical lengths must exclude the padding tail from the softmax."""
+        q, k_t, v, _ = self._inputs()
+        seqstart, cu, real = _padded_layout(self.ROWS, self.ROW_LEN, self.SEG_LENS)
+        scale = self.D ** -0.5
+
+        out = flash_attn_varlen(
+            q, k_t, v, seqstart, seqstart,
+            cu_seqlens_q_logical=cu, cu_seqlens_k_logical=cu,
+            max_seqlen_q=self.ROW_LEN, max_seqlen_k=self.ROW_LEN,
+            softmax_scale=scale, causal=True,
+        )[0]
+
+        ref = _segment_ref(q, k_t, v, seqstart, cu, scale)
+        got = np.asarray(out.astype(jnp.float32))[np.asarray(real)]
+        exp = ref[np.asarray(real)]
+        rel = np.linalg.norm(got - exp) / max(np.linalg.norm(exp), 1e-30)
+        assert rel < 2e-2, f"padded group-mode output rel_l2={rel:.6f}"
+
+    def test_padded_matches_tight_packing(self):
+        """Same logical tokens, tight vs padded layout: same attention result."""
+        q, k_t, v, _ = self._inputs()
+        seqstart, cu, real = _padded_layout(self.ROWS, self.ROW_LEN, self.SEG_LENS)
+        scale = self.D ** -0.5
+
+        padded = flash_attn_varlen(
+            q, k_t, v, seqstart, seqstart,
+            cu_seqlens_q_logical=cu, cu_seqlens_k_logical=cu,
+            max_seqlen_q=self.ROW_LEN, max_seqlen_k=self.ROW_LEN,
+            softmax_scale=scale, causal=True,
+        )[0]
+
+        # Gather the real tokens into a contiguous buffer and describe it without
+        # any padding, which needs the physical array only.
+        real_np = np.asarray(real)
+        qt, kt, vt = q[real_np], k_t[real_np], v[real_np]
+        tight = flash_attn_varlen(
+            qt, kt, vt, cu, cu,
+            max_seqlen_q=self.ROW_LEN, max_seqlen_k=self.ROW_LEN,
+            softmax_scale=scale, causal=True,
+        )[0]
+
+        a = np.asarray(padded.astype(jnp.float32))[real_np]
+        b = np.asarray(tight.astype(jnp.float32))
+        rel = np.linalg.norm(a - b) / max(np.linalg.norm(b), 1e-30)
+        assert rel < 1e-2, f"padded vs tight rel_l2={rel:.6f}"
+
+    def test_padded_backward_is_finite_and_padding_free(self):
+        """Backward runs in padded group mode and leaves padding gradients at 0."""
+        q, k_t, v, dout = self._inputs(seed=51)
+        seqstart, cu, real = _padded_layout(self.ROWS, self.ROW_LEN, self.SEG_LENS)
+        scale = self.D ** -0.5
+
+        def loss(q_, k_, v_):
+            out = flash_attn_varlen(
+                q_, k_, v_, seqstart, seqstart,
+                cu_seqlens_q_logical=cu, cu_seqlens_k_logical=cu,
+                max_seqlen_q=self.ROW_LEN, max_seqlen_k=self.ROW_LEN,
+                softmax_scale=scale, causal=True,
+            )[0]
+            return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32))
+
+        dq, dk, dv = jax.grad(loss, argnums=(0, 1, 2))(q, k_t, v)
+        for name, g in (("dq", dq), ("dk", dk), ("dv", dv)):
+            assert jnp.all(jnp.isfinite(g)), f"{name} not finite"
+
+        # Padding rows contribute to no segment, so their gradient stays zero.
+        n = self.ROWS * self.ROW_LEN
+        pad = np.setdiff1d(np.arange(n), np.asarray(real))
+        assert pad.size > 0
+        for name, g in (("dq", dq), ("dk", dk), ("dv", dv)):
+            pad_max = float(jnp.max(jnp.abs(g.astype(jnp.float32)[pad])))
+            assert pad_max == 0.0, f"{name} nonzero on padding: {pad_max}"
+
+
+# ===========================================================================
+# FUSED GQA dK/dV REDUCTION
+# ===========================================================================
+
+class TestFusedGqaReduction:
+    """One-pass dK+dV reduction must match the prior two-launch path."""
+
+    @staticmethod
+    def _inputs(seed=70):
+        n, hq, hk, d = 512, 8, 2, 64
+        key = jax.random.PRNGKey(seed)
+        kq, kk, kv, kd = jax.random.split(key, 4)
+        q = jax.random.normal(kq, (n, hq, d), jnp.float32).astype(jnp.bfloat16)
+        k_t = jax.random.normal(kk, (n, hk, d), jnp.float32).astype(jnp.bfloat16)
+        v = jax.random.normal(kv, (n, hk, d), jnp.float32).astype(jnp.bfloat16)
+        dout = jax.random.normal(kd, (n, hq, d), jnp.float32).astype(jnp.bfloat16)
+        return q, k_t, v, dout
+
+    @staticmethod
+    def _grad_fn(seqstart, cu_logical=None):
+        d = 64
+
+        def loss(q, k_t, v, dout):
+            out = flash_attn_varlen(
+                q, k_t, v, seqstart, seqstart,
+                cu_seqlens_q_logical=cu_logical,
+                cu_seqlens_k_logical=cu_logical,
+                max_seqlen_q=256, max_seqlen_k=256,
+                softmax_scale=d ** -0.5, causal=True,
+            )[0]
+            return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32))
+
+        return jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+
+    def test_fused_pair_is_bitwise_equal_to_separate_reductions(self, monkeypatch):
+        q, k_t, v, dout = self._inputs()
+        cu = jnp.array([0, 256, 512], jnp.int32)
+        grad = self._grad_fn(cu)
+
+        monkeypatch.setenv("JA_MHA_FUSE_GQA_REDUCE", "0")
+        separate = jax.block_until_ready(grad(q, k_t, v, dout))
+        monkeypatch.setenv("JA_MHA_FUSE_GQA_REDUCE", "1")
+        fused = jax.block_until_ready(grad(q, k_t, v, dout))
+
+        for name, actual, expected in zip(("dq", "dk", "dv"), fused, separate):
+            np.testing.assert_array_equal(
+                np.asarray(actual), np.asarray(expected),
+                err_msg=f"{name}: fused reduction differs from separate path",
+            )
+
+    def test_fused_pair_preserves_zero_padding_gradients(self, monkeypatch):
+        q, k_t, v, dout = self._inputs(seed=71)
+        # Two physical rows of 256 tokens, with logical lengths 128 and 192.
+        seqstart = jnp.array([0, 256, 512], jnp.int32)
+        cu_logical = jnp.array([0, 128, 320], jnp.int32)
+        grad = self._grad_fn(seqstart, cu_logical)
+        monkeypatch.setenv("JA_MHA_FUSE_GQA_REDUCE", "1")
+        dq, dk, dv = jax.block_until_ready(grad(q, k_t, v, dout))
+
+        pad = np.concatenate([np.arange(128, 256), np.arange(448, 512)])
+        for name, g in (("dq", dq), ("dk", dk), ("dv", dv)):
+            assert jnp.all(jnp.isfinite(g)), f"{name} not finite"
+            pad_max = float(jnp.max(jnp.abs(g.astype(jnp.float32)[pad])))
+            assert pad_max == 0.0, f"{name} nonzero on padding: {pad_max}"
+
+
+# ===========================================================================
+# REMAT TAGGING
+# ===========================================================================
+#
+# MaxText's `minimal_with_context` / `minimal_flash` /
+# `minimal_flash_save_fp4col` policies save the checkpoint name "context", which
+# is what TE tags its attention output, LSE and RNG state with. We tag the same
+# values so the two backends describe their residuals identically to the same
+# policy.
+#
+# The stable contract is the checkpoint name. Exact custom_vjp recomputation
+# counts are a JAX implementation detail: JAX 0.9 traces a second forward under
+# some policies while the supported JAX 0.11 stack does not.
+
+class TestRematContextTag:
+    """Context naming and remat policies preserve a valid custom_vjp graph."""
+
+    @staticmethod
+    def _grad_jaxpr(policy):
+        n, hq, hk, d = 256, 4, 4, 64
+        key = jax.random.PRNGKey(60)
+        k1, k2, k3 = jax.random.split(key, 3)
+        q = jax.random.normal(k1, (n, hq, d), jnp.float32).astype(jnp.bfloat16)
+        k_t = jax.random.normal(k2, (n, hk, d), jnp.float32).astype(jnp.bfloat16)
+        v = jax.random.normal(k3, (n, hk, d), jnp.float32).astype(jnp.bfloat16)
+        cu = jnp.array([0, 128, n], jnp.int32)
+
+        def f(q_, k_, v_):
+            out = flash_attn_varlen(
+                q_, k_, v_, cu, cu,
+                max_seqlen_q=128, max_seqlen_k=128,
+                softmax_scale=d ** -0.5, causal=True,
+            )[0]
+            return jnp.sum(out.astype(jnp.float32))
+
+        wrapped = jax.checkpoint(f, policy=policy)
+        return str(
+            jax.make_jaxpr(jax.grad(wrapped, argnums=(0, 1, 2)))(q, k_t, v)
+        )
+
+    @pytest.mark.parametrize(
+        "enabled,expected",
+        [("1", True), ("0", False)],
+        ids=["tagged", "untagged"],
+    )
+    def test_context_checkpoint_name_contract(self, monkeypatch, enabled, expected):
+        monkeypatch.setenv("JA_MHA_REMAT_CONTEXT", enabled)
+        jaxpr = str(
+            jax.make_jaxpr(lambda x: _tag_context(x))(
+                jnp.ones((2,), jnp.float32)
+            )
+        )
+        assert ("name=context" in jaxpr) is expected
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            jax.checkpoint_policies.save_only_these_names("context"),
+            jax.checkpoint_policies.nothing_saveable,
+            jax.checkpoint_policies.everything_saveable,
+        ],
+        ids=["save-context", "nothing", "everything"],
+    )
+    def test_remat_policy_keeps_valid_forward_and_backward(self, monkeypatch, policy):
+        monkeypatch.setenv("JA_MHA_REMAT_CONTEXT", "1")
+        jaxpr = self._grad_jaxpr(policy)
+        assert jaxpr.count("MhaFwdUnifiedJA") >= 1
+        assert jaxpr.count("MhaBwdUnifiedJA") == 1
+
+
+# ===========================================================================
 # REGRESSION GUARDS — every historical bug from AITER bump
 # ===========================================================================
 
@@ -584,12 +887,14 @@ class TestRegressions:
             assert jnp.all(jnp.isfinite(dk))
             assert jnp.all(jnp.isfinite(dv))
 
-    @pytest.mark.parametrize("d", [
-        pytest.param(96, marks=pytest.mark.xfail(reason="gfx950 CK varlen bwd causal max_sk>256 kernel issue")),
-        pytest.param(128, marks=pytest.mark.xfail(reason="gfx950 CK varlen bwd causal max_sk>256 kernel issue")),
-    ], ids=["d96", "d128"])
+    @pytest.mark.parametrize("d", [96, 128], ids=["d96", "d128"])
     def test_varlen_large_sk_causal(self, d):
-        """c5bc2e2: varlen max_sk>256 causal d>=96 on gfx950."""
+        """c5bc2e2: varlen max_sk>256 causal d>=96 stays finite on gfx950.
+
+        These were xfailed for an older kernel issue, but both cases now XPASS
+        consistently (three repeats). Keep them as ordinary regression guards
+        so a recurrence fails CI instead of being hidden by a stale exemption.
+        """
         q, k_t, v, cu_sq, cu_sk, msq, msk = make_varlen(4, 512, 512, 4, 4, d, jnp.bfloat16, seed=43)
         dq, dk, dv = run_varlen_bwd(q, k_t, v, cu_sq, cu_sk, msq, msk, causal=True)
         assert jnp.all(jnp.isfinite(dq)), f"d={d}: varlen dq NaN"

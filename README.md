@@ -1,214 +1,210 @@
-# jax-aiter
+# JAX-AITER
 
-![Nightly](https://img.shields.io/github/actions/workflow/status/rocm/jax-aiter/nightly-ci.yml?branch=main&label=nightly&logo=github)
-![CI](https://img.shields.io/github/actions/workflow/status/rocm/jax-aiter/ci.yml?branch=main&label=ci&logo=github)
+![Nightly](https://img.shields.io/github/actions/workflow/status/ROCm/jax-aiter/nightly-ci.yml?branch=main&label=nightly&logo=github)
+![CI](https://img.shields.io/github/actions/workflow/status/ROCm/jax-aiter/ci.yml?branch=main&label=ci&logo=github)
 ![License](https://img.shields.io/github/license/ROCm/jax-aiter)
 
-<img width="256" height="391" alt="jax-aiter-github" src="https://github.com/user-attachments/assets/b30ac891-ce50-4cff-8074-8a42f46ee111" />
+JAX-AITER exposes selected
+[AITER](https://github.com/ROCm/aiter) GPU kernels to JAX through XLA FFI.
+The public APIs are JAX functions with `custom_vjp` and sharding rules for
+training. PyTorch is not a runtime dependency.
 
-JAX-AITER integrates AMD's [AITER](https://github.com/ROCm/aiter) operator library into JAX via XLA FFI, bringing high-performance GPU kernels to JAX on ROCm. No PyTorch dependency at runtime.
+Alpha2 targets one tested stack:
 
-Python 3.12 required. ROCm 7.2+.
+| Component | Supported version |
+|---|---|
+| GPU | AMD Instinct MI355X (`gfx950`) |
+| ROCm | TheRock 7.14 GA |
+| Python | 3.12 |
+| JAX / `jaxlib` | 0.11.0 |
+| ROCm plugin / PJRT | 0.11.0.post1 |
 
-## What is AITER?
+`gfx942` is not included in alpha2 because no available CI runner can test it.
 
-**AITER** (AI Tensor Engine for ROCm) is AMD's centralized library of AI operators optimized for ROCm GPUs (MI300, MI350). It provides hand-tuned CK (Composable Kernel) and ASM kernels for attention, normalization, activations, GEMM, and more.
+## Install
 
-**JAX-AITER** provides:
+### 1. Start from TheRock 7.14 GA
 
-- **JAX-native API.** Operators exposed as JAX functions with `custom_vjp` gradient wiring.
-- **Zero-copy FFI.** GPU buffers passed directly between JAX and AITER via XLA FFI.
-- **Training-ready.** Gradients flow through AITER kernels for end-to-end training.
-- **No torch dependency.** Pure JAX + AITER at runtime.
+The runtime-only image is enough for wheel users:
 
-## Supported ops
+```bash
+docker pull ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14
+docker run --rm -it \
+  --device=/dev/kfd --device=/dev/dri \
+  --ipc=host --shm-size=16G --group-add video \
+  --security-opt seccomp=unconfined \
+  ghcr.io/rocm/jax-base-ubu24.therock-7.14:7.14 bash
+```
 
-| Op | API | Forward | Backward | Notes |
-|----|-----|---------|----------|-------|
-| **FP4 GEMM (training)** | `gemm_fp4_bf16(a, b)` | AITER ASM (35 kernels) | AITER ASM dA + AITER ASM dB (FSDP-aware wgrad sharding) | BF16 in/out with `custom_vjp`. TE-parity MXFP4 recipe; beats native hipBLASLt FP8 by +14.7% at 8B and +6.0% at 70B (8x MI355X). |
-| MXFP4 Quantizer / Workspace | `MXFP4Quantizer`, `WeightWorkspace` | -- | -- | TE-parity object API. `MXFP4Quantizer.for_weight/for_activation/for_grad` + `WeightWorkspace.get_or_quantize(w, q, cache_name=...)`. |
-| Gate+Up fusion | `gemm_fp4_gate_up_bf16(x, w_gate, w_up)` | concat + single FP4 GEMM + split | automatic via inner `custom_vjp` | Saves 5 FFI dispatches per MLP. Opt-in; benchmark E2E before using. |
-| MXFP4 Cast | `CastMxfp4JA` / `CastMxfp4DualJA` | Fused HIP kernel | -- | BF16 to MXFP4 (E2M1 + E8M0 block scales) with transpose + shuffle. |
-| FP4 GEMM (low-level) | `gemm_fp4(a, b, a_scale, b_scale)` | AITER ASM | -- | Pre-quantized fp4x2 inputs with e8m0 block scales. |
-| BF16 GEMM (training) | `gemm(a, b)` | AITER ASM | AITER ASM dX + hipBLASLt dW | A[M,K] @ B[N,K]^T with `custom_vjp`. 24 hand-tuned kernels. |
-| Flash Attention | `flash_attn_func(q, k, v, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | MHA/MQA/GQA, causal, SWA, bias, ALiBi, dropout. |
-| Flash Attention (varlen) | `flash_attn_varlen(q, k, v, cu_sq, cu_sk, ...)` | AITER CK/ASM v3 | AITER CK/ASM v3 | Packed variable-length sequences. |
-| RMSNorm | `rms_norm(x, gamma, epsilon)` | AITER CK | JAX | Fused square, mean, rsqrt, scale. |
-| Fused Add+RMSNorm | `rms_norm_with_add(x, residual, gamma, epsilon)` | AITER CK | JAX | `y = rms_norm(x + residual) * gamma` in one kernel. |
-| SiLU-and-Mul | `silu_and_mul(x)` | AITER HIP | -- | Fused `silu(x[:half]) * x[half:]` activation. |
+TheRock packages ROCm through `rocm-sdk`; the image deliberately has no
+`/opt/rocm`.
 
-## Quick start
+### 2. Install JAX from PyPI
+
+JAX and `jaxlib` come from upstream PyPI. The ROCm plugin and PJRT wheels also
+come from PyPI and use the TheRock `jax_plugins.xla_rocm7` backend:
+
+```bash
+python3 -m pip install \
+  "jax==0.11.0" "jaxlib==0.11.0" \
+  "jax-rocm7-plugin==0.11.0.post1" "jax-rocm7-pjrt==0.11.0.post1"
+
+python3 -c "import jax; print(jax.devices())"
+```
+
+### 3. Install JAX-AITER
+
+Download a wheel from the
+[GitHub release](https://github.com/ROCm/jax-aiter/releases/tag/v0.1.0-alpha2).
+The `+full` wheel is recommended: it is complete on its own, with nothing to
+fetch afterwards.
+
+```bash
+python3 -m pip install \
+  ./jax_aiter-0.1.0a2+full-cp312-cp312-manylinux_2_39_x86_64.whl
+```
+
+Both wheels are `gfx950`-only. The `+full` wheel is roughly 433 MB and bundles
+the MHA JIT libraries. The plain `0.1.0a2` wheel is roughly 30 MB and omits
+them, so it needs `jax-aiter-fetch-mha` before flash attention works — prefer
+it when download or image size matters. PyPI publication is intentionally not
+automated yet; the release notes will state when `pip install
+jax-aiter==0.1.0a2` is available.
+
+Verify the basic install:
+
+```bash
+python3 - <<'PY'
+import jax
+from jax_aiter.gemm import gemm
+from jax_aiter.gemm_fp4 import gemm_fp4_bf16
+from jax_aiter.rmsnorm import rms_norm
+
+print("devices:", jax.devices())
+print("JAX-AITER imports: OK")
+PY
+```
+
+### 4. Add flash attention when needed
+
+Skip this step if you installed the `+full` wheel; it already bundles the MHA
+JIT libraries.
+
+The plain wheel omits those two libraries because they expand to multiple
+gigabytes. Download the matching, checksummed `gfx950` artifacts instead of
+compiling them:
+
+```bash
+jax-aiter-fetch-mha
+python3 -c "from jax_aiter.mha import flash_attn_func; print('MHA ready')"
+```
+
+The command installs into an immutable, versioned user-cache generation
+(`~/.cache/jax-aiter/0.1.0a2/<cache-id>/`) and verifies the wheel's embedded
+AITER, ROCm, architecture, and JIT-recipe identity plus compressed and
+extracted SHA-256 checksums. It does not write into system `site-packages`.
+
+## Quick API examples
 
 ```python
-from jax_aiter.gemm_fp4 import gemm_fp4_bf16
+import jax.numpy as jnp
+
+from jax_aiter.activation import silu_and_mul
 from jax_aiter.gemm import gemm
-from jax_aiter.mha import flash_attn_func
+from jax_aiter.gemm_fp4 import gemm_fp4_bf16
 from jax_aiter.rmsnorm import rms_norm, rms_norm_with_add
 
-# FP4 (MXFP4) GEMM: BF16 inputs, FP4 quantization + ASM GEMM, BF16 output.
-# Has custom_vjp for training. TE-parity recipe: FP4 fwd + FP4 dA +
-# FP4 dB (NT wgrad with FSDP-aware psum sharding). grad_out is cast with
-# Hadamard transform for tighter convergence.
-# Beats native hipBLASLt FP8 by +14.7% at 8B and +6.0% at 70B on 8x MI355X.
-out = gemm_fp4_bf16(activations, weights)
+# A[M,K] @ B[N,K]^T. Inputs and output are BF16.
+y_bf16 = gemm(a_bf16, b_bf16)
 
-# Object-oriented MXFP4 quantizer (TE-parity, opt-in).
-from jax_aiter.gemm_fp4 import MXFP4Quantizer, WeightWorkspace
-weight_q = MXFP4Quantizer.for_weight()
-w_fp4 = weight_q.quantize(w_bf16)            # Mxfp4Tensor(row + col + scales)
-ws = WeightWorkspace()
-w_fp4_cached = ws.get_or_quantize(w_bf16, weight_q, cache_name="mlp_gate")
+# BF16 inputs, MXFP4 casts and AITER FP4 GEMMs, BF16 output.
+# custom_vjp supplies FP4 dA and FP4 dB/wgrad.
+y_fp4 = gemm_fp4_bf16(a_bf16, b_bf16)
 
-# Gate+Up fusion: concat gate and up weights, one FP4 GEMM, split output.
-# Saves FFI dispatches; benchmark E2E before enabling in production.
-from jax_aiter.gemm_fp4 import gemm_fp4_gate_up_bf16
-gate, up = gemm_fp4_gate_up_bf16(x, w_gate, w_up)
+y_norm = rms_norm(x_bf16, gamma_bf16, epsilon=1e-6)
+y_fused, residual_out = rms_norm_with_add(
+    x_bf16, residual_bf16, gamma_bf16, epsilon=1e-6
+)
 
-# BF16 GEMM: A[M,K] @ B[N,K]^T using AITER hand-tuned ASM kernels.
-out = gemm(a, b)  # bf16 inputs, bf16 output, has custom_vjp for training.
+y_silu = silu_and_mul(jnp.concatenate([gate_bf16, up_bf16], axis=-1))
+```
 
-# Attention.
+With the `+full` wheel, or after `jax-aiter-fetch-mha` on the plain wheel:
+
+```python
+from jax_aiter.mha import flash_attn_func, flash_attn_varlen
+
 out = flash_attn_func(q, k, v, causal=True)
-
-# RMSNorm.
-y = rms_norm(x, gamma, epsilon=1e-6)
-
-# Fused residual add + RMSNorm (one kernel, one memory pass).
-y, residual_out = rms_norm_with_add(x, residual, gamma, epsilon=1e-6)
 ```
 
-## Option A: Install from wheel
+## Supported operations
+
+| Operation | Public API | Training behavior |
+|---|---|---|
+| BF16 GEMM | `gemm(a, b)` | AITER ASM forward and gradients |
+| MXFP4 GEMM | `gemm_fp4_bf16(a, b)` | FP4 forward, dA, and FSDP-aware dB/wgrad |
+| Pre-quantized FP4 GEMM | `gemm_fp4(...)` | Low-level forward |
+| MXFP4 quantization | `MXFP4Quantizer`, `WeightWorkspace` | Row/column layouts and weight caching |
+| Flash attention | `flash_attn_func`, `flash_attn_varlen` | Batch/varlen `custom_vjp`; optional download |
+| RMSNorm | `rms_norm`, `rms_norm_with_add` | AITER forward, JAX backward |
+| SiLU-and-Mul | `silu_and_mul` | Fused forward with `custom_vjp` |
+
+The MXFP4 backward path uses `GemmFp4FwdJA` for both gradients. The dB/wgrad
+partition contracts the FSDP-sharded batch axis and emits `jax.lax.psum`.
+
+## MaxText recipes
+
+- [Llama 3.1 8B MXFP4 training](docs/recipes/mxfp4_llama3_8b_maxtext.md)
+- Direct JAX-AITER attention is selected with `attention=aiter_flash`.
+- Set `aiter_attention=False` with an explicit alternate attention mode to
+  roll back without changing the MXFP4 linear path.
+
+The recipe documentation records commands and provenance. Performance results
+are intentionally not claimed in repository documentation; publication results
+belong in the accompanying ROCm blog.
+
+## Build from source
+
+Wheel installation is the supported fast path. For development:
 
 ```bash
-pip install path/to/jax_aiter-<version>-*.whl
-```
-
-## Option B: Build from source
-
-Requires ROCm, `hipcc`, and JAX with ROCm support.
-
-```bash
-pip install cmake ninja pyyaml
-```
-
-### 1) Clone with submodules
-
-```bash
-git clone --recursive git@github.com:ROCm/jax-aiter.git
+git clone --recursive https://github.com/ROCm/jax-aiter.git
 cd jax-aiter
-```
 
-### 2) Environment setup
-
-```bash
 export JA_ROOT_DIR="$PWD"
+export GPU_ARCHS=gfx950
 export AITER_SYMBOL_VISIBLE=1
-export GPU_ARCHS=gfx950                                    # gfx942 for MI300, gfx950 for MI350.
-export AITER_ASM_DIR="$JA_ROOT_DIR/third_party/aiter/hsa/" # Base path, no arch suffix.
-```
 
-### 3) Build umbrella shared library
-
-```bash
 make
-```
-
-### 4) Build AITER JIT modules
-
-```bash
 python3 jax_aiter/jit/build_jit.py
-```
-
-Build specific modules:
-
-```bash
-python3 jax_aiter/jit/build_jit.py --module libmha_fwd,libmha_bwd,librmsnorm_fwd
-```
-
-### 5) Build FFI modules
-
-```bash
 make ja_mods
+JA_WHEEL_VARIANT=full python3 -m pip install .
 ```
 
-### 6) Install and test
+The full JIT build is intentionally not part of ordinary CI jobs. Prebuilt
+libraries are generated only when the pinned AITER revision or JIT recipe
+changes.
 
-```bash
-pip install .
-```
+See:
 
-Smoke test:
-
-```bash
-python3 -c "from jax_aiter.mha import flash_attn_func; from jax_aiter.gemm_fp4 import gemm_fp4_bf16; from jax_aiter.gemm import gemm; print('OK')"
-python3 tests/smoke_gemm_all_test.py
-```
-
-Run tests:
-
-```bash
-export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
-pytest -v --reruns 2 tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py \
-    tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py
-```
-
-## Build wheel
-
-```bash
-pip wheel . --no-deps -w dist/
-```
-
-## GPU architectures
-
-| GPU | Architecture | `GPU_ARCHS` |
-|-----|-------------|-------------|
-| MI300 series | CDNA3 | `gfx942` |
-| MI350 series | CDNA4 | `gfx950` |
-
-Multiple architectures: `GPU_ARCHS="gfx942;gfx950"`.
+- [Architecture](docs/architecture.md)
+- [Development and testing](docs/development.md)
+- [Release playbook](docs/release/RELEASE_PLAYBOOK.md)
 
 ## Troubleshooting
 
-- **Symbol not found errors.** Ensure JIT libs are built (`ls build/aiter_build/*.so`). JIT libs must load before FFI modules.
-- **Arch mismatch.** Set `GPU_ARCHS` to match your GPU, then rebuild all steps.
-- **JIT build fails.** Run with `--verbose` for details: `python3 jax_aiter/jit/build_jit.py --verbose`.
+- **`jax-aiter-fetch-mha` is suggested on import:** run that command once for
+  the installed package version.
+- **Architecture mismatch:** alpha2 supports `gfx950` only.
+- **No ROCm device in JAX:** verify the `jax-rocm7-plugin` and
+  `jax-rocm7-pjrt` versions match JAX, then run `python3 -c "import jax;
+  print(jax.devices())"`.
+- **Source build cannot find `hipcc`:** use the TheRock dev image,
+  `ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14`. The Makefile resolves its
+  compiler through `rocm-sdk`.
+- **HIP process abort:** JAX-AITER prints the HIP error, source file, and line
+  before aborting.
 
-## Developer notes
+## License
 
-JIT module config: `jax_aiter/jit/optCompilerConfig.json`.
-
-Available JIT modules:
-- `libmha_fwd` / `libmha_bwd` -- MHA forward/backward (CK + ASM v3).
-- `librmsnorm_fwd` -- RMSNorm forward (CK).
-
-FFI modules (built by `make ja_mods`):
-- `mha_fwd_ja.so` / `mha_bwd_ja.so` -- MHA FFI handlers.
-- `rmsnorm_fwd_ja.so` -- RMSNorm FFI handler.
-- `silu_and_mul_ja.so` -- SiLU activation FFI handler.
-- `gemm_fwd_ja.so` -- BF16 GEMM FFI handler (24 ASM kernels, heuristic selection).
-- `gemm_fp4_ja.so` -- FP4 GEMM (35 ASM kernels).
-- `cast_mxfp4_ja.so` -- MXFP4 cast + transpose + shuffle (BF16 to E2M1+E8M0).
-
-### GEMM architecture
-
-All GEMM variants bypass AITER's PyTorch wrapper and call the ASM kernels directly via HIP:
-
-```
-JAX buffer → FFI handler → KernelArgs struct (void*) → AiterAsmKernel → hipModuleLaunchKernel → .co
-```
-
-No PyTorch code at any layer. Kernel configs are auto-generated from CSV by `hsa/codegen.py`.
-
-### MXFP4 training architecture
-
-The MXFP4 path (`gemm_fp4_bf16`) uses `custom_vjp` + `custom_partitioning` for FSDP-compatible training:
-
-```
-Forward:  CastMxfp4JA(act) + CastMxfp4DualJA(wt) + GemmFp4FwdJA    (3 FFI calls)
-Backward: CastMxfp4JA(grad) + GemmFp4FwdJA(dA)                      (2 FFI calls)
-          hipBLASLt FP8 dB via lax.dot_general                       (native XLA)
-```
-
-FP4 ASM kernels are 1.19-1.54x faster than hipBLASLt FP8 at MLP shapes. The dB backward
-uses native FP8 `dot_general` so XLA can overlap it with FSDP communication.
+MIT. See [LICENSE](LICENSE).

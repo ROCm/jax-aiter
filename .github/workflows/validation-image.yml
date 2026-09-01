@@ -1,0 +1,101 @@
+name: Validation image (build + publish)
+
+# Publishes the clean-room image that scripts/validate_wheel.sh runs wheels in.
+#
+# Why this exists: validate_wheel.sh used to `docker build` this image on every
+# release run. That meant fetching a 3.39 GB ROCm base layer plus reinstalling
+# the JAX stack each time, and on a runner without those layers cached the step
+# ran past the job timeout -- it blocked three alpha2 release attempts. Building
+# once and pulling thereafter removes that from the release path.
+#
+# The tag is derived from docker/validation/Dockerfile.lite by
+# ci/validation_image_id.sh, so a recipe edit produces a new tag and preflight
+# rebuilds instead of validating against a stale environment.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'docker/validation/**'
+      - 'ci/validation_image_id.sh'
+      - '.github/workflows/validation-image.yml'
+
+concurrency:
+  group: validation-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: build + publish validation image
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 90
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Resolve the content-addressed image reference
+        id: ref
+        run: |
+          image="$(bash ci/validation_image_id.sh)"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "resolved $image"
+
+      - name: Log in to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Skip when this recipe is already published
+        id: preflight
+        run: |
+          if docker manifest inspect "${{ steps.ref.outputs.image }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "already published; nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.preflight.outputs.exists != 'true'
+        run: |
+          docker build -t "${{ steps.ref.outputs.image }}" \
+            -f docker/validation/Dockerfile.lite docker/validation
+
+      - name: Verify the image can import the JAX ROCm stack
+        if: steps.preflight.outputs.exists != 'true'
+        # No GPU on this runner, so only the import path is checked here; the
+        # release job exercises the GPU path when it validates a wheel.
+        run: |
+          docker run --rm "${{ steps.ref.outputs.image }}" \
+            python3 -c "import jax, jaxlib, jax_rocm7_plugin; print('validation image OK', jax.__version__)"
+
+      - name: Push
+        if: steps.preflight.outputs.exists != 'true'
+        run: docker push "${{ steps.ref.outputs.image }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Validation image"
+            echo
+            echo '```text'
+            echo "${{ steps.ref.outputs.image }}"
+            echo '```'
+            if [ "${{ steps.preflight.outputs.exists }}" = "true" ]; then
+              echo "Already published; build skipped."
+            else
+              echo "Built and pushed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

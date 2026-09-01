@@ -3,10 +3,26 @@
 # JAX-AITER build. No PyTorch dependency.
 # Targets: all (umbrella lib), ja_mods (FFI modules), clean.
 
-HIPCC        ?= /opt/rocm/bin/hipcc
 ROCM_ARCH    ?= gfx950
 PYTHON3      ?= python3
-HIP_LIB      := /opt/rocm/lib
+
+# ROCm location. Legacy images install under /opt/rocm; TheRock images ship ROCm
+# as the `rocm-sdk` pip package and have no /opt/rocm at all. Deliberately not
+# named ROCM_PATH: some images export that pointing at a versioned directory,
+# which would silently move the legacy rpath off /opt/rocm.
+ifneq ($(wildcard /opt/rocm/bin/hipcc),)
+JA_ROCM_PATH := /opt/rocm
+HIP_RPATH    := -Wl,-rpath,$(JA_ROCM_PATH)/lib
+else
+JA_ROCM_PATH := $(shell rocm-sdk path --root 2>/dev/null)
+# TheRock registers its libraries with ldconfig and resolves the rest through
+# $ORIGIN-relative RUNPATHs inside the _rocm_sdk_* packages. An rpath into
+# _rocm_sdk_devel/lib would shadow the per-arch device libraries, so omit it.
+HIP_RPATH    :=
+endif
+
+HIPCC        ?= $(if $(wildcard $(JA_ROCM_PATH)/bin/hipcc),$(JA_ROCM_PATH)/bin/hipcc,$(shell command -v hipcc 2>/dev/null))
+HIP_LIB      := $(JA_ROCM_PATH)/lib
 
 AITER_SRC_DIR:= third_party/aiter
 AITER_HIP_DIR:= build/hipified_aiter
@@ -22,7 +38,7 @@ UMBRELLA_CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
                      -I$(JAX_FFI_INC) -I$(PYTHON_INC) -I$(JAX_AITER_INC) -I$(AITER_INC) \
                      -fvisibility-inlines-hidden -fvisibility=hidden
 
-UMBRELLA_LDFLAGS := -lamdhip64 -lhiprtc -Wl,-rpath,$(HIP_LIB) -Wl,-soname,libjax_aiter.so
+UMBRELLA_LDFLAGS := -lamdhip64 -lhiprtc $(HIP_RPATH) -Wl,-soname,libjax_aiter.so
 
 JA_BUILD_DIR := build/jax_aiter_build
 
@@ -30,8 +46,7 @@ GPU_ARCHS ?= $(if $(GFX),$(GFX),$(ROCM_ARCH))
 GPU_ARCHS_LIST := $(subst ;, ,$(GPU_ARCHS))
 AMDGPU_TARGET_FLAGS := $(foreach arch,$(GPU_ARCHS_LIST),--offload-arch=$(arch))
 
-JA_CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
-               -DENABLE_CK=1 \
+JA_CXXFLAGS := -std=c++20 -fPIC -O3 -DUSE_ROCM -D__HIP_PLATFORM_AMD__ -DENABLE_CK=1 \
                -fvisibility-inlines-hidden -fvisibility=hidden
 
 JA_INCLUDES := -I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
@@ -48,25 +63,34 @@ GEMM_BF16_CFG    := $(GEMM_CONFIG_DIR)/asm_bf16gemm_configs.hpp
 GEMM_FP4_CFG     := $(GEMM_CONFIG_DIR)/asm_f4gemm_configs.hpp
 GEMM_INCLUDES    := $(JA_INCLUDES) -I$(GEMM_CONFIG_DIR)
 
-JA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
-              $(JA_BUILD_DIR)/mha_bwd_ja.so \
-              $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
-              $(JA_BUILD_DIR)/silu_and_mul_ja.so \
-              $(JA_BUILD_DIR)/gemm_fwd_ja.so \
-              $(JA_BUILD_DIR)/gemm_fp4_ja.so \
-              $(JA_BUILD_DIR)/cast_mxfp4_ja.so
+# Core (non-MHA) FFI shims: shipped in both the lite and full wheels.
+JA_CORE_MODULES := $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
+                   $(JA_BUILD_DIR)/silu_and_mul_ja.so \
+                   $(JA_BUILD_DIR)/gemm_fwd_ja.so \
+                   $(JA_BUILD_DIR)/gemm_fp4_ja.so \
+                   $(JA_BUILD_DIR)/cast_mxfp4_ja.so
 
-.PHONY: all clean ja_mods
+# MHA FFI shims: full wheel only (the heavy libmha_*.so JIT libs back these).
+JA_MHA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
+                  $(JA_BUILD_DIR)/mha_bwd_ja.so
+
+# Full set (unchanged target for `make ja_mods`): core + MHA.
+JA_MODULES := $(JA_CORE_MODULES) $(JA_MHA_MODULES)
+
+.PHONY: all clean clean-stage ja_mods ja_mods_nomha
 
 all: $(OUT_SO)
 
 ja_mods: $(JA_MODULES)
 
+# Lite wheel: build only the core (non-MHA) FFI shims.
+ja_mods_nomha: $(JA_CORE_MODULES)
+
 %/: 
 	mkdir -p $@
 
 $(OUT_SO): build/jax_aiter_build/ csrc/common/mha_common_utils.cu
-	$(HIPCC) -shared $(UMBRELLA_CXXFLAGS) \
+	$(HIPCC) -shared $(UMBRELLA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) \
 		-I$(AITER_SRC_DIR)/3rdparty/composable_kernel/include \
 		-I$(AITER_SRC_DIR)/3rdparty/composable_kernel/example/ck_tile/01_fmha \
 		csrc/common/mha_common_utils.cu \
@@ -102,5 +126,17 @@ $(JA_BUILD_DIR)/cast_mxfp4_ja.so: $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) | $(JA_
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) \
 		-Icsrc/ffi/cast_mxfp4 $(CAST_MXFP4_SRC) $(CAST_MXFP4_KERNEL) -o $@
 
+# Stage-only clean: wipes the wheel staging dirs (pure copies of the
+# source-of-truth libs/kernels) plus the stale moe_fwd_ja.so that has no
+# source. Safe to run during release work -- it NEVER touches
+# build/aiter_build/ (the multi-GB MHA JIT libs) nor the live *_ja.so /
+# libjax_aiter.so in build/jax_aiter_build/.
+clean-stage:
+	rm -rf jax_aiter/_lib/ jax_aiter/_hsa/ build/lib/ build/jax_aiter_build/moe_fwd_ja.so
+
+# WARNING: `make clean` deletes build/aiter_build/, which holds the
+# multi-GB MHA JIT libs (libmha_fwd.so ~1.3 GB, libmha_bwd.so ~1.0 GB,
+# librmsnorm_fwd.so ~167 MB) that cost hours to rebuild. DO NOT run this
+# during lite/full wheel release work -- use `make clean-stage` instead.
 clean:
 	rm -rf build/jax_aiter_build build/aiter_build

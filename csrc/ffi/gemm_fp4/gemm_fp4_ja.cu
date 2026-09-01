@@ -151,6 +151,53 @@ select_fp4_kernel(int M, int N, int K, int dev_id, CFG* cfgs) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-shape oracle dispatch table (kernel-selection study 20260615).
+//
+// Measured throughput-optimal (kernel, log2_split) per 8B Llama-3.1 full-scope
+// (M_tok=32768) GEMM (M,N,K), from the widened microbench + rocprof cross-check
+// in mxfp4_analysis/runs/20260615_8b_fp4_kernselect_097/. Kernel choice is
+// numerically NEUTRAL (fp32-accumulate; parsed/neutrality.json: splitK=1 tiles
+// byte-identical, splitK>1 within 1 bf16 ULP), so this changes wall-time only.
+//
+// Findings vs the production FORCE pin (256x256/sK1):
+//   - 128x512/sK1 wins (3-9%) on every tall-M shape + q/o-wgrad;
+//   - 256x256/sK1 stays optimal for the two large wgrad shapes;
+//   - 128x512/sK4 wins +39% on the skinny kv-wgrad (M=1024) -- where the
+//     occupancy heuristic instead picks a catastrophic 256x256/sK4 (+61%).
+//
+// Gated by AITER_FP4_DISPATCH (default OFF => production behavior byte-identical
+// / reversible). Unknown shapes return false => caller falls through to the
+// existing FORCE / heuristic path.
+// ---------------------------------------------------------------------------
+static bool
+lookup_fp4_dispatch(int M, int N, int K, std::string& knl, int& log2_split) {
+  static const std::string K128x512 =
+      "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E";
+  static const std::string K256x256 =
+      "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E";
+  struct Entry { int M, N, K; const std::string* knl; int log2; };
+  static const Entry table[] = {
+      {32768, 4096, 4096,   &K128x512, 0},  // attn_qo fwd/dgrad
+      {32768, 1024, 4096,   &K128x512, 0},  // attn_kv fwd
+      {32768, 4096, 1024,   &K128x512, 0},  // attn_kv dgrad
+      {32768, 14336, 4096,  &K128x512, 0},  // mlp_gateup fwd / down dgrad
+      {32768, 4096, 14336,  &K128x512, 0},  // mlp_gateup dgrad / down fwd
+      {4096, 4096, 32768,   &K128x512, 0},  // attn_qo wgrad
+      {1024, 4096, 32768,   &K128x512, 2},  // attn_kv wgrad -> splitK=4
+      {14336, 4096, 32768,  &K256x256, 0},  // mlp_gateup wgrad
+      {4096, 14336, 32768,  &K256x256, 0},  // mlp_down wgrad
+  };
+  for (const auto& e : table) {
+    if (e.M == M && e.N == N && e.K == K) {
+      knl = *e.knl;
+      log2_split = e.log2;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // FFI bridge
 // ---------------------------------------------------------------------------
 ffi::Error
@@ -190,17 +237,42 @@ GemmFp4Fwd_Bridge(
   // ---------------------------------------------------------------------
   std::string knl_name;
   int log2_split = 0;
-  const char* force_name = std::getenv("AITER_FORCE_KERNEL_NAME");
-  if (force_name && force_name[0] != '\0') {
-    knl_name = force_name;
-    const char* force_split = std::getenv("AITER_FORCE_LOG2_K_SPLIT");
-    if (force_split && force_split[0] != '\0') {
-      log2_split = std::atoi(force_split);
+
+  // ---------------------------------------------------------------------
+  // Per-shape oracle dispatch (kernel-selection study 20260615). Default OFF.
+  // When AITER_FP4_DISPATCH is set (non-empty, not "0") AND (M,N,K) has a tuned
+  // entry, use the measured throughput-optimal kernel/splitK. This is the
+  // generalisation of the kv-wgrad band-aid into the full per-shape table and
+  // takes precedence over every other selector. Untabled shapes fall through.
+  // Default (env unset / empty / "0") => production behavior byte-identical.
+  // ---------------------------------------------------------------------
+  bool dispatch_override = false;
+  const char* dispatch_env = std::getenv("AITER_FP4_DISPATCH");
+  if (dispatch_env && dispatch_env[0] != '\0' && dispatch_env[0] != '0') {
+    if (lookup_fp4_dispatch(M, N, K, knl_name, log2_split)) {
+      dispatch_override = true;
+      static std::once_flag dispatch_log_flag;
+      std::call_once(dispatch_log_flag, []() {
+        fprintf(stderr,
+                "[ja-fp4-dispatch] AITER_FP4_DISPATCH active: per-shape oracle "
+                "table (20260615) in effect.\n");
+      });
     }
-  } else {
-    auto picked = select_fp4_kernel(M, N, K, dev_id, config_map);
-    knl_name    = std::get<0>(picked);
-    log2_split  = std::get<1>(picked);
+  }
+
+  if (!dispatch_override) {
+    const char* force_name = std::getenv("AITER_FORCE_KERNEL_NAME");
+    if (force_name && force_name[0] != '\0') {
+      knl_name = force_name;
+      const char* force_split = std::getenv("AITER_FORCE_LOG2_K_SPLIT");
+      if (force_split && force_split[0] != '\0') {
+        log2_split = std::atoi(force_split);
+      }
+    } else {
+      auto picked = select_fp4_kernel(M, N, K, dev_id, config_map);
+      knl_name    = std::get<0>(picked);
+      log2_split  = std::get<1>(picked);
+    }
   }
   if (knl_name.empty()) {
     char msg[256];

@@ -4,10 +4,12 @@
 # Build script for JAX-AITER using AITER's JIT system.
 
 import os
+import re
 import sys
 import shutil
 import subprocess
 import json
+import time
 import argparse
 import functools
 from pathlib import Path
@@ -122,8 +124,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
                     "CK_DIR": core_module.CK_DIR,
                     "get_asm_dir": core_module.get_asm_dir,
                     "jax_ffi_include_dir": jax_ffi_include,
-                    "torch_site": torch_site,
-                    "pytorch_include_dirs": pytorch_include_dirs,
                 }
                 try:
                     return eval(value, eval_globals)
@@ -153,19 +153,6 @@ def patch_aiter_core(core_module, jax_aiter_root):
             except:
                 jax_ffi_include = ""
 
-            # Get PyTorch include directories (needed for compilation).
-            torch_site = str(core_module.JA_ROOT_DIR / "third_party" / "pytorch")
-            pytorch_include_dirs = [
-                f"{torch_site}/torch/csrc/api/include",
-                f"{torch_site}/aten",
-                f"{torch_site}/aten/src",
-                f"{torch_site}/aten/src/ATen",
-                f"{torch_site}/build_static",
-                f"{torch_site}/build_static/aten/src",
-                f"{torch_site}/build_static/install/include",
-                f"{torch_site}/torch/csrc",
-            ]
-
             # Process the config values through eval.
             processed_config = {}
             for key, value in config.items():
@@ -174,23 +161,17 @@ def patch_aiter_core(core_module, jax_aiter_root):
             # Merge with defaults.
             d_opt_build_args.update(processed_config)
 
-            # Always add PyTorch include directories (needed for compilation).
-            # Even with torch_exclude=True, we need headers for compilation.
-            pytorch_includes = [f"-I{torch_site}"]
-            pytorch_includes.extend(
-                [f"-I{inc_dir}" for inc_dir in pytorch_include_dirs]
-            )
-
             # Define JAX-aiter specific include flags.
             ja_includes = [
                 f"-I{jax_ffi_include}",
                 f"-I{core_module.JA_ROOT_DIR}/csrc/common",
             ]
 
-            # Add PyTorch includes to both CC and HIP flags.
+            # All three configured modules use torch_exclude=True. The previous
+            # PyTorch include list was dead weight: Ninja's dependency database
+            # for every built object contains zero PyTorch headers.
             if "flags_extra_cc" not in d_opt_build_args:
                 d_opt_build_args["flags_extra_cc"] = []
-            d_opt_build_args["flags_extra_cc"].extend(pytorch_includes)
             d_opt_build_args["flags_extra_cc"].extend(ja_includes)
 
             # Add jax-aiter library linking flags.
@@ -287,11 +268,14 @@ def patch_aiter_core(core_module, jax_aiter_root):
             if torch_exclude:
                 import sys
                 import types
-                import os
 
-                torch_site = str(core_module.JA_ROOT_DIR / "third_party" / "pytorch")
                 mock_torch = types.ModuleType('torch')
-                mock_torch.__file__ = os.path.join(torch_site, '__init__.py')
+                # cpp_extension only needs a module-shaped object while
+                # torch_exclude=True. Point at an existing repository file;
+                # no PyTorch source tree or runtime package is consumed.
+                mock_torch.__file__ = str(
+                    core_module.JA_ROOT_DIR / "jax_aiter" / "__init__.py"
+                )
                 sys.modules['torch'] = mock_torch
                 
                 try:
@@ -394,37 +378,81 @@ def patch_aiter_core(core_module, jax_aiter_root):
             _write_ninja_file_and_build_library_ja
         )
 
+        _NINJA_PROGRESS_RE = re.compile(r"^\[(\d+)/(\d+)\]")
+        _NINJA_FAIL_RE = re.compile(r"^(FAILED:|ninja: build stopped)|\berror:")
+
         def _run_ninja_build(
             build_directory: str, verbose: bool, error_prefix: str
         ) -> None:
+            """Run ninja, rendering one self-updating progress line.
+
+            The JIT build compiles tens of thousands of generated sources. Ninja
+            already counts them, but the previous implementation captured stdout
+            into a pipe and threw it away unless the build failed, so a two-hour
+            compile looked identical to a hung one. Here the stream is consumed
+            live: progress collapses onto a single line, compiler errors are
+            echoed the moment they appear, and the whole output is retained so a
+            failure still reports the real reason.
+            """
             command = ["ninja"]
             num_workers = cpp_extension._get_num_workers(verbose)
             if num_workers is not None:
                 command.extend(["-j", str(num_workers)])
-            env = os.environ.copy()
 
-            try:
+            # error_prefix looks like: Error building extension 'libmha_bwd'
+            label = (m.group(1) if (m := re.search(r"'([^']+)'", error_prefix))
+                     else "ninja")
+            tty = sys.stdout.isatty()
+            start = time.time()
+            captured: list[str] = []
+            last_tick = 0.0
+            done = total = 0
+
+            sys.stdout.flush()
+            sys.stderr.flush()
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=build_directory,
+                env=os.environ.copy(),
+                text=True,
+                bufsize=1,
+            )
+
+            def _status() -> str:
+                pct = f"{100.0 * done / total:5.1f}%" if total else "  ?  "
+                el = int(time.time() - start)
+                return (f"[{label}] {done}/{total or '?'} {pct} "
+                        f"{el // 60}m{el % 60:02d}s")
+
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                captured.append(line)
+                if m := _NINJA_PROGRESS_RE.match(line):
+                    done, total = int(m.group(1)), int(m.group(2))
+                    now = time.time()
+                    if tty:
+                        sys.stdout.write("\r\033[K" + _status())
+                        sys.stdout.flush()
+                    elif now - last_tick >= 30:
+                        # nohup / CI: periodic lines, since \r would be noise.
+                        print(_status(), flush=True)
+                        last_tick = now
+                    continue
+                if verbose or _NINJA_FAIL_RE.search(line):
+                    if tty:
+                        sys.stdout.write("\r\033[K")
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+
+            rc = proc.wait()
+            if tty:
+                sys.stdout.write("\r\033[K" + _status() + "\n")
                 sys.stdout.flush()
-                sys.stderr.flush()
-                stdout_fileno = 1
-                subprocess.run(
-                    command,
-                    stdout=stdout_fileno if verbose else subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=build_directory,
-                    check=True,
-                    env=env,
-                )
-            except subprocess.CalledProcessError as e:
-                # Python 2 and 3 compatible way of getting the error object.
-                _, error, _ = sys.exc_info()
-                # error.output contains the stdout and stderr of the build attempt.
-                message = error_prefix
-                # `error` is a CalledProcessError (which has an `output`) attribute, but
-                # mypy thinks it's Optional[BaseException] and doesn't narrow.
-                if hasattr(error, "output") and error.output:
-                    message += f": {error.output.decode(*SUBPROCESS_DECODE_ARGS)}"
-                raise RuntimeError(message) from e
+
+            if rc != 0:
+                raise RuntimeError(f"{error_prefix}: {''.join(captured)}")
 
         cpp_extension._run_ninja_build = _run_ninja_build
 
@@ -479,6 +507,10 @@ def build_module(core_module, module_name, verbose=False):
             if module_name.startswith("lib")
             else build_args.get("is_python_module", True)
         )
+        # v0.1.14 added a positional `third_party` param to build_module
+        # (before `hipify`). Pass the trailing params by keyword so they bind
+        # correctly: `third_party` defaults to [] (JA configs don't clone
+        # 3rdparty repos at JIT time) and `hipify` stays True for JA builds.
         core_module.build_module(
             build_args["md_name"],
             build_args["srcs"],
@@ -491,7 +523,7 @@ def build_module(core_module, module_name, verbose=False):
             is_python_module,
             build_args.get("is_standalone", False),
             build_args.get("torch_exclude", False),
-            build_args.get("third_party", []),
+            third_party=build_args.get("third_party", []),
             hipify=build_args.get("hipify", True),
             flags_extra_hip_per_source=build_args.get(
                 "flags_extra_hip_per_source", {}

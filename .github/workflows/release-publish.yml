@@ -1,0 +1,275 @@
+name: JAX-AITER Release Build + Validate
+
+# Build the gfx950 alpha2 wheels in the TheRock manylinux_2_28 image, validate
+# both variants on a real MI355, then attach them to the GitHub release.
+#
+# The wheels are tagged manylinux_2_39, not 2_28. Broad manylinux compatibility
+# is not a goal for alpha2: the bundled JIT libraries come from jit-libs.yml,
+# which builds them on Ubuntu 24.04, so they need GLIBCXX_3.4.31 regardless of
+# which image packages the wheel. Alpha2 targets ROCm 7.14 on Ubuntu 24.04
+# anyway, and an honest tag makes pip refuse an unusable install up front
+# instead of failing at import.
+#
+# This workflow NEVER builds JIT libraries; jit-libs.yml is their only producer.
+# It also does NOT upload to PyPI. That irreversible step stays manual until the
+# user explicitly approves the AMD-owned PyPI project/token arrangement.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach validated wheels to"
+        type: string
+        default: v0.1.0-alpha2
+      publish:
+        description: "Upload to the GitHub release after validation"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  # Pull the published clean-room validation image.
+  packages: read
+
+env:
+  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  GPU_ARCHS: gfx950
+  ROCM_VERSION: "7.14.0"
+  JA_WHEEL_ARCH: gfx950
+  JA_WHEEL_PLAT_NAME: manylinux_2_39_x86_64
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+
+jobs:
+  build:
+    name: build manylinux wheels
+    runs-on: build-only-jax-aiter
+    timeout-minutes: 90
+    outputs:
+      built_sha: ${{ steps.source.outputs.sha }}
+    env:
+      CONTAINER_NAME: ja_release_build
+
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Bind build to the alpha2 source commit
+        id: source
+        run: |
+          tag="${{ inputs.tag }}"
+          test "$tag" = "v0.1.0-alpha2"
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "building $tag from $sha"
+
+      - name: Fetch prebuilt JIT libs
+        id: fetch_jit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p build/aiter_build
+          bash ci/fetch_jit_libs.sh
+
+      - name: Fail if the JIT libs are missing
+        if: steps.fetch_jit.outputs.rebuild == 'true'
+        run: |
+          echo "::error::No JIT libs matched this AITER pin / gfx950 / JIT recipe." >&2
+          echo "Run the 'JIT libs (build + publish)' workflow first." >&2
+          exit 1
+
+      - name: Pull manylinux build image
+        run: docker pull "$BUILD_IMAGE"
+
+      - name: Launch build container
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host --ipc=host --shm-size=16G \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS \
+            -e JA_WHEEL_ARCH -e JA_WHEEL_PLAT_NAME -e AITER_ASM_DIR \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -w /jax-aiter "$BUILD_IMAGE" tail -f /dev/null
+
+      - name: Install build tooling and JAX
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            # The manylinux image is minimal. --jax-only uses --no-deps, so
+            # provide the JAX runtime requirements first.
+            python3 -m pip install --break-system-packages \
+              numpy ml_dtypes scipy opt_einsum
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
+            python3 -m pip install --break-system-packages pandas auditwheel
+            # build_wheel.sh runs pip wheel --no-build-isolation, so the PEP 517
+            # backend must already be importable, and this minimal image ships
+            # neither setuptools nor wheel. wheel is capped because setup.py
+            # imports wheel.bdist_wheel, scheduled upstream for removal.
+            python3 -m pip install --break-system-packages \
+              "setuptools>=64" "wheel<1.0"
+          '
+
+      - name: Build umbrella and FFI shims
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            make
+            make ja_mods
+            test -s build/jax_aiter_build/libjax_aiter.so
+            test -s build/jax_aiter_build/mha_fwd_ja.so
+            test -s build/jax_aiter_build/mha_bwd_ja.so
+          '
+
+      - name: Package default/PyPI-shaped wheel
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc \
+            'bash scripts/build_wheel.sh --variant lite'
+
+      - name: Build GitHub-only full wheel
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc \
+            'bash scripts/build_wheel.sh --variant full'
+
+      - name: Audit wheel policy and contents
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            # set -e is load-bearing: without it a non-zero exit from either
+            # check_manylinux_policy.py call is discarded and the audit passes
+            # vacuously, which is the whole point of this step.
+            set -euo pipefail
+            # No --max-minor: the ceiling comes from the tag on each wheel, so
+            # a future build-image bump fails here until the tag is corrected.
+            python3 ci/check_manylinux_policy.py \
+              dist/jax_aiter-0.1.0a2-*.whl
+            python3 ci/check_manylinux_policy.py \
+              dist/jax_aiter-0.1.0a2+full-*.whl
+            python3 - <<"PY"
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          for wheel in Path("dist").glob("jax_aiter-0.1.0a2*.whl"):
+              with ZipFile(wheel) as archive:
+                  names = archive.namelist()
+                  has_full = "+full" in wheel.name
+                  jit = [n for n in names if "/aiter_build/libmha_" in n]
+                  shims = [n for n in names if "/jax_aiter_build/mha_" in n]
+                  assert len(shims) == 2, (wheel, shims)
+                  assert len(jit) == (2 if has_full else 0), (wheel, jit)
+                  assert not any("/_hsa/gfx942/" in n for n in names), wheel
+                  assert not any("/_hsa/gfx1250/" in n for n in names), wheel
+                  assert any("/_hsa/gfx950/" in n for n in names), wheel
+                  print(f"{wheel}: contract OK ({len(jit)} MHA JIT libs)")
+          PY
+          '
+
+      - name: Hand artifacts back to the runner user
+        run: sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/dist"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jax-aiter-alpha2-wheels
+          path: dist/jax_aiter-0.1.0a2*.whl
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Cleanup
+        if: always()
+        run: timeout --kill-after=10s 60s docker rm -f "$CONTAINER_NAME" || true
+
+  validate-and-publish:
+    name: validate on 1x MI355 + publish
+    needs: build
+    runs-on: linux-jax-aiter-mi355-1
+    timeout-minutes: 90
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: Verify validation checkout matches wheel build
+        run: test "$(git rev-parse HEAD)" = "${{ needs.build.outputs.built_sha }}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: jax-aiter-alpha2-wheels
+          path: dist
+
+      - name: Log in to ghcr.io
+        # validate_wheel.sh pulls the prebuilt clean-room image instead of
+        # rebuilding it; without this it would silently fall back to a build.
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Validate default wheel in a clean TheRock container
+        # Bound the step rather than letting a stall eat the whole job budget:
+        # a hung download once ran 87 minutes here and reported nothing useful.
+        timeout-minutes: 40
+        run: |
+          wheel="$(python3 - <<'PY'
+          from pathlib import Path
+          print(next(p for p in Path("dist").glob("jax_aiter-0.1.0a2-*.whl") if "+full" not in p.name))
+          PY
+          )"
+          bash scripts/validate_wheel.sh --variant lite "$wheel"
+
+      - name: Validate full wheel in a clean TheRock container
+        timeout-minutes: 40
+        run: |
+          wheel="$(python3 - <<'PY'
+          from pathlib import Path
+          print(next(Path("dist").glob("jax_aiter-0.1.0a2+full-*.whl")))
+          PY
+          )"
+          bash scripts/validate_wheel.sh --variant full "$wheel"
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          tag="${{ inputs.tag }}"
+          echo "tag=${tag:-v0.1.0-alpha2}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure the GitHub release exists
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if ! gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "${{ github.repository }}" \
+              --target "${{ needs.build.outputs.built_sha }}" \
+              --title "jax-aiter v0.1.0-alpha2" --prerelease \
+              --notes-file docs/RELEASE_NOTES_v0.1.0-alpha2.md
+          fi
+
+      - name: Verify release tag points at the built commit
+        if: inputs.publish
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          git fetch -q origin "refs/tags/$tag:refs/tags/$tag" || true
+          test "$(git rev-list -n 1 "$tag")" = "${{ needs.build.outputs.built_sha }}"
+
+      - name: Upload validated wheels to GitHub release
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" --clobber dist/*.whl

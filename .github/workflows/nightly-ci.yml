@@ -1,168 +1,106 @@
 name: JAX-AITER Nightly CI
 
+# The full suite on 4 GPUs, including the cases the PR tier skips.
+#
+# Two things this catches that ci.yml cannot:
+#   * the `slow` sweeps -- the full BATCH_CORE shape grid and the 70B GEMM shapes
+#   * the `multigpu` FSDP sharding cases, which need >= 4 visible devices and so
+#     have always skipped silently on the single-GPU path
+#
+# Like the PR job, JIT libraries are fetched and never built here.
+
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 1 * * *'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  CONTAINER_NAME: ja_ci_nightly
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  GPU_ARCHS: gfx950
+  ROCM_VERSION: "7.14.0"
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+
 jobs:
-  build-and-test:
-    runs-on: [self-hosted, Linux]
-
-    env:
-      IMAGE: ghcr.io/rocm/jax-base-ubu24.rocm720:latest
-      CONTAINER_NAME: rv_aiter_nightly
-      JA_ROOT_DIR: /jax-aiter
-      AITER_SYMBOL_VISIBLE: 1
-      GPU_ARCHS: "gfx942;gfx950"
-      AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
-
+  full-suite:
+    name: full suite (4x MI355)
+    runs-on: linux-jax-aiter-mi355-4
+    timeout-minutes: 90
     steps:
-      - name: Fix permissions from previous Docker run
+      - name: Fix permissions from a previous container run
         run: |
           if [ -d "${{ github.workspace }}" ]; then
-            sudo chown -R $(id -u):$(id -g) "${{ github.workspace }}" || true
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - name: Checkout repository with submodules
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
-          fetch-depth: 0
+          # Depth 1 is enough: the only git call is `rev-parse HEAD` on the
+          # AITER submodule, for the JIT-lib cache key. Full history costs
+          # minutes here because the submodules are 4.5 GB.
+          fetch-depth: 1
 
-      - name: Apply AITER patches
+      - name: Fetch prebuilt JIT libs
+        id: fetch_jit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          cd third_party/aiter
-          git apply ../../scripts/aiter_mha_bwd_thread_local.patch
+          mkdir -p build/aiter_build
+          bash ci/fetch_jit_libs.sh
 
-      - name: Pull container image
+      - name: Fail if the JIT libs are missing
+        if: steps.fetch_jit.outputs.rebuild == 'true'
+        run: |
+          echo "::error::No JIT libs matched this AITER pin / arch / JIT recipe." >&2
+          echo "Run the 'JIT libs (build + publish)' workflow, then re-run this job." >&2
+          exit 1
+
+      - name: Pull image
         run: docker pull "$IMAGE"
 
-      - name: Launch build container
+      - name: Launch container (all visible GPUs)
         run: |
-          set -euxo pipefail
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
           docker run -d --name "$CONTAINER_NAME" \
-            --network=host \
-            --device=/dev/kfd \
-            --device=/dev/dri \
-            --ipc=host \
-            --shm-size=16G \
-            --group-add=video \
-            --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            -e JA_ROOT_DIR="${{ env.JA_ROOT_DIR }}" \
-            -e AITER_SYMBOL_VISIBLE="${{ env.AITER_SYMBOL_VISIBLE }}" \
-            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
-            -e AITER_ASM_DIR="${{ env.AITER_ASM_DIR }}" \
-            -e HIP_VISIBLE_DEVICES=0 \
+            --network=host --device=/dev/kfd --device=/dev/dri \
+            --ipc=host --shm-size=32G --group-add=video \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS -e AITER_ASM_DIR \
             -v "${{ github.workspace }}:/jax-aiter" \
-            -w "/jax-aiter" \
-            "$IMAGE" tail -f /dev/null
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
 
-      - name: Install tooling and JAX runtime
+      - name: Install tooling and JAX
+        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+
+      # After setup_jax.sh: the base image ships no jax, so importing it any
+      # earlier fails the job before a single test runs.
+      - name: Environment
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              git ca-certificates curl build-essential pkg-config
-            curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --break-system-packages
-            python3 -m pip install --break-system-packages cmake ninja pyyaml psutil pandas
-
-            # JAX must be installed before build (Makefile needs jax.ffi.include_dir())
-            python3 -m pip install --break-system-packages jax==0.9.0
-            python3 -m pip install --break-system-packages \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jaxlib-0.9.0+rocm7-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-            python3 -m pip install --break-system-packages \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_plugin-0.9.0+rocm7.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
-              https://github.com/ROCm/rocm-jax/releases/download/rocm-jax-v0.9.0-rc3/jax_rocm7_pjrt-0.9.0+rocm7.2.0-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
-            python3 -m pip install --break-system-packages pytest pytest-rerunfailures
+            echo "processors: $(nproc)"
+            rocm-smi || true
+            python3 -c "import jax; print(\"jax devices:\", jax.devices())"
           '
 
-      - name: Mark repos safe for Git
+      - name: Build (umbrella + FFI shims + install)
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -eux
-            git config --global --add safe.directory /jax-aiter
-            git config --global --add safe.directory /jax-aiter/third_party/aiter
-          '
+          docker exec -e JA_SKIP_JIT_BUILD=true "$CONTAINER_NAME" \
+            bash -lc 'bash ci/build.sh'
 
-      - name: Display environment
+      - name: Test (full suite, including slow and multigpu)
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            echo "=== System ==="
-            echo "Processors: $(nproc)"
-            rocm-smi || echo "rocm-smi not available"
-            rocminfo | grep -E "Marketing Name:|gfx" || true
-          '
-
-      - name: Build umbrella library
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            make
-            ls -lh build/jax_aiter_build/libjax_aiter.so
-          '
-
-      - name: Build JIT modules (full rebuild, no cache)
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            python3 jax_aiter/jit/build_jit.py --verbose
-            ls -lh build/aiter_build/*.so
-          '
-
-      - name: Build FFI modules
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            make ja_mods
-            ls -lh build/jax_aiter_build/*.so
-          '
-
-      - name: Install JAX-AITER
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            pip install --break-system-packages .
-          '
-
-      - name: Smoke test
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            python3 -c "from jax_aiter.mha import flash_attn_func, flash_attn_varlen; from jax_aiter.rmsnorm import rms_norm; from jax_aiter.gemm import gemm; from jax_aiter.gemm_fp4 import gemm_fp4_bf16, MXFP4Quantizer, WeightWorkspace; print(\"jax-aiter import OK\")"
-            python3 tests/smoke_gemm_test.py
-            python3 tests/smoke_gemm_all_test.py
-          '
-
-      - name: Run full test suite (1 GPU)
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            set -euxo pipefail
-            export XLA_PYTHON_CLIENT_ALLOCATOR=platform
-            export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_nccl_comm_splitting=false --xla_gpu_enable_command_buffer="
-            python3 -m pytest -v --reruns 2 \
-              tests/test_mha_ja.py tests/test_rmsnorm_ja.py tests/test_gemm_ja.py \
-              tests/test_gemm_fp4_ja.py tests/test_silu_and_mul_ja.py \
-              tests/test_mxfp4_quantizer.py tests/test_weight_workspace.py \
-              tests/test_fp4_wgrad.py
-          '
-
-      - name: Build summary
-        if: always()
-        run: |
-          docker exec "$CONTAINER_NAME" bash -lc '
-            echo "=== Build Artifacts ==="
-            echo "Umbrella:"; ls -lh build/jax_aiter_build/libjax_aiter.so 2>/dev/null || echo "Not found"
-            echo "AITER JIT:"; ls -lh build/aiter_build/*.so 2>/dev/null || echo "None"
-            echo "FFI modules:"; ls -lh build/jax_aiter_build/*.so 2>/dev/null || echo "None"
-          ' || true
+          docker exec -e JA_TEST_TIER=nightly "$CONTAINER_NAME" \
+            bash -lc 'bash ci/test.sh'
 
       - name: Cleanup
         if: always()

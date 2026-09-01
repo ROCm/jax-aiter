@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ..ffi.registry import register_ffi_target
 
@@ -22,8 +23,28 @@ def _ensure_cast_registered():
     register_ffi_target("CastMxfp4JA", "ROCM")
 
 
+def _ensure_keyed_cast_registered():
+    register_ffi_target("CastMxfp4KeyedSrJA", "ROCM")
+
+
 def _ensure_dual_registered():
     register_ffi_target("CastMxfp4DualJA", "ROCM")
+
+
+def _ensure_keyed_dual_registered():
+    register_ffi_target("CastMxfp4DualKeyedSrJA", "ROCM")
+
+
+def _validate_sr_key(sr_key):
+    if sr_key is None:
+        raise ValueError("deterministic MXFP4 SR requires an explicit uint32[4] key")
+    sr_key = jnp.asarray(sr_key)
+    if sr_key.dtype != jnp.uint32 or sr_key.shape != (4,):
+        raise ValueError(
+            f"deterministic MXFP4 SR key must be uint32[4], got "
+            f"dtype={sr_key.dtype} shape={sr_key.shape}"
+        )
+    return sr_key
 
 
 def gemm_fp4(a_packed, b_packed, a_scale, b_scale):
@@ -50,7 +71,9 @@ def gemm_fp4(a_packed, b_packed, a_scale, b_scale):
     return jax.jit(call)(a_packed, b_packed, a_scale, b_scale)
 
 
-def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False):
+def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False,
+               use_sr=False, sr_key=None, sr_role=0, scale_margin=0,
+               scale_mode=0, use_2d_scale=False):
     """Fused BF16 -> MXFP4 quantization + shuffle via HIP kernel (single FFI call).
 
     Args:
@@ -59,13 +82,19 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False):
             True for weight operands, False for activation operands.
         shuffle_scales: Whether to shuffle E8M0 scales (always True for AITER ASM).
         use_hadamard: Apply Hadamard transform before quantization.
+        use_sr: Use stochastic rounding (unbiased) instead of RNE for the
+            FP32->FP4 convert. Default False => byte-identical RNE path.
+        scale_margin: Extra E8M0 headroom (int). The per-32-block scale is
+            ``2^(exp - 2 - scale_margin)``; ``>0`` shrinks the scale so small
+            entries survive the FP4 cast (fixes under-flush) at the cost of
+            clipping the largest entries. Default ``0`` => byte-identical to the
+            legacy ``exp-2`` cast.
 
     Returns:
         (fp4_packed, scales):
             fp4_packed: [M, K/2] uint8 — packed MXFP4 data.
             scales: [M_pad, scale_n_pad] uint8 — E8M0 block scales.
     """
-    _ensure_cast_registered()
     M, K = x.shape
     scale_n = (K + 31) // 32
     m_pad = ((M + 255) // 256) * 256
@@ -75,17 +104,38 @@ def cast_mxfp4(x, *, shuffle_fp4, shuffle_scales=True, use_hadamard=False):
         jax.ShapeDtypeStruct((M, K // 2), jnp.uint8),
         jax.ShapeDtypeStruct((m_pad, scale_n_pad), jnp.uint8),
     )
+    attrs = dict(
+        shuffle_fp4=shuffle_fp4,
+        shuffle_scales=shuffle_scales,
+        use_hadamard=use_hadamard,
+        use_sr=use_sr,
+        scale_margin=np.int32(scale_margin),
+        scale_mode=np.int32(scale_mode),
+        use_2d_scale=use_2d_scale,
+    )
+    if use_sr:
+        _ensure_keyed_cast_registered()
+        sr_key = _validate_sr_key(sr_key)
+        call = jax.ffi.ffi_call(
+            "CastMxfp4KeyedSrJA", out_shapes,
+            vmap_method="broadcast_all",
+            has_side_effect=False,
+        )
+        return call(x, sr_key, sr_role=np.int32(sr_role), **attrs)
+    _ensure_cast_registered()
     call = jax.ffi.ffi_call(
         "CastMxfp4JA", out_shapes,
         vmap_method="broadcast_all",
         has_side_effect=False,
     )
-    return call(x, shuffle_fp4=shuffle_fp4,
-                shuffle_scales=shuffle_scales, use_hadamard=use_hadamard)
+    return call(x, **attrs)
 
 
 def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
-                     shuffle_scales=True, use_hadamard=False):
+                     shuffle_scales=True, use_hadamard=False, use_sr=False,
+                     scale_margin=0, use_hadamard_col=None, use_sr_col=None,
+                     sr_key=None, sr_role=0, scale_mode=0,
+                     use_2d_scale=False):
     """Fused BF16 -> MXFP4 with BOTH rowwise and columnwise output in one kernel launch.
 
     Returns rowwise (for forward GEMM) + columnwise (for dA/dB backward GEMM).
@@ -98,7 +148,19 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
             False -> colwise output is linear layout, equivalent to rowwise of x^T
                      (suitable as GEMM A operand for dB backward).
         shuffle_scales: Whether to shuffle E8M0 scales.
-        use_hadamard: Apply Hadamard transform before quantization.
+        use_hadamard: Apply Hadamard to the ROWWISE output before quantization.
+        use_sr: Stochastic rounding (unbiased) for the ROWWISE output. Default
+            False => byte-identical RNE path.
+        scale_margin: Extra E8M0 headroom (int). The per-32-block scale is
+            ``2^(exp - 2 - scale_margin)``; ``>0`` shrinks the scale so small
+            entries survive the FP4 cast (fixes under-flush). Default ``0`` =>
+            byte-identical to the legacy ``exp-2`` cast.
+        use_hadamard_col: Apply Hadamard to the COLWISE output, independent of
+            the rowwise flag. ``None`` (default) => same as ``use_hadamard`` so
+            existing callers are byte-identical. Setting it differently lets ONE
+            dual launch emit asymmetric row/col Hadamard (no frontend split cast).
+        use_sr_col: Stochastic rounding for the COLWISE output, independent of
+            ``use_sr``. ``None`` (default) => same as ``use_sr``.
 
     Returns:
         (row_fp4, row_scale, col_fp4, col_scale):
@@ -107,7 +169,10 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
             col_fp4:   [K, M/2] uint8.
             col_scale: [K_pad, cscale_n_pad] uint8.
     """
-    _ensure_dual_registered()
+    if use_hadamard_col is None:
+        use_hadamard_col = use_hadamard
+    if use_sr_col is None:
+        use_sr_col = use_sr
     M, K = x.shape
 
     rscale_n = (K + 31) // 32
@@ -124,11 +189,31 @@ def cast_mxfp4_dual(x, *, shuffle_fp4, shuffle_colwise_fp4=True,
         jax.ShapeDtypeStruct((K, M // 2), jnp.uint8),
         jax.ShapeDtypeStruct((c_k_pad, cscale_n_pad), jnp.uint8),
     )
+    attrs = dict(
+        shuffle_fp4=shuffle_fp4,
+        shuffle_colwise_fp4=shuffle_colwise_fp4,
+        shuffle_scales=shuffle_scales,
+        use_hadamard=use_hadamard,
+        use_hadamard_col=use_hadamard_col,
+        use_sr=use_sr,
+        use_sr_col=use_sr_col,
+        scale_margin=np.int32(scale_margin),
+        scale_mode=np.int32(scale_mode),
+        use_2d_scale=use_2d_scale,
+    )
+    if use_sr or use_sr_col:
+        _ensure_keyed_dual_registered()
+        sr_key = _validate_sr_key(sr_key)
+        call = jax.ffi.ffi_call(
+            "CastMxfp4DualKeyedSrJA", out_shapes,
+            vmap_method="broadcast_all",
+            has_side_effect=False,
+        )
+        return call(x, sr_key, sr_role=np.int32(sr_role), **attrs)
+    _ensure_dual_registered()
     call = jax.ffi.ffi_call(
         "CastMxfp4DualJA", out_shapes,
         vmap_method="broadcast_all",
         has_side_effect=False,
     )
-    return call(x, shuffle_fp4=shuffle_fp4,
-                shuffle_colwise_fp4=shuffle_colwise_fp4,
-                use_hadamard=use_hadamard)
+    return call(x, **attrs)

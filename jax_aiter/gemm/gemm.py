@@ -4,12 +4,9 @@
 
 Forward: Out = A @ B^T using hand-tuned ASM kernels via FFI.
 Backward:
-  dA = dOut @ B  -- always AITER ASM GEMM
-  dB = dOut^T @ A -- multi-backend, selected by AITER_DB_BACKEND env var:
-    "hipblaslt" (default) -- lax.dot_general → hipBLASLt, XLA-pipelined
-    "ck"                  -- CK Col/Row/Row zero-copy GEMM via FFI
-    "triton"              -- Triton NN-layout GEMM via jax_triton
-    "fused"               -- Fused dA+dB (closed: OOM at production scale)
+  dA = dOut @ B   -- AITER ASM GEMM
+  dB = dOut^T @ A -- lax.dot_general → hipBLASLt, so XLA pipelines it across
+                     scan layers
 
 GSPMD sharding: custom_partitioning tells XLA how to partition the FFI call.
   Out[M,N] = A[M,K] @ B[N,K]^T
@@ -128,78 +125,6 @@ def gemm(
     return _gemm_partitioned(a, b)
 
 
-_DB_BACKEND_CACHE = None
-
-
-def _get_db_backend():
-    """Select the backward dB backend.
-
-    Checked once at first call, then cached. Priority:
-
-    1. AITER_DB_BACKEND env var (explicit selection):
-       "hipblaslt" -- native lax.dot_general → hipBLASLt (default, XLA-pipelined)
-       "ck"        -- CK Col/Row/Row zero-copy GEMM via FFI (no workspace)
-       "triton"    -- Triton NN-layout GEMM via jax_triton (requires triton)
-       "fused"     -- Fused dA+dB in one FFI call (closed: OOM at production scale)
-
-    2. Legacy env var fallback (backward compat):
-       AITER_CK_DB=1      → "ck"
-       AITER_TRITON_DB=1   → "triton"
-       AITER_FUSED_BWD=1   → "fused"
-    """
-    global _DB_BACKEND_CACHE
-    if _DB_BACKEND_CACHE is not None:
-        return _DB_BACKEND_CACHE
-
-    import os
-    backend = os.environ.get("AITER_DB_BACKEND", "").lower()
-
-    if backend in ("hipblaslt", "ck", "fused"):
-        _DB_BACKEND_CACHE = backend
-        return backend
-
-    if backend == "triton":
-        from ..triton import is_triton_available
-        if is_triton_available():
-            _DB_BACKEND_CACHE = "triton"
-            return "triton"
-        _DB_BACKEND_CACHE = "hipblaslt"
-        return "hipblaslt"
-
-    if os.environ.get("AITER_CK_DB", "0") == "1":
-        _DB_BACKEND_CACHE = "ck"
-    elif os.environ.get("AITER_FUSED_BWD", "0") == "1":
-        _DB_BACKEND_CACHE = "fused"
-    elif os.environ.get("AITER_TRITON_DB", "0") == "1":
-        from ..triton import is_triton_available
-        if is_triton_available():
-            _DB_BACKEND_CACHE = "triton"
-        else:
-            _DB_BACKEND_CACHE = "hipblaslt"
-    else:
-        _DB_BACKEND_CACHE = "hipblaslt"
-
-    return _DB_BACKEND_CACHE
-
-
-def gemm_ck_db(g, a):
-    """CK dB: dB[N,K] = g[M,N]^T @ a[M,K] via zero-copy Col/Row/Row GEMM.
-
-    Row-major g[M,N] is reinterpreted as col-major A[N,M] by CK without data
-    movement. No transpose kernel, no workspace buffer.
-    """
-    from ..ffi.registry import register_ffi_target
-    register_ffi_target("GemmCkDbJA", "ROCM")
-    N = g.shape[1]
-    K = a.shape[1]
-    call = jax.ffi.ffi_call(
-        "GemmCkDbJA",
-        jax.ShapeDtypeStruct((N, K), jnp.bfloat16),
-        vmap_method="broadcast_all",
-    )
-    return call(g, a)
-
-
 def _gemm_fwd(a, b):
     out = gemm(a, b)
     # Save B untransposed — avoid storing B^T through the scan carry.
@@ -210,36 +135,16 @@ def _gemm_fwd(a, b):
 
 def _gemm_bwd(residuals, grad_out):
     a, b = residuals
-    backend = _get_db_backend()
 
     # Forward was: Out[M,N] = A[M,K] @ B[N,K]^T
 
-    # Fused backward computes both dA and dB in one FFI call.
-    # Closed at production scale (OOM), kept behind AITER_DB_BACKEND=fused.
-    if backend == "fused":
-        from ..gemm_bwd_fused import gemm_bwd_fused
-        g = grad_out.astype(jnp.bfloat16)
-        da, db = gemm_bwd_fused(g, b, a)
-        return da, db
-
-    # --- dA: AITER ASM by default, hipBLASLt if AITER_HIPBLASLT_DA=1 ---
     # dA[M,K] = grad_out[M,N] @ B[N,K]
-    import os
-    if os.environ.get("AITER_HIPBLASLT_DA", "0") == "1":
-        da = jax.lax.dot_general(grad_out, b, (((1,), (0,)), ((), ())))
-    else:
-        b_t = jnp.transpose(b, (1, 0))
-        da = gemm(grad_out, b_t)
+    b_t = jnp.transpose(b, (1, 0))
+    da = gemm(grad_out, b_t)
 
-    # --- dB: backend-selected ---
-    if backend == "ck":
-        db = gemm_ck_db(grad_out.astype(jnp.bfloat16), a)
-    elif backend == "triton":
-        from ..triton import gemm_db_triton
-        db = gemm_db_triton(grad_out, a)
-    else:
-        # hipblaslt (default): XLA-native, gets pipelined across scan layers
-        db = jax.lax.dot_general(grad_out, a, (((0,), (0,)), ((), ())))
+    # dB[N,K] = grad_out[M,N]^T @ A[M,K]. XLA-native so it pipelines across
+    # scan layers.
+    db = jax.lax.dot_general(grad_out, a, (((0,), (0,)), ((), ())))
 
     return da, db
 

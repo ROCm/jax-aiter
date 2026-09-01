@@ -1,0 +1,204 @@
+name: JAX-AITER Weekly Convergence (8x MI355)
+
+# Convergence is checked WEEKLY, not nightly, by explicit decision: a single
+# MLPerf-directional leg is a multi-hour 6,000-step run against the real C4
+# corpus, and running two arms of that every night would consume the 8-GPU box
+# for most of the week while telling us almost nothing new -- AITER pin moves
+# that break numerics overwhelmingly break the nightly test suite or the
+# throughput gate first.
+#
+# Arms: MXFP4 and BF16 only. Plain FP8 is non-finite on this recipe and is
+# deliberately omitted rather than left to fail every week.
+#
+# PRECONDITION: the runner needs the ~125 GB C4 corpus and the Llama 3.1 8B
+# tokenizer/checkpoint under $JA_DATA_ROOT. That data currently lives on
+# smci355-ccs-aus-m15-29, NOT on the runner. Until it is staged (or a shared
+# mount is added), the preflight job reports "data absent" and the run is
+# SKIPPED, not failed -- a workflow that goes red every Sunday for a missing
+# mount trains everyone to ignore it, which is how the previous nightly sat
+# broken for ten consecutive nights without anyone noticing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "Training steps per arm"
+        type: string
+        default: "6000"
+  schedule:
+    # 02:00 UTC Sunday -- the quietest window on the shared box.
+    - cron: '0 2 * * 0'
+
+concurrency:
+  group: weekly-convergence-8gpu
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  JA_ROOT_DIR: /jax-aiter
+  AITER_SYMBOL_VISIBLE: 1
+  GPU_ARCHS: gfx950
+  ROCM_VERSION: "7.14.0"
+  AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
+  # Override at the repo/runner level once the corpus is staged somewhere else.
+  JA_DATA_ROOT: /data/aiter_proj/datasets
+
+jobs:
+  preflight:
+    name: check the corpus is present
+    runs-on: linux-jax-aiter-mi355-8
+    timeout-minutes: 15
+    outputs:
+      have_data: ${{ steps.check.outputs.have_data }}
+    steps:
+      - name: Look for the C4 corpus and tokenizer
+        id: check
+        run: |
+          missing=0
+          for p in \
+            "$JA_DATA_ROOT/mlperf_c4/c4-train.en_6_text_document.bin" \
+            "$JA_DATA_ROOT/mlperf_c4/c4-validation-91205-samples.en_text_document.bin"
+          do
+            if [ ! -s "$p" ]; then
+              echo "::warning::missing $p"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "0" ]; then
+            echo "have_data=true" >> "$GITHUB_OUTPUT"
+            echo "corpus present under $JA_DATA_ROOT"
+          else
+            echo "have_data=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Convergence skipped"
+              echo ""
+              echo "The C4 corpus is not staged under \`$JA_DATA_ROOT\` on this"
+              echo "runner, so the weekly convergence run cannot start."
+              echo ""
+              echo "To enable it, stage the MLPerf C4 \`.bin\`/\`.idx\` pair and the"
+              echo "Llama 3.1 8B tokenizer there (~125 GB), or point"
+              echo "\`JA_DATA_ROOT\` at a shared mount that already has them."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  converge:
+    name: convergence ${{ matrix.arm }} (8x MI355)
+    needs: preflight
+    if: needs.preflight.outputs.have_data == 'true'
+    strategy:
+      fail-fast: false
+      # One arm at a time: both want all 8 GPUs on the same box.
+      max-parallel: 1
+      matrix:
+        arm: [mxfp4, bf16]
+    runs-on: linux-jax-aiter-mi355-8
+    timeout-minutes: 720
+    env:
+      CONTAINER_NAME: ja_weekly_conv_${{ matrix.arm }}_${{ github.run_id }}
+    steps:
+      - name: Fix permissions from a previous container run
+        run: |
+          if [ -d "${{ github.workspace }}" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Fetch prebuilt JIT libs for the current pin
+        id: fetch_jit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p build/aiter_build
+          bash ci/fetch_jit_libs.sh
+
+      - name: Fail if the JIT libs are missing
+        if: steps.fetch_jit.outputs.rebuild == 'true'
+        run: |
+          echo "::error::No JIT libs matched this AITER pin / arch / JIT recipe." >&2
+          echo "The nightly publishes these on every pin bump; run it, or the" >&2
+          echo "'JIT libs (build + publish)' workflow, then re-run this job." >&2
+          exit 1
+
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Launch 8-GPU container
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" \
+            --network=host --device=/dev/kfd --device=/dev/dri \
+            --ipc=host --shm-size=64G --group-add=video \
+            --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            -e JA_ROOT_DIR -e AITER_SYMBOL_VISIBLE -e GPU_ARCHS -e AITER_ASM_DIR \
+            -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+            -v "${{ github.workspace }}:/jax-aiter" \
+            -v "$JA_DATA_ROOT:/datasets:ro" \
+            -w /jax-aiter "$IMAGE" tail -f /dev/null
+
+      # -u 0 throughout: the project-wide convention, and harmless where exec is
+      # already root. It is NOT a fix for the apt failure the nightly perf leg
+      # hit -- that turned out to be per-node, not per-pool; see the note in
+      # nightly-perf.yml. These legs compile, so they need the apt tooling and
+      # cannot use setup_jax's --no-apt escape.
+      - name: Wait for an idle GPU
+        run: |
+          # rocm-smi ships in the runtime image, not necessarily on the ARC
+          # runner host, so the gate runs after the container is up.
+          docker exec -u 0 "$CONTAINER_NAME" bash -lc \
+            'bash scripts/wait_for_idle_gpu.sh' || true
+
+      - name: Install tooling and JAX
+        run: docker exec -u 0 "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+
+      - name: Build against the current pin
+        run: |
+          docker exec -u 0 -e JA_SKIP_JIT_BUILD=true "$CONTAINER_NAME" \
+            bash -lc 'bash ci/build.sh'
+
+      - name: Install MaxText at the pinned recipe commit
+        run: |
+          docker exec -u 0 -e MAXTEXT_DIR=/maxtext_conv "$CONTAINER_NAME" \
+            bash -lc 'JA_MAXTEXT_ONLY=1 bash ci/perf/run_8b_fp4.sh'
+
+      - name: Run the ${{ matrix.arm }} convergence leg
+        run: |
+          docker exec -u 0 \
+            -e PROJECT_ROOT=/ \
+            -e JAX_AITER_ROOT=/jax-aiter \
+            -e MAXTEXT_ROOT=/maxtext_conv \
+            -e DATA_ROOT=/datasets \
+            -e XLA_PYTHON_CLIENT_MEM_FRACTION=.97 \
+            "$CONTAINER_NAME" bash -lc '
+              bash scripts/recipes/run_mlperf_ttc_8b.sh \
+                weekly_${{ matrix.arm }} ${{ matrix.arm }} \
+                /jax-aiter/ci_conv_out "${{ inputs.steps || 6000 }}"
+            '
+
+      - name: Hand output back to the runner user
+        if: always()
+        run: |
+          if [ -d "${{ github.workspace }}/ci_conv_out" ]; then
+            sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/ci_conv_out"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: weekly-convergence-${{ matrix.arm }}
+          path: |
+            ci_conv_out/**/train.log
+            ci_conv_out/**/*.json
+            ci_conv_out/**/*.md
+          if-no-files-found: warn
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$CONTAINER_NAME" || true

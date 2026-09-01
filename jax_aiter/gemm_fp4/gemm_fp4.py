@@ -32,9 +32,92 @@ Env vars (advanced)
 ``AITER_FUSED_QUANT_HADAMARD=1``
     Apply Hadamard to ALL casts (act / weight / grad). Debug / ablation
     knob. Default applies Hadamard ONLY to the grad cast.
-``AITER_KERNEL_SEL=1``
-    Use AITER's per-shape tuned-kernel CSV instead of the default static
-    heuristic. Opt-in.
+``JA_FP4_DGRAD_PARTITION=gather``
+    FSDP/Shardy-correct FP4 dgrad rollback. ``gather`` replicates the logical
+    bf16 weight over N, casts the full weight locally, then runs the FP4 GEMM.
+    **DEFAULT = ``gather_packed``**, which all-gathers concat-safe unshuffled
+    packed FP4 plus linear scales over N and shuffles in the GEMM body (~4x less
+    communication). The former pre-shuffled-weight gather was corrupt under
+    Shardy and has been removed.
+``JA_FP4_DGRAD_REUSE_FWD_COL=1`` (DEFAULT-OFF; Experiment B)
+    Reuse the forward's columnwise weight cast in the packed dgrad instead of
+    RE-casting the raw bf16 weight every backward. Only active under the default
+    ``gather_packed`` dgrad. When set, the FORWARD produces the UNSHUFFLED colwise
+    weight (``_cast_wt_colwise_unshuf(b)`` -- packed [K, N/2] + LINEAR E8M0 scale)
+    and stashes it as the weight-colwise residual (tagged with the same
+    ``mxfp4_wt_col`` ``checkpoint_name`` so a ``save_fp4col`` remat policy SAVES it,
+    exactly like NVIDIA TE checkpoints its transposed weight operand); the packed
+    dgrad then CONSUMES that saved residual and skips ``_cast_wt_colwise_unshuf``
+    (~224 fewer backward ``CastMxfp4DualJA`` at 8B = 7 projections x 32 layers).
+    Byte-identical to the recast path by construction (the saved residual IS
+    ``_cast_wt_colwise_unshuf(b)`` for the SAME weight ``b``), and Shardy-safe: the
+    saved residual carries the correct N-sharding and the dgrad still all-gathers
+    the UNSHUFFLED packed weight over N + shuffles in-body (concat-safe; unlike the
+    corrupt reuse of the SHUFFLED colwise weight). The forward's shuffled
+    colwise weight (dead under ``gather_packed``) is dropped, and the raw bf16
+    weight is no longer stashed. **Unset / 0 (default) => the packed dgrad
+    re-casts (byte-identical behavior).** Reversible: frontend-only,
+    trace-time flag, no kernel rebuild.
+``JA_FP4_SCALE_MARGIN=<int>``
+    E8M0 under-flush headroom for the DGRAD (gradient) cast (B2). The fused cast
+    kernel computes the per-32-block scale as ``2^(exp - 2 - scale_margin)``;
+    a positive margin SHRINKS the block scale so small gradient entries that
+    would flush to FP4 code +/-0 instead survive as ``+/-0.5*scale`` -- directly
+    targeting the §9 dgrad grad-operand under-flush (recovering the dgrad-bf16
+    accuracy win at full FP4 speed, no bf16/fp8 backward GEMM) at the cost of
+    clipping the few largest entries. Applied to the grad cast ONLY (fprop /
+    weight casts stay at margin 0). The resolved value is printed once at import.
+    **Unset / 0 (default) => byte-identical to the legacy ``exp-2`` cast.**
+    Reversible debug knob.
+``JA_FP4_SR_PASSES=<comma-list of {dgrad_grad,act,wt}>``
+    Per-ROLE stochastic rounding (B1). SR makes the FP32->FP4 cast UNBIASED
+    (``E[SR(x)] == x``) so small entries probabilistically round up instead of
+    flushing to FP4 code 0 -- NVIDIA's actual DGRAD under-flush mitigation
+    ("quantize WITH SR" on the dgrad gradient input). ``dgrad_grad`` scopes SR to
+    the grad cast (both backward grad operands); ``act`` / ``wt`` scope the
+    activation / weight casts. Reuses the per-call ``use_sr`` kernel attr
+    (FRONTEND-only, no kernel rebuild). Unlike a positive ``scale_margin`` it does
+    NOT shrink the block scale, so it fixes under-flush WITHOUT clipping the large
+    grad entries, and can STACK with ``JA_FP4_SCALE_MARGIN``. Differs from the
+    global ``AITER_FP4_SR=1`` (SR on every cast).
+    **Unset (default) => RNE everywhere (byte-identical).** Reversible.
+``JA_FP4_PACK_GATEUP_AG`` (DEFAULT-ON since 2026-07-13; set ``=0`` to disable)
+    Quantize the MLP gate/up weight ALL-GATHER (Lever B, now default-on).
+    Under pure FSDP the gate/up DenseGeneral weight shards its contraction-K
+    (``embed``) axis, so the rowwise MXFP4 weight cast (which declares its output
+    K-replicated) forces XLA to all-gather the FULL weight in **bf16** before the
+    cast. This flag makes the weight cast run LOCALLY on each K-shard (emitting
+    packed FP4 + scales sharded on K, rowwise UNSHUFFLED) and gathers the **packed
+    u8** operand along the FSDP axis INSIDE the fwd GEMM partition, where it is
+    re-assembled with ``shuffle_weight`` / ``e8m0_shuffle`` before the ASM kernel.
+    Cuts the gate/up weight all-gather from bf16 -> packed-FP4 (~3.76x less
+    volume, ~-5.5 GB/step) with NO numeric change: MXFP4 block=32 along K and the
+    per-shard K = embed/fsdp = 16*32 so blocks never cross a shard boundary
+    (Hadamard is within-block) -- the per-shard cast is byte-identical to the
+    full-K cast, and the gather/shuffle reconstruction is exact (verified). The
+    colwise (dgrad) weight cast becomes K-sharded on its OUTPUT axis, which the
+    existing GEMM partition gathers as packed u8 too (shuffle-compatible along the
+    output axis). **DEFAULT-ON (2026-07-13); set ``JA_FP4_PACK_GATEUP_AG=0`` to
+    restore the byte-identical legacy bf16 weight all-gather (K-replication).**
+    Reversible: flag-gated registration, no kernel rebuild.
+``JA_CAPTURE_DIR=<dir>``
+    Offline-probe capture hook (debug / analysis only). When set, the
+    forward dumps the bf16 ``(a, b)`` operands and the backward dumps the
+    bf16 ``grad_out`` for each distinct ``(M, N, K)`` GEMM site (FIRST
+    occurrence by default), so an offline replay can rebuild the
+    ``(a, b, grad_out)`` triple per projection shape. **Unset (default) =>
+    zero effect:** the guard is a trace-time Python check, so no callback /
+    slice node is added to the graph and production numerics are
+    byte-identical. Reversible: delete the ``_capture_*`` block + the two
+    call sites in the fwd / bwd.
+``JA_CAPTURE_AFTER_STEP=<N>``
+    Steady-state capture knob (only meaningful with ``JA_CAPTURE_DIR`` set).
+    The GEMM call site does not see the training step, so this is compared
+    against a HOST-side per-shape GEMM-call (fire) counter: a site is
+    captured only once its counter reaches ``N``. With ``scan_layers``
+    (and remat) a shape fires ~``num_layers`` (or ~2x) times per step, so
+    ``N`` ~= ``target_step * fires_per_step``. Default ``0`` => capture the
+    FIRST fire (step-0 behavior, backward-compatible).
 """
 
 from __future__ import annotations
@@ -44,6 +127,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp  # noqa: F401  # imported for downstream consumers
+from jax.ad_checkpoint import checkpoint_name
 from jax.experimental.custom_partitioning import custom_partitioning
 from jax.sharding import NamedSharding, PartitionSpec as P
 
@@ -63,7 +147,9 @@ from .fp4_utils import bf16_to_mxfp4, e8m0_shuffle, shuffle_weight  # noqa: F401
 # ---------------------------------------------------------------------------
 try:
     register_ffi_target("CastMxfp4JA", "ROCM")
+    register_ffi_target("CastMxfp4KeyedSrJA", "ROCM")
     register_ffi_target("CastMxfp4DualJA", "ROCM")
+    register_ffi_target("CastMxfp4DualKeyedSrJA", "ROCM")
     register_ffi_target("GemmFp4FwdJA", "ROCM")
 except Exception as exc:  # pragma: no cover -- build-time error path
     raise ImportError(
@@ -74,85 +160,431 @@ except Exception as exc:  # pragma: no cover -- build-time error path
 
 
 # Hadamard "force-on for ALL casts" override. Default is grad-only.
-_HADAMARD_ALL = os.environ.get("AITER_FUSED_QUANT_HADAMARD", "0") == "1"
+# AITER_FP4_HADAMARD_OFF=1 fully disables Hadamard on EVERY cast incl. grad
+# (debug/ablation; default off => unchanged grad-only / all-on behavior).
+_HADAMARD_NONE = os.environ.get("AITER_FP4_HADAMARD_OFF", "0") == "1"
+_HADAMARD_ALL = (os.environ.get("AITER_FUSED_QUANT_HADAMARD", "0") == "1") and not _HADAMARD_NONE
+
+
+def _parse_hadamard_passes():
+    raw = os.environ.get("JA_FP4_HADAMARD_PASSES", "").strip().lower()
+    if not raw:
+        if _HADAMARD_NONE:
+            return frozenset()
+        if _HADAMARD_ALL:
+            return frozenset({"fprop", "dgrad", "wgrad"})
+        return None  # Preserve legacy grad-dual behavior when unset.
+    passes = {p.strip() for p in raw.split(",") if p.strip()}
+    if "none" in passes or "off" in passes:
+        return frozenset()
+    if "all" in passes:
+        return frozenset({"fprop", "dgrad", "wgrad"})
+    if "backward" in passes or "bwd" in passes:
+        passes.update({"dgrad", "wgrad"})
+    allowed = {"grad", "fprop", "dgrad", "wgrad"}
+    return frozenset(p for p in passes if p in allowed)
+
+
+_HADAMARD_PASSES = _parse_hadamard_passes()
+_HADAMARD_LEGACY_GRAD = _HADAMARD_PASSES is None
+_H_FPROP = (not _HADAMARD_LEGACY_GRAD) and "fprop" in _HADAMARD_PASSES
+_H_DGRAD = (not _HADAMARD_LEGACY_GRAD) and "dgrad" in _HADAMARD_PASSES
+_H_WGRAD = (not _HADAMARD_LEGACY_GRAD) and "wgrad" in _HADAMARD_PASSES
+_H_GRAD_COMPAT = (not _HADAMARD_LEGACY_GRAD) and "grad" in _HADAMARD_PASSES
 
 
 # ---------------------------------------------------------------------------
-# Per-shape kernel selection (advanced, opt-in via AITER_KERNEL_SEL=1).
+# Stochastic rounding (SR) for the FP32->FP4 cast (advanced, opt-in via
+# AITER_FP4_SR=1). Same E2M1 grid as the default RNE (NO extra precision) but
+# unbiased: E[dequant(SR(x))] == x. RNE's per-step rounding bias does not
+# cancel across steps; SR's does, so its payoff is cumulative over training --
+# a lever a single-step calibration cannot observe. When enabled, SR is applied
+# to ALL FP4 casts (act / weight / grad), which covers both dgrad operands
+# (grad_out + weight). Read at import (parity with _HADAMARD_ALL); the cast
+# helpers look the module global up at trace time so tests can monkeypatch it.
+# Default off => byte-identical RNE path (the kernel compiles both; the runtime
+# use_sr flag selects). Reversible debug knob.
 # ---------------------------------------------------------------------------
-_KERNEL_SEL_CACHE = None
+_SR_ALL = os.environ.get("AITER_FP4_SR", "0") == "1"
 
 
-def _use_kernel_selection():
-    global _KERNEL_SEL_CACHE
-    if _KERNEL_SEL_CACHE is None:
-        _KERNEL_SEL_CACHE = os.environ.get("AITER_KERNEL_SEL", "0") == "1"
-    return _KERNEL_SEL_CACHE
+# ---------------------------------------------------------------------------
+# Per-ROLE stochastic rounding (B1, advanced, opt-in via JA_FP4_SR_PASSES).
+# Comma-list of {dgrad_grad, act, wt} selecting WHICH cast roles use SR, vs the
+# global AITER_FP4_SR (_SR_ALL) which forces SR on every cast. This is NVIDIA's
+# actual DGRAD under-flush mitigation: SR on the gradient cast makes the cast
+# UNBIASED (E[SR(x)] == x), so small grad entries probabilistically round UP to
+# +/-0.5 instead of deterministically flushing to FP4 code 0 -- the under-flush
+# is averaged out across steps WITHOUT shrinking the block scale (so, unlike a
+# positive scale-margin, it does NOT clip the large grad entries). NVIDIA's
+# nvfp4 recipe applies "quantize WITH SR" to the dgrad gradient input.
+#   * dgrad_grad (aliases: grad, dgrad) -> SR on the grad cast (_cast_grad_dual):
+#     its rowwise output is the dgrad A-operand (grad_out) and colwise is the
+#     wgrad grad-operand -- i.e. SR on BOTH backward grad operands, one launch.
+#   * act (aliases: fprop, fprop_act) -> SR on the activation casts.
+#   * wt  (alias: weight)            -> SR on the weight casts.
+# Reuses the per-call use_sr kernel attr (cast kernel compiles both RNE + SR
+# paths; runtime-selected) => FRONTEND-ONLY, NO kernel rebuild. Read at import
+# (parity with _SR_ALL); helpers look the globals up at trace time. Default
+# empty + AITER_FP4_SR unset => every role RNE (byte-identical). Reversible.
+# ---------------------------------------------------------------------------
+def _parse_sr_passes():
+    raw = os.environ.get("JA_FP4_SR_PASSES", "")
+    return frozenset(p.strip().lower() for p in raw.split(",") if p.strip())
 
 
-def _get_kernel_name(M, N, K):
-    if not _use_kernel_selection():
-        return ""
+_SR_PASSES = _parse_sr_passes()
+_SR_GRAD = _SR_ALL or bool(_SR_PASSES & {"dgrad_grad", "grad", "dgrad"})
+_SR_DGRAD_ROW = _SR_GRAD or bool(_SR_PASSES & {"dgrad_row", "dgrad_grad_row"})
+_SR_WGRAD_COL = _SR_GRAD or bool(_SR_PASSES & {"wgrad_col", "wgrad_grad_col"})
+_SR_ACT = _SR_ALL or bool(_SR_PASSES & {"act", "fprop", "fprop_act"})
+_SR_WT = _SR_ALL or bool(_SR_PASSES & {"wt", "weight"})
+_SR_ANY = _SR_DGRAD_ROW or _SR_WGRAD_COL or _SR_ACT or _SR_WT
+_SR_ROLE_ACT = 0
+_SR_ROLE_WT = 1
+_SR_ROLE_GRAD = 2
+
+
+def _normalize_sr_key(sr_key):
+    """Return the explicit runtime SR key as a uint32[4] JAX array."""
+    if sr_key is None:
+        raise ValueError(
+            "MXFP4 stochastic rounding requires an explicit runtime sr_key"
+        )
+    key = jnp.asarray(sr_key)
+    if jnp.issubdtype(key.dtype, jax.dtypes.prng_key):
+        key = jax.random.bits(key, shape=(4,), dtype=jnp.uint32)
+    if key.dtype != jnp.uint32 or key.shape != (4,):
+        raise ValueError(
+            f"MXFP4 sr_key must be a typed JAX key or uint32[4], got "
+            f"dtype={key.dtype} shape={key.shape}"
+        )
+    return key
+
+
+# ---------------------------------------------------------------------------
+# FSDP/Shardy dgrad partition mode.
+#
+# ``gather_packed`` is the default: cast the N-sharded weight to concat-safe
+# UNSHUFFLED packed FP4 + linear E8M0 scales, all-gather over N, then apply the
+# GEMM layout shuffle in the local computation. ``gather`` is the
+# convergence-proven rollback that gathers the logical bf16 weight before the
+# local cast. The former path that gathered already-shuffled shards was corrupt
+# under Shardy and is deliberately not selectable.
+# ---------------------------------------------------------------------------
+_DGRAD_PARTITION = os.environ.get("JA_FP4_DGRAD_PARTITION", "gather_packed").strip().lower()
+if _DGRAD_PARTITION not in ("gather", "gather_packed"):
+    raise ValueError(
+        "JA_FP4_DGRAD_PARTITION must be 'gather' or 'gather_packed'; "
+        f"got {_DGRAD_PARTITION!r}"
+    )
+_DGRAD_GATHER = _DGRAD_PARTITION == "gather"
+_DGRAD_PACKED = _DGRAD_PARTITION == "gather_packed"
+
+# ---------------------------------------------------------------------------
+# Experiment B (opt-in via JA_FP4_DGRAD_REUSE_FWD_COL=1, DEFAULT-OFF). Reuse the
+# forward's columnwise weight cast in the packed dgrad instead of re-casting the
+# raw bf16 weight every backward. Only meaningful under the default gather_packed
+# dgrad (_DGRAD_PACKED). See the module docstring for the full rationale. Read at
+# import; the fwd/bwd look the module globals up at trace time so tests can
+# monkeypatch. Default off => byte-identical legacy recast behavior.
+# ---------------------------------------------------------------------------
+_DGRAD_REUSE_FWD_COL = os.environ.get("JA_FP4_DGRAD_REUSE_FWD_COL", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# E8M0 scale-margin for the DGRAD (gradient) cast (B2, advanced, opt-in via
+# JA_FP4_SCALE_MARGIN=<int>). The fused cast kernel computes the per-32-block
+# E8M0 scale as 2^(exp - 2 - scale_margin). The hardcoded "-2" is the legacy
+# headroom below the FP4 max; scale_margin adds EXTRA headroom:
+#   * scale_margin > 0  -> SMALLER block scale -> small gradient entries that
+#     would flush to FP4 code +/-0 instead survive as +/-0.5*scale. Directly
+#     targets the §9 dgrad under-flush (grad-operand block-scale median ~2^-20,
+#     ~14.5% of grad entries flushed to 0) at the cost of clipping the few
+#     largest entries (a little more saturation). Recovers the dgrad-bf16
+#     accuracy win at full FP4 speed (no bf16/fp8 backward GEMM).
+#   * scale_margin < 0  -> larger block scale (more under-flush, less clip).
+#   * scale_margin == 0 -> byte-identical to the legacy exp-2 cast (DEFAULT).
+# Applied to the GRAD cast ONLY (_cast_grad_dual): its rowwise output is the
+# dgrad A-operand (dA = grad_out @ b) -- the §9 culprit -- and its colwise
+# output is the wgrad grad-operand (same gradient tensor). fprop activation +
+# weight casts stay at margin 0. Read at import (parity with _HADAMARD_ALL /
+# _SR_ALL); the grad cast helper looks the module global up at trace time so
+# tests can monkeypatch it. Reversible debug knob.
+# ---------------------------------------------------------------------------
+def _parse_scale_margin():
+    raw = os.environ.get("JA_FP4_SCALE_MARGIN", "").strip()
+    if not raw:
+        return 0
     try:
-        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+        return int(raw)
+    except ValueError:
+        return 0
 
-        cfg = get_GEMM_config(M, N, K)
-        if cfg is not None:
-            return cfg["kernelName"]
-    except Exception:
-        pass
-    return ""
+
+_SCALE_MARGIN = _parse_scale_margin()
+
+
+# ---------------------------------------------------------------------------
+# OAS -- overflow-aware scale SELECTION (paper 2603.08713, cast-only, opt-in via
+# JA_FP4_OAS=1). The cast kernel's compute_e8m0_scale gains a scale_mode: mode 1
+# FLOORs amax to a power of two (exp = floor(log2 amax)) instead of rounding to
+# the nearest, so the per-32-block max normalizes to [4, 8) and targets the high
+# end of the E2M1 range (~(3.5,7]) -- letting the top of a binade OVERFLOW (clip
+# to +/-6) in exchange for ~2x more resolution on the small entries that would
+# otherwise flush to zero. DISTINCT from JA_FP4_SCALE_MARGIN: margin is a
+# CONSTANT uniform integer shift on every block (the prior over-clip failure at
+# +1); OAS is a DATA-DEPENDENT rounding-rule change (~half a bit average, bounded
+# overflow). Applied to ALL casts (act / wt / grad) so the whole pipeline gets
+# the overflow-aware scale. Read at import (helpers look it up at trace time so
+# tests can monkeypatch). Default unset => scale_mode 0 => byte-identical.
+# ---------------------------------------------------------------------------
+_OAS_MODE = 1 if os.environ.get("JA_FP4_OAS", "0") == "1" else 0
+
+
+# ---------------------------------------------------------------------------
+# 2D weight scaling (cast-only, opt-in via JA_FP4_WT2D=1). The WEIGHT dual cast
+# shares ONE UE8M0 scale per 32x32 tile across its rowwise + columnwise outputs
+# (use_2d_scale in the cast kernel reduces the tile amax once and feeds both
+# phases), so the weight FP4 codes are IDENTICAL in fprop (rowwise B) and dgrad
+# (colwise B): W_fprop == W_dgrad, removing the row/col scale-inconsistency the
+# 1x32 dual cast introduces (a coarse stand-in for NVFP4's 2D-16x16 weight
+# scale, HW-infeasible on gfx950). Activations + grads stay 1x32 (their backward
+# operands are not the same tensor cast two ways). Applied to the weight dual
+# cast ONLY. Read at import. Default unset => byte-identical 1x32 weight cast.
+# ---------------------------------------------------------------------------
+_WT2D = os.environ.get("JA_FP4_WT2D", "0") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Lever B -- quantized gate/up weight all-gather (JA_FP4_PACK_GATEUP_AG).
+# See the module docstring. DEFAULT-ON (set =0 for byte-identical bf16 weight
+# all-gather: rowwise/dual weight casts force K-replication, exactly as before).
+# ---------------------------------------------------------------------------
+# DEFAULT-ON 2026-07-13: the packed gate/up weight all-gather is now the default
+# (was "0"). It gathers the fwd weight as packed FP4 over K (~3.76x less comm than
+# bf16) with NO numeric change (block=32 never crosses the embed/fsdp K-shard).
+# Escape hatch: JA_FP4_PACK_GATEUP_AG=0 restores the bf16 weight all-gather.
+_PACK_GATEUP_AG = os.environ.get("JA_FP4_PACK_GATEUP_AG", "1") != "0"
+
+# Policy log: emit the resolved DGRAD-cast scale margin once at import so each
+# training leg's log records exactly which margin its grad cast used.
+print("[ja-fp4] DGRAD cast scale_margin = %d "
+      "(E8M0 scale 2^(exp-2-margin); 0 = legacy/bit-identical) | "
+      "OAS scale_mode = %d (1 = floor/overflow-aware) | WT2D = %s "
+      "(2D 32x32 weight scale) | pack_gateup_ag = %s "
+      "(Lever B: quantized gate/up weight all-gather) | "
+      "SR roles: grad=%s dgrad_row=%s wgrad_col=%s act=%s wt=%s | hadamard_passes=%s "
+      "| dgrad_partition=%s | dgrad_reuse_fwd_col=%s"
+      % (_SCALE_MARGIN, _OAS_MODE, _WT2D, _PACK_GATEUP_AG,
+         _SR_GRAD, _SR_DGRAD_ROW, _SR_WGRAD_COL,
+         _SR_ACT, _SR_WT,
+         "legacy_grad" if _HADAMARD_LEGACY_GRAD else ",".join(sorted(_HADAMARD_PASSES)),
+         _DGRAD_PARTITION, _DGRAD_REUSE_FWD_COL),
+      flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Remat residual-save tagging (advanced, opt-in via JA_FP4_REMAT_SAVE_COL).
+# Under MaxText layer-level remat (jax.checkpoint) the columnwise FP4 dual-cast
+# residuals that the custom_vjp fwd declares are RECOMPUTED in the backward
+# unless the remat policy is told to SAVE them. This flag tags those residual
+# outputs with jax.ad_checkpoint.checkpoint_name so a matching MaxText
+# save_only_these_names policy (e.g. remat_policy=minimal_flash_save_fp4col)
+# keeps them as residuals instead of re-firing CastMxfp4DualJA in backward.
+#
+# This is a graph-scheduling lever ONLY: checkpoint_name is an identity at
+# lowering (name_p -> x), so the saved FP4 residual is bit-identical to the
+# recomputed one and numerics are unchanged. The names below MUST match the
+# MaxText policy. Default unset => no name_p added => byte-identical graph to
+# the recompute path (and a no-op for any non-matching remat policy).
+#   unset / "0" / "none"  : tag nothing (default)
+#   "wt"                  : tag the weight-columnwise residual only
+#                           (~6 ms/step floor at 8B, lowest OOM risk)
+#   "act"                 : tag the activation-columnwise residual only
+#                           (~33 ms/step at 8B, the larger chunk)
+#   "both" / "1" / "all"  : tag both columnwise residuals
+# Read at import (parity with _HADAMARD_ALL); the fwd looks the module globals
+# up at trace time so tests can monkeypatch them.
+# ---------------------------------------------------------------------------
+_REMAT_SAVE_COL = os.environ.get("JA_FP4_REMAT_SAVE_COL", "").strip().lower()
+_REMAT_SAVE_WT_COL = _REMAT_SAVE_COL in ("wt", "both", "all", "1")
+_REMAT_SAVE_ACT_COL = _REMAT_SAVE_COL in ("act", "both", "all", "1")
+
+# checkpoint_name tags for the columnwise FP4 residuals. MUST match the
+# MaxText remat save policy (decoders.py get_remat_policy).
+_MXFP4_ACT_COL_NAME = "mxfp4_act_col"
+_MXFP4_WT_COL_NAME = "mxfp4_wt_col"
 
 
 # ---------------------------------------------------------------------------
 # Raw cast helpers -- role-specific flag combinations baked in.
 # ---------------------------------------------------------------------------
 
-def _cast_act_raw(x):
+def _h_act_row():
+    return _HADAMARD_ALL if _HADAMARD_LEGACY_GRAD else _H_FPROP
+
+
+def _h_wt_row():
+    return _HADAMARD_ALL if _HADAMARD_LEGACY_GRAD else _H_FPROP
+
+
+def _h_act_col():
+    return _HADAMARD_ALL if _HADAMARD_LEGACY_GRAD else _H_WGRAD
+
+
+def _h_wt_col():
+    return _HADAMARD_ALL if _HADAMARD_LEGACY_GRAD else _H_DGRAD
+
+
+def _h_grad_row():
+    return (not _HADAMARD_NONE) if _HADAMARD_LEGACY_GRAD else (_H_DGRAD or _H_GRAD_COMPAT)
+
+
+def _h_grad_col():
+    return (not _HADAMARD_NONE) if _HADAMARD_LEGACY_GRAD else (_H_WGRAD or _H_GRAD_COMPAT)
+
+
+def _cast_dual_selective(x, *, shuffle_fp4, shuffle_colwise_fp4,
+                         row_hadamard, col_hadamard, row_sr, col_sr,
+                         sr_key=None, sr_role=0, scale_margin=0, scale_mode=0,
+                         use_2d_scale=False):
+    """Dual-cast with independent row/col Hadamard/SR in ONE fused launch.
+
+    The fused dual-cast kernel takes PER-DIRECTION Hadamard + SR flags
+    (``CastMxfp4DualJA`` ``use_hadamard``/``use_hadamard_col`` +
+    ``use_sr``/``use_sr_col``), so a single launch emits asymmetric row/col
+    settings -- no split cast, no redundant rowwise recompute. When the row and
+    col settings match this is byte-identical to the legacy matched path; when
+    they differ it replaces the former 2-launch split, removing the split-cast
+    throughput tax on selective Hadamard/SR placements.
+    """
+    return _cast_mxfp4_dual_op(
+        x,
+        shuffle_fp4=shuffle_fp4,
+        shuffle_colwise_fp4=shuffle_colwise_fp4,
+        use_hadamard=row_hadamard,
+        use_hadamard_col=col_hadamard,
+        use_sr=row_sr,
+        use_sr_col=col_sr,
+        sr_key=sr_key,
+        sr_role=sr_role,
+        scale_margin=scale_margin,
+        scale_mode=scale_mode,
+        use_2d_scale=use_2d_scale,
+    )
+
+
+def _cast_act_raw(x, sr_key=None):
     """Activation cast: rowwise only, unshuffled, no Hadamard.
 
     Used by the forward-only primal path (no autograd).
     """
-    return _cast_mxfp4_op(x, shuffle_fp4=False, use_hadamard=_HADAMARD_ALL)
+    return _cast_mxfp4_op(x, shuffle_fp4=False, use_hadamard=_h_act_row(),
+                          use_sr=_SR_ACT, sr_key=sr_key,
+                          sr_role=_SR_ROLE_ACT, scale_mode=_OAS_MODE)
 
 
-def _cast_wt_raw(x):
+def _cast_wt_raw(x, sr_key=None):
     """Weight cast: rowwise only, B-preshuffle shuffled, no Hadamard.
 
     Used by the forward-only primal path (no autograd).
     """
-    return _cast_mxfp4_op(x, shuffle_fp4=True, use_hadamard=_HADAMARD_ALL)
+    return _cast_mxfp4_op(x, shuffle_fp4=True, use_hadamard=_h_wt_row(),
+                          use_sr=_SR_WT, sr_key=sr_key,
+                          sr_role=_SR_ROLE_WT, scale_mode=_OAS_MODE)
 
 
-def _cast_act_dual_raw(x):
+def _cast_act_dual_raw(x, sr_key=None):
     """Activation dual-cast: rowwise unshuffled + columnwise shuffled, no Hadamard.
 
     rowwise -> A operand of fprop GEMM
     columnwise -> A operand of wgrad GEMM (via the FFI's NT-layout dB call).
     """
-    return _cast_mxfp4_dual_op(
+    return _cast_dual_selective(
         x,
         shuffle_fp4=False,
         shuffle_colwise_fp4=True,
-        use_hadamard=_HADAMARD_ALL,
+        row_hadamard=_h_act_row(),
+        col_hadamard=_h_act_col(),
+        row_sr=_SR_ACT,
+        col_sr=_SR_ACT,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_ACT,
+        scale_mode=_OAS_MODE,
     )
 
 
-def _cast_wt_dual_raw(x):
+def _cast_wt_dual_raw(x, sr_key=None):
     """Weight dual-cast: rowwise shuffled + columnwise shuffled, no Hadamard.
 
     rowwise -> B operand of fprop GEMM
     columnwise -> B operand of dgrad GEMM (avoids re-quantization in backward).
     """
-    return _cast_mxfp4_dual_op(
+    return _cast_dual_selective(
         x,
         shuffle_fp4=True,
         shuffle_colwise_fp4=True,
-        use_hadamard=_HADAMARD_ALL,
+        row_hadamard=_h_wt_row(),
+        col_hadamard=_h_wt_col(),
+        row_sr=_SR_WT,
+        col_sr=_SR_WT,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_WT,
+        scale_mode=_OAS_MODE,
+        use_2d_scale=_WT2D,
     )
 
 
-def _cast_grad_dual_raw(x):
+# ----- Lever B: K-sharded weight cast helpers (JA_FP4_PACK_GATEUP_AG) -----
+# When the weight's contraction-K axis is FSDP-sharded (gate/up), the rowwise
+# weight cast runs LOCALLY on each K-shard and emits the FP4 data + scales
+# UNSHUFFLED (shuffle_fp4=False, shuffle_scales=False). Unshuffled packed bytes
+# and linear scales concatenate cleanly along K, so the fwd GEMM partition can
+# all-gather the packed u8 along the FSDP axis and re-assemble the kernel layout
+# with shuffle_weight / e8m0_shuffle. (Shuffled rowwise output would entangle
+# K-blocks into the row axis and could NOT be gathered along K.)
+
+def _cast_wt_row_unshuf_raw(x, sr_key=None):
+    """Rowwise weight cast, UNSHUFFLED (Lever B K-sharded path).
+
+    Emits packed FP4 + LINEAR E8M0 scales (no B-preshuffle, no scale shuffle) so
+    the per-K-shard outputs concatenate cleanly along K. The fwd GEMM partition
+    shuffles the gathered full-K operand before the ASM kernel.
+    """
+    return _cast_mxfp4_op(x, shuffle_fp4=False, shuffle_scales=False,
+                          use_hadamard=_h_wt_row(), use_sr=_SR_WT,
+                          sr_key=sr_key, sr_role=_SR_ROLE_WT,
+                          scale_mode=_OAS_MODE)
+
+
+def _cast_wt_dual_ksharded_raw(x, sr_key=None):
+    """Weight dual-cast for a K-sharded weight (Lever B).
+
+    Rowwise output is UNSHUFFLED (gathered + shuffled later in the fwd GEMM);
+    colwise output is SHUFFLED as usual (its gather, along the OUTPUT axis, is
+    shuffle-compatible). Two launches because the rowwise needs unshuffled scales
+    while the colwise needs shuffled scales (the dual kernel shares one
+    shuffle_scales flag). Byte-identical VALUES to ``_cast_wt_dual_raw`` -- only
+    the rowwise shuffle/scale-shuffle layout differs (re-applied after gather).
+    """
+    r_packed, r_scale = _cast_wt_row_unshuf_raw(x, sr_key)
+    _, _, c_packed, c_scale = _cast_mxfp4_dual_op(
+        x,
+        shuffle_fp4=True,
+        shuffle_colwise_fp4=True,
+        use_hadamard=_h_wt_row(),
+        use_hadamard_col=_h_wt_col(),
+        use_sr=_SR_WT,
+        use_sr_col=_SR_WT,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_WT,
+        scale_mode=_OAS_MODE,
+        use_2d_scale=_WT2D,
+    )
+    return r_packed, r_scale, c_packed, c_scale
+
+
+def _cast_grad_dual_raw(x, sr_key=None):
     """Grad dual-cast: rowwise unshuffled + columnwise unshuffled, Hadamard ON.
 
     rowwise -> A operand of dgrad GEMM (dA = grad_out @ B_col).
@@ -164,11 +596,18 @@ def _cast_grad_dual_raw(x):
     packed FP4 values. This decorrelates outliers in the gradient
     distribution. Matches TE PyTorch MXFP4 grad-quantizer default.
     """
-    return _cast_mxfp4_dual_op(
+    return _cast_dual_selective(
         x,
         shuffle_fp4=False,
         shuffle_colwise_fp4=False,
-        use_hadamard=True,
+        row_hadamard=_h_grad_row(),
+        col_hadamard=_h_grad_col(),
+        row_sr=_SR_DGRAD_ROW,
+        col_sr=_SR_WGRAD_COL,
+        sr_key=sr_key,
+        sr_role=_SR_ROLE_GRAD,
+        scale_margin=_SCALE_MARGIN,
+        scale_mode=_OAS_MODE,
     )
 
 
@@ -181,6 +620,35 @@ def _get_spec(info):
     if info.sharding is None:
         return P(*([None] * len(info.shape)))
     return info.sharding.spec
+
+
+# ----- Lever B: K-shard padding-alignment guard (JA_FP4_PACK_GATEUP_AG) -------
+# The fused MXFP4 cast pads its E8M0 scale column count to a multiple of 8 and
+# its row/col extents to a multiple of 256. A per-K-shard cast therefore tiles
+# cleanly under the declared K-sharding ONLY when each shard's K is a multiple of
+# 256 (=> scale columns K_shard/32 is a multiple of 8 and the 256-pad is a no-op).
+# Canonical 8B: embed=4096 / fsdp=8 = 512 (aligned). When NOT aligned the
+# packed-AG path falls back to the legacy bf16 weight all-gather (still correct).
+
+def _mesh_axis_size(mesh, axis):
+    if axis is None:
+        return 1
+    if isinstance(axis, tuple):
+        s = 1
+        for ax in axis:
+            s *= mesh.shape[ax]
+        return s
+    return mesh.shape[axis]
+
+
+def _kshard_packed_ag_ok(mesh, k_axis, k_global):
+    """True iff a K-sharded weight can use the packed-FP4 all-gather path."""
+    if k_axis is None:
+        return False
+    n = _mesh_axis_size(mesh, k_axis)
+    if n <= 1 or (k_global % n) != 0:
+        return False
+    return (k_global // n) % 256 == 0
 
 
 # ----- rowwise-only casts (act / wt) for the forward-only primal -----
@@ -218,18 +686,67 @@ def _make_rowwise_cast_partition(raw_fn):
     return _partition
 
 
+# ----- Lever B: K-sharded-aware rowwise weight cast (JA_FP4_PACK_GATEUP_AG) ---
+# Allows the weight's contraction-K axis to stay FSDP-sharded: the cast runs
+# locally on the K-shard and emits UNSHUFFLED packed FP4 + linear scales sharded
+# on K (gathered + shuffled later in the fwd GEMM). When K is NOT sharded (down
+# proj, or unsharded) it behaves exactly like the legacy rowwise weight cast.
+
+def _cast_wt_rowwise_infer_ag(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    k_axis = x_spec[1] if len(x_spec) > 1 else None
+    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
+        return (NamedSharding(mesh, P(m_axis, k_axis)),
+                NamedSharding(mesh, P(m_axis, k_axis)))
+    return _cast_rowwise_infer_sharding(mesh, arg_shapes, result_shape)
+
+
+def _cast_wt_rowwise_partition_ag(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    k_axis = x_spec[1] if len(x_spec) > 1 else None
+    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
+        in_spec = P(m_axis, k_axis)
+        out_spec = P(m_axis, k_axis)
+    else:
+        in_spec = P(m_axis, None)
+        out_spec = P(m_axis, None)
+    # Emit UNSHUFFLED for BOTH the K-sharded (gate/up, gathered) and K-local
+    # (down/O) cases: under PACK the shuffle is applied in the fwd GEMM base body
+    # (`_fp4_fwd_kgather`) so it survives shardy=True. shuffle_weight(unshuffled)
+    # is byte-identical to the shuffled cast (verified), so down/O numerics are
+    # unchanged -- only the shuffle location moves (cast -> fwd body).
+    raw_fn = _cast_wt_row_unshuf_raw
+
+    def _lowered(x):
+        return raw_fn(x)
+
+    return (mesh, _lowered,
+            (NamedSharding(mesh, out_spec), NamedSharding(mesh, out_spec)),
+            (NamedSharding(mesh, in_spec),))
+
+
 _cast_act.def_partition(
     _make_rowwise_cast_partition(_cast_act_raw),
     infer_sharding_from_operands=_cast_rowwise_infer_sharding,
     sharding_rule="m k -> m kp, m sp",
     need_replication_factors=("k", "kp", "sp"),
 )
-_cast_wt.def_partition(
-    _make_rowwise_cast_partition(_cast_wt_raw),
-    infer_sharding_from_operands=_cast_rowwise_infer_sharding,
-    sharding_rule="m k -> m kp, m sp",
-    need_replication_factors=("k", "kp", "sp"),
-)
+if _PACK_GATEUP_AG:
+    _cast_wt.def_partition(
+        _cast_wt_rowwise_partition_ag,
+        infer_sharding_from_operands=_cast_wt_rowwise_infer_ag,
+        sharding_rule="m k -> m kp, m sp",
+        need_replication_factors=(),
+    )
+else:
+    _cast_wt.def_partition(
+        _make_rowwise_cast_partition(_cast_wt_raw),
+        infer_sharding_from_operands=_cast_rowwise_infer_sharding,
+        sharding_rule="m k -> m kp, m sp",
+        need_replication_factors=("k", "kp", "sp"),
+    )
 
 
 # ----- dual casts (rowwise + columnwise) for fwd-with-residuals + bwd -----
@@ -249,6 +766,11 @@ def _cast_wt_dual(x):
 @custom_partitioning
 def _cast_grad_dual(x):
     return _cast_grad_dual_raw(x)
+
+
+@custom_partitioning
+def _cast_grad_dual_keyed(x, sr_key):
+    return _cast_grad_dual_raw(x, sr_key)
 
 
 def _cast_dual_infer_sharding(mesh, arg_shapes, result_shape):
@@ -278,15 +800,135 @@ def _make_dual_cast_partition(raw_fn):
     return _partition
 
 
-for _wrapped, _raw in (
-    (_cast_act_dual,  _cast_act_dual_raw),
-    (_cast_wt_dual,   _cast_wt_dual_raw),
-    (_cast_grad_dual, _cast_grad_dual_raw),
-):
+def _cast_dual_keyed_partition(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    in_spec = P(m_axis, None)
+    row_spec = P(m_axis, None)
+    col_spec = P(None, m_axis)
+
+    def _lowered(x, sr_key):
+        return _cast_grad_dual_raw(x, sr_key)
+
+    return (
+        mesh,
+        _lowered,
+        (
+            NamedSharding(mesh, row_spec),
+            NamedSharding(mesh, row_spec),
+            NamedSharding(mesh, col_spec),
+            NamedSharding(mesh, col_spec),
+        ),
+        (
+            NamedSharding(mesh, in_spec),
+            NamedSharding(mesh, P(None)),
+        ),
+    )
+
+
+# ----- Lever B: K-sharded-aware weight dual cast (JA_FP4_PACK_GATEUP_AG) ------
+# For a K-sharded weight (gate/up) the dual cast runs locally on the K-shard:
+#   * rowwise output  -> UNSHUFFLED, sharded on K (axis1) -> fprop B (gathered +
+#     shuffled in the fwd GEMM).
+#   * colwise output  -> SHUFFLED, sharded on K (axis0 = the dgrad OUTPUT axis)
+#     -> dgrad B (gathered as packed u8 by the existing GEMM partition; the
+#     colwise B-preshuffle is shuffle-compatible with a gather along its output
+#     axis, verified).
+# When K is NOT sharded (down proj) it behaves exactly like the legacy weight
+# dual cast (single fused launch, shuffled rowwise).
+
+def _cast_wt_dual_infer_ag(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    k_axis = x_spec[1] if len(x_spec) > 1 else None
+    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
+        return (NamedSharding(mesh, P(m_axis, k_axis)),
+                NamedSharding(mesh, P(m_axis, k_axis)),
+                NamedSharding(mesh, P(k_axis, None)),
+                NamedSharding(mesh, P(k_axis, None)))
+    return _cast_dual_infer_sharding(mesh, arg_shapes, result_shape)
+
+
+def _cast_wt_dual_partition_ag(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    k_axis = x_spec[1] if len(x_spec) > 1 else None
+    if _kshard_packed_ag_ok(mesh, k_axis, arg_shapes[0].shape[1]):
+        in_spec = P(m_axis, k_axis)
+        row_spec = P(m_axis, k_axis)
+        col_spec = P(k_axis, None)
+    else:
+        in_spec = P(m_axis, None)
+        row_spec = P(m_axis, None)
+        col_spec = P(None, m_axis)
+    # UNSHUFFLED rowwise for BOTH cases (colwise stays shuffled): under PACK the
+    # rowwise B-preshuffle is applied in the fwd GEMM base body (`_fp4_fwd_kgather`)
+    # so it survives shardy=True. Byte-identical rowwise result to the shuffled
+    # dual cast (shuffle_weight(unshuffled) == shuffled), so down/O fwd numerics
+    # are unchanged; the colwise (dgrad B) path is untouched.
+    raw_fn = _cast_wt_dual_ksharded_raw
+
+    def _lowered(x):
+        return raw_fn(x)
+
+    return (mesh, _lowered,
+            (NamedSharding(mesh, row_spec), NamedSharding(mesh, row_spec),
+             NamedSharding(mesh, col_spec), NamedSharding(mesh, col_spec)),
+            (NamedSharding(mesh, in_spec),))
+
+
+# --- Dual-cast Shardy sharding rules -----------------------------------------
+# The colwise outputs are [K, M/2] (fp4) and [K_pad, M/32] (scale). For the
+# ACTIVATION and GRAD dual casts the colwise M-dim is the FSDP-sharded TOKEN
+# axis, so Shardy must propagate the input-M sharding to the colwise outputs --
+# otherwise (the legacy "replicated colwise M" rule) Shardy treats each device's
+# local colwise shard as the full replicated tensor and the FP4 wgrad
+# (`db = grad_col @ act_col` over the token axis) reads mismatched data/scales,
+# giving a ~2^20 gradient blow-up under shardy=True (the 1B base.yml default).
+# To tie the colwise packed (M/2) and scale (M/32) M-dims to the input M,
+# express them as compound factors of a shared base factor c = M/32 (so the M
+# sharding follows c on all four outputs): sf=32 (M = c*32), hf=16 (M/2 = c*16).
+#   NOTE: GSPMD (shardy=False) ignores sharding_rule and uses the partition
+#   callback (byte-identical to before); this is a Shardy-propagation-only fix.
+_DUAL_CAST_RULE_SHARDED_M = "(c sf) k -> (c sf) rkp, (c sf) rsp, k (c hf), k c"
+# The WEIGHT dual cast keeps the legacy replicated-colwise rule: its colwise
+# M-dim (= weight N_out) is the dgrad CONTRACTION axis, REPLICATED under FSDP
+# (the dgrad GEMM forces it replicated), so dgrad stays unchanged / working.
+_DUAL_CAST_RULE_REPL_M = "m k -> m rkp, m rsp, k cmp, k csp"
+
+for _wrapped, _raw in ((_cast_act_dual, _cast_act_dual_raw),
+                       (_cast_grad_dual, _cast_grad_dual_raw)):
     _wrapped.def_partition(
         _make_dual_cast_partition(_raw),
         infer_sharding_from_operands=_cast_dual_infer_sharding,
-        sharding_rule="m k -> m rkp, m rsp, k cmp, k csp",
+        sharding_rule=_DUAL_CAST_RULE_SHARDED_M,
+        # Shardy requires special-factor indices in ascending first-appearance
+        # order: c=0, sf=1, k=2, rkp=3, rsp=4, hf=5 (c is the sharded M base).
+        need_replication_factors=("sf", "k", "rkp", "rsp", "hf"),
+        sf=32, hf=16,
+    )
+
+_cast_grad_dual_keyed.def_partition(
+    _cast_dual_keyed_partition,
+    infer_sharding_from_operands=_cast_dual_infer_sharding,
+    sharding_rule="(c sf) k, r -> (c sf) rkp, (c sf) rsp, k (c hf), k c",
+    need_replication_factors=("sf", "k", "r", "rkp", "rsp", "hf"),
+    sf=32,
+    hf=16,
+)
+
+if _PACK_GATEUP_AG:
+    _cast_wt_dual.def_partition(
+        _cast_wt_dual_partition_ag,
+        infer_sharding_from_operands=_cast_wt_dual_infer_ag,
+        sharding_rule=_DUAL_CAST_RULE_REPL_M,
+        need_replication_factors=(),
+    )
+else:
+    _cast_wt_dual.def_partition(
+        _make_dual_cast_partition(_cast_wt_dual_raw),
+        infer_sharding_from_operands=_cast_dual_infer_sharding,
+        sharding_rule=_DUAL_CAST_RULE_REPL_M,
         need_replication_factors=("k", "rkp", "rsp", "cmp", "csp"),
     )
 
@@ -353,11 +995,350 @@ def _fp4_partition(mesh, arg_shapes, result_shape):
              NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec)))
 
 
-_fp4_ffi_partitioned.def_partition(
-    _fp4_partition,
-    infer_sharding_from_operands=_fp4_infer_sharding,
+# ----- Lever B: K-sharded-b fwd GEMM with packed all-gather (PACK_GATEUP_AG) --
+# For gate/up the rowwise weight B arrives K-sharded (axis1 = contraction) and
+# UNSHUFFLED (from the Lever-B weight cast), while A (activation) has full K
+# (sharded on M). The partition all-gathers the packed u8 B + its linear scales
+# along the FSDP axis, re-assembles the ASM layout (shuffle_weight / e8m0_shuffle)
+# and runs the GEMM -- replacing the legacy bf16 weight all-gather with a
+# ~3.76x-smaller packed-FP4 all-gather. When B's K axis is NOT sharded (down,
+# dgrad, attention, replicated) it defers to the legacy ``_fp4_partition``.
+
+def _fp4_b_k_axis(mesh, arg_shapes):
+    """Return b's K (axis1, contraction) mesh axis iff it is sharded AND the
+    packed all-gather path is padding-aligned; else None (legacy)."""
+    b_spec = _get_spec(arg_shapes[1])
+    b_k = b_spec[1] if b_spec is not None and len(b_spec) > 1 else None
+    # arg_shapes[1] is the PACKED weight [N, K/2]; K_global = (K/2)*2.
+    k_global = arg_shapes[1].shape[1] * 2
+    return b_k if _kshard_packed_ag_ok(mesh, b_k, k_global) else None
+
+
+def _fp4_infer_ag(mesh, arg_shapes, result_shape):
+    b_k = _fp4_b_k_axis(mesh, arg_shapes)
+    if b_k is not None:
+        a_spec = _get_spec(arg_shapes[0])
+        b_spec = _get_spec(arg_shapes[1])
+        a_m = a_spec[0]
+        b_n = b_spec[0]
+        if b_n == a_m:
+            b_n = None
+        return NamedSharding(mesh, P(a_m, b_n))
+    return _fp4_infer_sharding(mesh, arg_shapes, result_shape)
+
+
+def _fp4_partition_ag(mesh, arg_shapes, result_shape):
+    a_spec = _get_spec(arg_shapes[0])
+    b_spec = _get_spec(arg_shapes[1])
+    b_k = _fp4_b_k_axis(mesh, arg_shapes)
+
+    if b_k is None:
+        # No K-sharded B operand -> legacy behavior (down / dgrad / replicated).
+        return _fp4_partition(mesh, arg_shapes, result_shape)
+
+    a_m = a_spec[0]
+    b_n = b_spec[0]
+    out_n = None if b_n == a_m else b_n
+    ag_axis = b_k
+
+    a_pspec = P(a_m, None)        # activation: M-sharded, full K
+    b_pspec = P(b_n, b_k)         # weight: K-sharded (axis1), unshuffled
+    out_pspec = P(a_m, out_n)
+
+    def _lowered(a_packed, b_packed, a_scale, b_scale):
+        # Gather the packed u8 weight + linear scales to full K, then re-assemble
+        # the ASM (B-preshuffle) layout. Concatenation along K is exact for the
+        # unshuffled cast (MXFP4 block=32 never crosses the K-shard boundary).
+        b_full = jax.lax.all_gather(b_packed, ag_axis, axis=1, tiled=True)
+        bs_full = jax.lax.all_gather(b_scale, ag_axis, axis=1, tiled=True)
+        b_sh = shuffle_weight(b_full)
+        bs_sh = e8m0_shuffle(bs_full)
+        return _gemm_fp4_ffi(a_packed, b_sh, a_scale, bs_sh)
+
+    return (mesh, _lowered,
+            NamedSharding(mesh, out_pspec),
+            (NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec),
+             NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec)))
+
+
+if _PACK_GATEUP_AG:
+    _fp4_ffi_partitioned.def_partition(
+        _fp4_partition_ag,
+        infer_sharding_from_operands=_fp4_infer_ag,
+        sharding_rule="m kp, n kp, m ks, n ks -> m n",
+        need_replication_factors=(),
+    )
+else:
+    _fp4_ffi_partitioned.def_partition(
+        _fp4_partition,
+        infer_sharding_from_operands=_fp4_infer_sharding,
+        sharding_rule="m kp, n kp, m ks, n ks -> m n",
+        need_replication_factors=("kp", "ks"),
+    )
+
+
+# ----- Lever B (shardy=True correct): forward FP4 GEMM with shuffle IN the base body -
+# WHY THIS EXISTS: with JA_FP4_PACK_GATEUP_AG the rowwise weight cast emits UNSHUFFLED
+# packed FP4; the legacy `_fp4_partition_ag` re-applies the ASM B-preshuffle
+# (`shuffle_weight`/`e8m0_shuffle`) INSIDE its GSPMD partition CALLBACK. Under
+# shardy=True that Python callback is NOT used to build the local computation -- Shardy
+# partitions the shuffle-less base primitive via the sharding_rule, so the ASM kernel
+# receives an UNSHUFFLED weight -> corrupt forward (diagnosed 2026-07-10:
+# runs/20260710_8b_mxfp4_packgateup_shardy_hlo_diag; the packed all-gather itself is
+# correct under both partitioners, only the shuffle was dropped).
+#
+# FIX (mirrors the shipped, shardy-validated `_fp4_dgrad_gather`): put the shuffle in
+# the @custom_partitioning BASE body. `need_replication` on the packed-K contraction
+# makes Shardy all-gather the packed u8 weight to full K (preserving the packed-AG win)
+# and THEN run this shuffling body per-device. GSPMD uses the callback below (gather in
+# `_lowered` for gate/up, shuffle-local for down/O). Consumes the UNSHUFFLED weight in
+# BOTH cases (the rowwise cast now emits unshuffled under PACK for gate/up AND down/O);
+# shuffle_weight(unshuffled) is byte-identical to the shuffled cast, so down/O numerics
+# are unchanged. Used ONLY for the fprop (dgrad/wgrad keep their own partitions).
+
+def _fwd_kgather_local(a_packed, b_unshuf, a_scale, b_scale_lin):
+    """Forward FP4 GEMM from an UNSHUFFLED packed weight + LINEAR E8M0 scale.
+
+    Applies the ASM B-preshuffle (`shuffle_weight` / `e8m0_shuffle`) locally, then the
+    FP4 GEMM. When b's K is FSDP-sharded the partitioner/rule gathers b to full K FIRST
+    (concat-safe for the unshuffled cast: MXFP4 block=32 never crosses a K-shard
+    boundary), so the shuffle always runs on the full-K weight.
+    """
+    return _gemm_fp4_ffi(a_packed, shuffle_weight(b_unshuf),
+                         a_scale, e8m0_shuffle(b_scale_lin))
+
+
+@custom_partitioning
+def _fp4_fwd_kgather(a_packed, b_unshuf, a_scale, b_scale_lin):
+    return _fwd_kgather_local(a_packed, b_unshuf, a_scale, b_scale_lin)
+
+
+def _fp4_fwd_kgather_infer(mesh, arg_shapes, result_shape):
+    a_spec = _get_spec(arg_shapes[0])
+    b_spec = _get_spec(arg_shapes[1])
+    a_m = a_spec[0]
+    b_n = b_spec[0]
+    if b_n == a_m:
+        b_n = None
+    return NamedSharding(mesh, P(a_m, b_n))
+
+
+def _fp4_fwd_kgather_partition(mesh, arg_shapes, result_shape):
+    b_k = _fp4_b_k_axis(mesh, arg_shapes)
+
+    if b_k is not None:
+        # gate/up: weight K-sharded (contraction) + unshuffled -> gather the packed
+        # u8 weight over K, shuffle, GEMM. (a has full K, sharded on M.)
+        a_spec = _get_spec(arg_shapes[0])
+        b_spec = _get_spec(arg_shapes[1])
+        a_m = a_spec[0]
+        b_n = b_spec[0]
+        out_n = None if b_n == a_m else b_n
+        a_pspec = P(a_m, None)
+        b_pspec = P(b_n, b_k)
+        out_pspec = P(a_m, out_n)
+
+        def _lowered(a_packed, b_unshuf, a_scale, b_scale_lin):
+            b_full = jax.lax.all_gather(b_unshuf, b_k, axis=1, tiled=True)
+            bs_full = jax.lax.all_gather(b_scale_lin, b_k, axis=1, tiled=True)
+            return _gemm_fp4_ffi(a_packed, shuffle_weight(b_full),
+                                 a_scale, e8m0_shuffle(bs_full))
+
+        return (mesh, _lowered,
+                NamedSharding(mesh, out_pspec),
+                (NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec),
+                 NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec)))
+
+    # Not K-sharded (down/O, attention-out, or replicated): the weight arrives
+    # UNSHUFFLED under PACK, so mirror the LEGACY _fp4_partition sharding exactly
+    # (dedup the weight's N/output axis against the token axis -> replicate the
+    # weight so its N is gathered to full, matching production), differing ONLY by
+    # shuffling the unshuffled weight in the base body (byte-identical numerics).
+    m_axis, n_axis = _resolve_fp4_specs(arg_shapes)
+    a_pspec = P(m_axis, None)
+    b_pspec = P(n_axis, None)
+    out_pspec = P(m_axis, n_axis)
+
+    def _lowered(a_packed, b_unshuf, a_scale, b_scale_lin):
+        return _fwd_kgather_local(a_packed, b_unshuf, a_scale, b_scale_lin)
+
+    return (mesh, _lowered,
+            NamedSharding(mesh, out_pspec),
+            (NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec),
+             NamedSharding(mesh, a_pspec), NamedSharding(mesh, b_pspec)))
+
+
+# need_replication on the K contraction (kp/ks): under Shardy this gathers the packed
+# u8 weight to full K, THEN the base body shuffles -- correct for gate/up (gathered)
+# AND down/O (K-local, no-op gather). GSPMD uses the callback above.
+_fp4_fwd_kgather.def_partition(
+    _fp4_fwd_kgather_partition,
+    infer_sharding_from_operands=_fp4_fwd_kgather_infer,
     sharding_rule="m kp, n kp, m ks, n ks -> m n",
     need_replication_factors=("kp", "ks"),
+)
+
+# The fprop primitive: under PACK use the shuffle-in-body K-gather primitive (correct
+# under GSPMD and shardy); otherwise the legacy pre-shuffled-input partition.
+_fp4_fprop = _fp4_fwd_kgather if _PACK_GATEUP_AG else _fp4_ffi_partitioned
+
+
+# ----- Fix 2: colwise-unshuffled weight cast (N-sharded) for the packed dgrad -----
+# Emits ONLY the colwise weight output, UNSHUFFLED (packed [K, N/2] + LINEAR E8M0
+# scale [K_pad, N/32]), so per-N-shard outputs concatenate/all-gather cleanly (MXFP4
+# block=32 along N never crosses a shard boundary at N/fsdp=512=16*32). The dgrad GEMM
+# re-applies shuffle_weight/e8m0_shuffle AFTER the gather. Byte-identical VALUES to the
+# legacy colwise dual cast -- only the shuffle layout differs (relocated post-gather).
+# The Shardy rule ties the colwise packed(N/2)+scale(N/32) dims to the input N via a
+# shared base factor nc=N/32 so Shardy N-shards the colwise output (down/O: N=out
+# sharded), mirroring the act/grad _DUAL_CAST_RULE_SHARDED_M; k stays a whole-dim
+# factor so gate/up (K-sharded) shards the colwise axis0 instead. GSPMD uses the
+# callback. Colwise cast params match _cast_wt_dual_raw so numerics are unchanged.
+
+def _cast_wt_colwise_unshuf_raw(x):
+    _, _, c_packed, c_scale = _cast_mxfp4_dual_op(
+        x,
+        shuffle_fp4=False,
+        shuffle_colwise_fp4=False,
+        shuffle_scales=False,
+        use_hadamard=_h_wt_row(),
+        use_hadamard_col=_h_wt_col(),
+        use_sr=_SR_WT,
+        use_sr_col=_SR_WT,
+        scale_mode=_OAS_MODE,
+        use_2d_scale=_WT2D,
+    )
+    return c_packed, c_scale
+
+
+@custom_partitioning
+def _cast_wt_colwise_unshuf(x):
+    return _cast_wt_colwise_unshuf_raw(x)
+
+
+def _cast_wt_col_unshuf_infer(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    k_axis = x_spec[1] if len(x_spec) > 1 else None
+    # colwise packed [K, N/2] and scale [K_pad, N/32]: axis0 follows input-K,
+    # axis1 follows input-N(=m). Exactly one is FSDP-sharded (down/O: m; gate/up: k).
+    return (NamedSharding(mesh, P(k_axis, m_axis)),
+            NamedSharding(mesh, P(k_axis, m_axis)))
+
+
+def _cast_wt_col_unshuf_partition(mesh, arg_shapes, result_shape):
+    x_spec = _get_spec(arg_shapes[0])
+    m_axis = x_spec[0]
+    k_axis = x_spec[1] if len(x_spec) > 1 else None
+    in_spec = P(m_axis, k_axis)
+    out_spec = P(k_axis, m_axis)
+
+    def _lowered(x):
+        return _cast_wt_colwise_unshuf_raw(x)
+
+    return (mesh, _lowered,
+            (NamedSharding(mesh, out_spec), NamedSharding(mesh, out_spec)),
+            (NamedSharding(mesh, in_spec),))
+
+
+# Rule: input [(nc nf), k]; colwise packed [k, (nc pf)], scale [k, nc]. nc=N/32 is the
+# shared sharded base tying the colwise N-dims to input N (down/O); k is a whole-dim
+# factor so a K-sharded input (gate/up) shards the colwise axis0. Replicate only the
+# sub-block factors nf(=32 elems/block) and pf(=16 bytes/block). Aligned shapes only
+# (K a multiple of 256 so K_pad==K); the packed-AG guard enforces this upstream.
+_fp4_col_unshuf_rule = "(nc nf) k -> k (nc pf), k nc"
+_cast_wt_colwise_unshuf.def_partition(
+    _cast_wt_col_unshuf_partition,
+    infer_sharding_from_operands=_cast_wt_col_unshuf_infer,
+    sharding_rule=_fp4_col_unshuf_rule,
+    need_replication_factors=("nf", "pf"),
+    nf=32, pf=16,
+)
+
+
+# ----- Fix 2: dgrad FP4 GEMM with packed weight all-gather + shuffle IN the body -----
+# dA = grad_out @ W, contraction over N (out-features, FSDP-sharded for down/O). The
+# colwise weight arrives UNSHUFFLED + N-sharded (from _cast_wt_colwise_unshuf); this
+# primitive all-gathers the PACKED u8 weight + linear scale over N, then
+# shuffle_weight/e8m0_shuffle LOCALLY, then the FP4 GEMM. need_replication on the N
+# contraction (nh/ns) => Shardy gathers the packed weight to full N and runs the
+# shuffling body per-device (the shuffle-in-body pattern that fixed the forward). GSPMD
+# uses the callback (explicit all_gather). For gate/up (N not sharded) the gather is a
+# no-op and it just shuffles the local weight.
+
+def _fp4_dgrad_kgather_local(go_row, colb_unshuf, go_row_s, colb_scale_lin):
+    # colb arrives FULL (gathered by the partitioner), UNSHUFFLED -> re-apply the ASM
+    # B-preshuffle here so the shuffle survives shardy=True, then the FP4 GEMM.
+    return _gemm_fp4_ffi(go_row, shuffle_weight(colb_unshuf),
+                         go_row_s, e8m0_shuffle(colb_scale_lin))
+
+
+@custom_partitioning
+def _fp4_dgrad_kgather(go_row, colb_unshuf, go_row_s, colb_scale_lin):
+    return _fp4_dgrad_kgather_local(go_row, colb_unshuf, go_row_s, colb_scale_lin)
+
+
+def _fp4_dgrad_kgather_infer(mesh, arg_shapes, result_shape):
+    m_axis = _get_spec(arg_shapes[0])[0]           # grad_out rowwise: token(M)-sharded
+    return NamedSharding(mesh, P(m_axis, None))    # dA [M_shard, K_full]
+
+
+def _first_sharded_axis(spec):
+    """Return (tensor_axis_index, mesh_axis) of the first FSDP-sharded dim, or
+    (None, None) if the tensor is fully replicated."""
+    for i, ax in enumerate(spec):
+        if ax is not None:
+            return i, ax
+    return None, None
+
+
+def _fp4_dgrad_kgather_partition(mesh, arg_shapes, result_shape):
+    m_axis = _get_spec(arg_shapes[0])[0]
+    cb_spec = _get_spec(arg_shapes[1])             # colb  [k, nh]
+    cbs_spec = _get_spec(arg_shapes[3])            # colb_scale [k, ns]
+    # colb / colb_scale are sharded on EXACTLY ONE axis: axis0 (k=embed, the dA
+    # output feature) for gate/up-style weights, or axis1 (nh/ns = the N
+    # contraction) for down/o-style. lower_fn all-gathers that axis so it
+    # genuinely produces the k-replicated dA that need_replication promises
+    # (Shardy leaves the operand sharded for lower_fn; it does NOT pre-gather).
+    cb_ax, cb_mesh = _first_sharded_axis(cb_spec)
+    cbs_ax, cbs_mesh = _first_sharded_axis(cbs_spec)
+
+    go_pspec = P(m_axis, None)
+    gos_pspec = P(m_axis, None)
+    cb_pspec = P(*cb_spec)
+    cbs_pspec = P(*cbs_spec)
+    out_pspec = P(m_axis, None)
+
+    def _lowered(go_row, colb_unshuf, go_row_s, colb_scale_lin):
+        # Gather the PACKED colwise weight + linear scale to full over its
+        # FSDP-sharded axis (packed u8 -> ~4x less comm than a bf16 gather),
+        # THEN re-apply the ASM B-preshuffle (survives shardy=True), then GEMM.
+        if cb_mesh is not None:
+            colb_unshuf = jax.lax.all_gather(colb_unshuf, cb_mesh, axis=cb_ax, tiled=True)
+        if cbs_mesh is not None:
+            colb_scale_lin = jax.lax.all_gather(colb_scale_lin, cbs_mesh, axis=cbs_ax, tiled=True)
+        return _gemm_fp4_ffi(go_row, shuffle_weight(colb_unshuf),
+                             go_row_s, e8m0_shuffle(colb_scale_lin))
+
+    return (mesh, _lowered,
+            NamedSharding(mesh, out_pspec),
+            (NamedSharding(mesh, go_pspec), NamedSharding(mesh, cb_pspec),
+             NamedSharding(mesh, gos_pspec), NamedSharding(mesh, cbs_pspec)))
+
+
+# Rule: go_row [m, nh], colb [k, nh], go_row_s [m, ns], colb_scale [k, ns] -> dA [m, k].
+# need_replication on the weight's factors (nh=N/2 packed contraction, k=out-feature,
+# ns=N/32 scale) tells Shardy the op internally replicates them: Shardy leaves the
+# operand sharded for lower_fn (which explicitly all-gathers the sharded axis) and
+# keeps dA's k replicated while m (tokens) stays sharded -> dA [M_shard, K_full],
+# matching the bf16 _fp4_dgrad_gather. Factors listed in ascending first-appearance
+# index order (m=0, nh=1, k=2, ns=3).
+_fp4_dgrad_kgather.def_partition(
+    _fp4_dgrad_kgather_partition,
+    infer_sharding_from_operands=_fp4_dgrad_kgather_infer,
+    sharding_rule="m nh, k nh, m ns, k ns -> m k",
+    need_replication_factors=("nh", "k", "ns"),
 )
 
 
@@ -440,20 +1421,231 @@ def _fp4_wgrad_partition(mesh, arg_shapes, result_shape):
              NamedSharding(mesh, s_a_pspec), NamedSharding(mesh, s_b_pspec)))
 
 
+# Shardy rule: the M (token/batch) axis is the CONTRACTION and is FSDP-sharded,
+# so it must be declared as a REDUCTION factor -- a sharded reduction factor
+# tells Shardy the result is all-reduced over that axis (the psum the partition
+# callback emits). The packed (M/2) and scale (M/32) M-dims are tied via a
+# shared base factor mc = M/32 (hf=16 => M/2 = mc*16) so Shardy sees them as the
+# same sharded contraction axis. Leaving M undeclared (the legacy rule) made
+# Shardy mishandle the sharded contraction -> the FP4 wgrad blow-up. GSPMD
+# (shardy=False) is unaffected (it uses the partition callback).
 _fp4_ffi_partitioned_wgrad.def_partition(
     _fp4_wgrad_partition,
     infer_sharding_from_operands=_fp4_wgrad_infer_sharding,
-    sharding_rule="n mp, k mp, n ms, k ms -> n k",
-    need_replication_factors=(),
+    sharding_rule="n (mc hf), k (mc hf), n mc, k mc -> n k",
+    reduction_factors=("mc", "hf"),
+    hf=16,
 )
+
+
+# ---------------------------------------------------------------------------
+# FSDP/Shardy-correct FP4 dgrad via LOGICAL-weight gather (JA_FP4_DGRAD_PARTITION
+# = gather). See the _DGRAD_GATHER flag block for the full rationale.
+#
+#   go_row   [M, N/2]  (packed grad cotangent, M/token-sharded under FSDP)
+#   go_row_s [M, N/32] (E8M0 grad scales)
+#   b        [N, K]    (raw bf16 weight, N/out-feature-sharded under FSDP)
+#   OUT = dA [M, K]    (contraction over N)
+#
+# The dgrad N contraction is FSDP-sharded, so each rank needs the FULL weight
+# over N. Unlike the wgrad (whose sharded M contraction is SUMMED across ranks =>
+# reduction_factors + psum), the dgrad output dA is PER-TOKEN (M-sharded, not
+# summed), so the correct collective is an ALL-GATHER of the operand over N, NOT
+# a reduce. This op declares the N factor need_replication (Shardy) / the weight
+# operand replicated (GSPMD partition callback) so the partitioner all-gathers
+# the LOGICAL bf16 weight (concat-safe along N). The colwise cast + B-preshuffle
+# then runs LOCALLY on the full weight -- never on gathered shuffled shards.
+# ---------------------------------------------------------------------------
+
+def _dgrad_gather_local(go_row, go_row_s, b, sr_key):
+    """Single-device FP4 dgrad from an existing grad cast + full bf16 weight."""
+    _, _, col_b, col_b_s = _cast_wt_dual_raw(b, sr_key)
+    return _gemm_fp4_ffi(go_row, col_b, go_row_s, col_b_s)
+
+
+@custom_partitioning
+def _fp4_dgrad_gather(go_row, go_row_s, b, sr_key):
+    return _dgrad_gather_local(go_row, go_row_s, b, sr_key)
+
+
+def _dgrad_gather_infer_sharding(mesh, arg_shapes, result_shape):
+    g_spec = _get_spec(arg_shapes[0])          # packed grad_out [M, N/2]
+    m_axis = g_spec[0]
+    return NamedSharding(mesh, P(m_axis, None))  # dA [M, K]: M-sharded, K replicated
+
+
+def _dgrad_gather_partition(mesh, arg_shapes, result_shape):
+    g_spec = _get_spec(arg_shapes[0])
+    m_axis = g_spec[0]
+    g_pspec = P(m_axis, None)                   # grad packed: M-sharded, N replicated
+    gs_pspec = P(m_axis, None)                  # grad scales: same logical axes
+    b_pspec = P(None, None)                     # weight: REPLICATED -> all-gather
+                                                # the LOGICAL bf16 weight over N.
+    key_pspec = P(None)                         # deterministic SR key is replicated
+    out_pspec = P(m_axis, None)
+
+    def _lowered(go_row, go_row_s, b, sr_key):
+        return _dgrad_gather_local(go_row, go_row_s, b, sr_key)
+
+    return (mesh, _lowered,
+            NamedSharding(mesh, out_pspec),
+            (NamedSharding(mesh, g_pspec), NamedSharding(mesh, gs_pspec),
+             NamedSharding(mesh, b_pspec), NamedSharding(mesh, key_pspec)))
+
+
+# Shardy rule: the dgrad contracts N (out-features). Declaring N need_replication
+# tells Shardy to GATHER (replicate) the operand along N rather than reduce over
+# it -- the opposite of the wgrad's reduction_factors. dA[M,K] keeps grad_out's M
+# sharding; K follows the (replicated-under-FSDP) weight K.
+_fp4_dgrad_gather.def_partition(
+    _dgrad_gather_partition,
+    infer_sharding_from_operands=_dgrad_gather_infer_sharding,
+    sharding_rule="m nh, m ns, n k, r -> m k",
+    need_replication_factors=("nh", "ns", "n", "r"),
+)
+
+
+# ---------------------------------------------------------------------------
+# Offline-capture hook (env-gated via JA_CAPTURE_DIR; OFF by default).
+#
+# Purpose: dump the real bf16 (a, b, grad_out) per GEMM site so an offline
+# replay can localize which FP4 backward pass (fprop / dgrad / wgrad) damages
+# the training signal. Lives here because it must observe the *exact* tensors
+# the custom_vjp fwd / bwd receive.
+#
+# Production no-op guarantee: _capture_dir() is read at trace time. When unset
+# the helpers `return` immediately, so NO slice / callback node is emitted and
+# numerics are byte-identical. Fully reversible -- delete this block plus the
+# two `_capture_*` calls in _gemm_fp4_bf16_fwd / _gemm_fp4_bf16_bwd.
+#
+# Bounding: only a fixed leading slice (_CAPTURE_ROW_CAP rows along the token /
+# M axis, and along N for the weight) is transferred + saved, keyed by the
+# ORIGINAL (M, N, K) shape. A first-wins O_EXCL write means whichever scan
+# iteration / device fires first (past the JA_CAPTURE_AFTER_STEP threshold)
+# for a shape captures it; the rest skip. So the capture is a single
+# representative per-shard slice regardless of FSDP degree.
+#
+# Steady-state capture (JA_CAPTURE_AFTER_STEP): the GEMM call site cannot see
+# the training step, so we keep a HOST-side per-(role, shape) GEMM-call (fire)
+# counter -- bumped each time the runtime callback fires -- and only write once
+# a site's counter reaches the threshold. Default threshold 0 => write on the
+# first fire (step-0 behavior, backward-compatible). This lets an offline probe
+# compare step-0 vs steady-state under-flush from the same hook.
+# ---------------------------------------------------------------------------
+
+_CAPTURE_ROW_CAP = 4096
+
+# Host-side per-(role, shape) runtime fire counter for JA_CAPTURE_AFTER_STEP.
+_CAPTURE_CALL_COUNTS = {}
+
+
+def _capture_dir():
+    return os.environ.get("JA_CAPTURE_DIR")
+
+
+def _capture_after_step():
+    """Per-shape GEMM-call (fire) threshold; capture once a site's counter
+    reaches it. 0 (default / unparsable) => capture the first fire."""
+    v = os.environ.get("JA_CAPTURE_AFTER_STEP")
+    try:
+        return int(v) if v else 0
+    except ValueError:
+        return 0
+
+
+def _capture_count_ready(counter_key):
+    """Host-side: bump the per-(role, shape) fire counter and report whether
+    it has reached the JA_CAPTURE_AFTER_STEP threshold. Returns (ready, count)."""
+    n = _CAPTURE_CALL_COUNTS.get(counter_key, 0) + 1
+    _CAPTURE_CALL_COUNTS[counter_key] = n
+    return n >= _capture_after_step(), n
+
+
+def _capture_write(path, arr):
+    """First-wins host writer: O_EXCL means exactly one fire per shape wins.
+    Returns True if this call wrote the file, False if it already existed."""
+    import errno
+    import numpy as np
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except OSError as exc:
+        if exc.errno == errno.EEXIST:
+            return False  # already captured this site -- first-wins, skip.
+        raise
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            np.save(fh, np.asarray(arr, dtype=np.float32))
+        return True
+    except Exception:  # never let capture I/O perturb the run.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+
+
+def _capture_fwd(a, b):
+    """Dump bf16 (a, b) for this (M, N, K) site once its fire counter crosses
+    the JA_CAPTURE_AFTER_STEP threshold (default: first fire)."""
+    cap_dir = _capture_dir()
+    if not cap_dir:
+        return
+    M, K = a.shape
+    N = b.shape[0]
+    key = "M%d_N%d_K%d" % (M, N, K)
+    cap = _CAPTURE_ROW_CAP
+    a_s, b_s = a[:cap], b[:cap]
+
+    def _w(a_h, b_h):
+        ready, n = _capture_count_ready("fwd_" + key)
+        if not ready:
+            return
+        os.makedirs(cap_dir, exist_ok=True)
+        wrote = _capture_write(os.path.join(cap_dir, "site_%s__a.npy" % key), a_h)
+        _capture_write(os.path.join(cap_dir, "site_%s__b.npy" % key), b_h)
+        if wrote:
+            print("[ja-capture] fwd site %s (a,b) captured at fire #%d" % (key, n),
+                  flush=True)
+
+    jax.debug.callback(_w, a_s, b_s)
+
+
+def _capture_bwd(grad_out, k_dim):
+    """Dump bf16 grad_out for this (M, N, K) site once its fire counter crosses
+    the JA_CAPTURE_AFTER_STEP threshold (default: first fire)."""
+    cap_dir = _capture_dir()
+    if not cap_dir:
+        return
+    M, N = grad_out.shape
+    key = "M%d_N%d_K%d" % (M, N, k_dim)
+    cap = _CAPTURE_ROW_CAP
+    g_s = grad_out[:cap, :cap]
+
+    def _w(g_h):
+        ready, n = _capture_count_ready("bwd_" + key)
+        if not ready:
+            return
+        os.makedirs(cap_dir, exist_ok=True)
+        wrote = _capture_write(os.path.join(cap_dir, "site_%s__grad_out.npy" % key), g_h)
+        if wrote:
+            print("[ja-capture] bwd site %s grad_out captured at fire #%d" % (key, n),
+                  flush=True)
+
+    jax.debug.callback(_w, g_s)
 
 
 # ---------------------------------------------------------------------------
 # Public high-level API: BF16 in, FP4 internally, BF16 out.
 # ---------------------------------------------------------------------------
 
+def _gemm_fp4_bf16_primal(a, b):
+    a_packed, a_scales = _cast_act(a)
+    b_packed, b_scales = _cast_wt(b)
+    return _fp4_fprop(a_packed, b_packed, a_scales, b_scales)
+
+
 @partial(jax.custom_vjp, nondiff_argnums=())
-def gemm_fp4_bf16(a, b):
+def _gemm_fp4_bf16_unkeyed(a, b):
     """Compute ``A @ B^T`` in MXFP4 with BF16 inputs and outputs.
 
     Forward: cast ``a`` and ``b`` to MXFP4 (rowwise only for the no-autograd
@@ -472,32 +1664,165 @@ def gemm_fp4_bf16(a, b):
     Returns:
         out: [M, N] bfloat16.
     """
-    a_packed, a_scales = _cast_act(a)
-    b_packed, b_scales = _cast_wt(b)
-    return _fp4_ffi_partitioned(a_packed, b_packed, a_scales, b_scales)
+    return _gemm_fp4_bf16_primal(a, b)
 
 
 def _gemm_fp4_bf16_fwd(a, b):
-    """Forward-with-residuals: dual-cast keeps columnwise FP4 for backward."""
+    """Forward-with-residuals: dual-cast keeps columnwise FP4 for backward.
+
+    The activation dual-cast supplies the wgrad operand. The weight needs only
+    its rowwise fprop output unless packed dgrad reuses an unshuffled colwise
+    residual; otherwise the raw bf16 weight is stashed for the backward cast.
+    """
+    _capture_fwd(a, b)  # env-gated offline-probe hook (no-op unless JA_CAPTURE_DIR set).
     a_row, a_row_s, col_a_fp4, col_a_scale = _cast_act_dual(a)
-    b_row, b_row_s, col_b_fp4, col_b_scale = _cast_wt_dual(b)
-    out = _fp4_ffi_partitioned(a_row, b_row, a_row_s, b_row_s)
-    return out, (col_a_fp4, col_a_scale, col_b_fp4, col_b_scale)
+    # WT2D remains an open accuracy experiment and needs the dual kernel to
+    # compute a shared 32x32 row/column scale. The production 1D-scale path no
+    # longer emits the shuffled columnwise weight that only the removed corrupt
+    # dgrad consumed.
+    if _WT2D:
+        b_row, b_row_s, _, _ = _cast_wt_dual(b)
+    else:
+        b_row, b_row_s = _cast_wt(b)
+    out = _fp4_fprop(a_row, b_row, a_row_s, b_row_s)
+    # Experiment B (JA_FP4_DGRAD_REUSE_FWD_COL, default-off): under the default
+    # packed dgrad, the backward re-casts the raw bf16 weight colwise-UNSHUFFLED
+    # every step. Instead produce that UNSHUFFLED colwise weight HERE in the
+    # forward and stash it as the weight-colwise residual so the packed dgrad
+    # reuses it. Byte-identical: the residual IS
+    # _cast_wt_colwise_unshuf(b) for the SAME weight b, exactly what the backward
+    # would otherwise recompute. The FPROP path (b_row) is UNTOUCHED.
+    _reuse_fwd_col = _DGRAD_REUSE_FWD_COL and _DGRAD_PACKED
+    if _reuse_fwd_col:
+        col_b_fp4, col_b_scale = _cast_wt_colwise_unshuf(b)
+    # Optionally tag the columnwise FP4 residuals so a MaxText remat policy can
+    # SAVE them instead of recomputing the dual-cast in backward (graph-
+    # scheduling only; checkpoint_name is identity => byte-identical numerics).
+    # BOTH the packed FP4 and its E8M0 scale must be tagged, else the cast
+    # kernel still re-fires to recompute the untagged half. Default off
+    # (_REMAT_SAVE_* both False) => no name_p added => unchanged graph. Under
+    # Experiment B the SAME mxfp4_wt_col name tags the UNSHUFFLED colwise weight,
+    # so the existing save_fp4col remat policy saves the reused residual.
+    if _REMAT_SAVE_ACT_COL:
+        col_a_fp4 = checkpoint_name(col_a_fp4, _MXFP4_ACT_COL_NAME)
+        col_a_scale = checkpoint_name(col_a_scale, _MXFP4_ACT_COL_NAME)
+    if _reuse_fwd_col and _REMAT_SAVE_WT_COL:
+        col_b_fp4 = checkpoint_name(col_b_fp4, _MXFP4_WT_COL_NAME)
+        col_b_scale = checkpoint_name(col_b_scale, _MXFP4_WT_COL_NAME)
+    if _reuse_fwd_col:
+        residual = (col_a_fp4, col_a_scale, col_b_fp4, col_b_scale)
+    else:
+        residual = (col_a_fp4, col_a_scale, b)
+    return out, residual
 
 
-def _gemm_fp4_bf16_bwd(residuals, grad_out):
-    """Backward: FP4 dA and FP4 dB (wgrad-sharded) using saved columnwise data."""
-    col_a_fp4, col_a_scale, col_b_fp4, col_b_scale = residuals
+def _gemm_fp4_bf16_bwd(residuals, grad_out, sr_key=None):
+    """Backward: FP4 dA and dB.
+
+    dA is the input-gradient (dgrad) GEMM ``grad_out @ B``, contracting the
+    output-feature axis N (REPLICATED under FSDP). dB is the weight-gradient
+    (wgrad) GEMM ``grad_out^T @ A``, contracting the FSDP-sharded M/batch axis.
+    Both consume the Hadamard-transformed grad dual-cast.
+    """
+    col_a_fp4, col_a_scale = residuals[:2]
+    # Experiment B: reuse the forward's saved UNSHUFFLED colwise weight instead of
+    # re-casting from the raw bf16 weight (only under the default packed dgrad).
+    _reuse_fwd_col = _DGRAD_REUSE_FWD_COL and _DGRAD_PACKED
+    if _reuse_fwd_col:
+        col_b_fp4, col_b_scale = residuals[2:4]
+        b_bf16 = None
+        capture_k = col_b_fp4.shape[0]
+    else:
+        col_b_fp4 = col_b_scale = None
+        b_bf16 = residuals[2]
+        capture_k = b_bf16.shape[1]
+
+    # env-gated offline-probe hook (no-op unless JA_CAPTURE_DIR set). K is the
+    # contraction dim, recovered from the saved weight representation.
+    _capture_bwd(grad_out, capture_k)
 
     # Hadamard ON: applied inside the fused cast kernel for grad only.
-    go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
+    if _SR_DGRAD_ROW or _SR_WGRAD_COL:
+        if sr_key is None:
+            raise ValueError(
+                "gradient stochastic rounding requires a runtime sr_key"
+            )
+        go_row, go_row_s, go_col_fp4, go_col_scale = (
+            _cast_grad_dual_keyed(grad_out, sr_key)
+        )
+    else:
+        go_row, go_row_s, go_col_fp4, go_col_scale = _cast_grad_dual(grad_out)
 
-    # dA = grad_out @ B  -- NN layout, K is the contraction (replicated).
-    da = _fp4_ffi_partitioned(go_row, col_b_fp4, go_row_s, col_b_scale)
+    # dA = grad_out @ B -- NN layout, contraction over N (replicated under FSDP).
+    if _DGRAD_GATHER:
+        # FSDP/Shardy-correct FP4 dgrad: gather the LOGICAL bf16 weight over N
+        # (concat-safe), THEN colwise cast/pack/shuffle LOCALLY, THEN FP4 GEMM.
+        # The removed path gathered already-shuffled shards and corrupted dA.
+        gather_key = (
+            sr_key if sr_key is not None
+            else jnp.zeros((4,), dtype=jnp.uint32)
+        )
+        da = _fp4_dgrad_gather(
+            go_row, go_row_s, b_bf16, gather_key
+        )
+    else:
+        # FP4 dgrad with PACKED weight all-gather over N (Fix 2): cast the raw bf16
+        # weight colwise-UNSHUFFLED (N-sharded), then all-gather the packed u8 + linear
+        # scale over N and re-apply shuffle_weight/e8m0_shuffle INSIDE the GEMM base
+        # body (survives shardy=True), THEN the FP4 dgrad GEMM. ~4x less dgrad weight
+        # comm than the bf16 gather; numerically identical (shuffle merely relocated).
+        if _reuse_fwd_col:
+            # Experiment B: the forward already produced this UNSHUFFLED colwise
+            # weight (col_b_fp4/col_b_scale are _cast_wt_colwise_unshuf(b)) and
+            # stashed it as a residual -- reuse it, no backward recast.
+            cb_packed, cb_scale = col_b_fp4, col_b_scale
+        else:
+            cb_packed, cb_scale = _cast_wt_colwise_unshuf(b_bf16)
+        da = _fp4_dgrad_kgather(go_row, cb_packed, go_row_s, cb_scale)
     # dB = grad_out^T @ A -- NT layout, M_batch is the contraction (FSDP-
     # sharded). The partition callback emits psum across the FSDP mesh.
     db = _fp4_ffi_partitioned_wgrad(go_col_fp4, col_a_fp4, go_col_scale, col_a_scale)
     return da, db
 
 
-gemm_fp4_bf16.defvjp(_gemm_fp4_bf16_fwd, _gemm_fp4_bf16_bwd)
+_gemm_fp4_bf16_unkeyed.defvjp(_gemm_fp4_bf16_fwd, _gemm_fp4_bf16_bwd)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=())
+def _gemm_fp4_bf16_keyed(a, b, sr_key):
+    return _gemm_fp4_bf16_primal(a, b)
+
+
+def _gemm_fp4_bf16_keyed_fwd(a, b, sr_key):
+    out, residual = _gemm_fp4_bf16_fwd(a, b)
+    return out, (residual, sr_key)
+
+
+def _gemm_fp4_bf16_keyed_bwd(keyed_residual, grad_out):
+    residual, sr_key = keyed_residual
+    da, db = _gemm_fp4_bf16_bwd(residual, grad_out, sr_key=sr_key)
+    return da, db, None
+
+
+_gemm_fp4_bf16_keyed.defvjp(
+    _gemm_fp4_bf16_keyed_fwd, _gemm_fp4_bf16_keyed_bwd
+)
+
+
+def gemm_fp4_bf16(a, b, *, sr_key=None):
+    """Compute ``A @ B^T`` in MXFP4, with explicit-key deterministic SR.
+
+    The default RNE path retains the original two-operand HLO. When an SR role
+    is enabled, ``sr_key`` must be a typed JAX key or ``uint32[4]`` runtime
+    array. The current high-level training path supports deterministic SR on
+    the gradient row/column representations; activation/weight SR remains a
+    low-level diagnostic.
+    """
+    if _SR_ACT or _SR_WT:
+        raise NotImplementedError(
+            "deterministic high-level MXFP4 currently supports gradient SR "
+            "only; activation/weight SR requires keyed forward cast plumbing"
+        )
+    if _SR_ANY:
+        return _gemm_fp4_bf16_keyed(a, b, _normalize_sr_key(sr_key))
+    return _gemm_fp4_bf16_unkeyed(a, b)
