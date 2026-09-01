@@ -100,20 +100,31 @@ case "$RECIPE_PROFILE" in
     export PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-9}"
     export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-72}"
     export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+    # Deliberately export NOTHING else. run_nvfp4_match_8b.sh enforces this
+    # profile with require_value, and its own defaults ARE the contract:
+    # autotune_level=4, weight/mu dtype bfloat16, use_iota_embed=False,
+    # remat_policy=minimal_flash_save_fp4_wtcol. Those are the values the
+    # frozen 1840.6644 run recorded in its train.log. Exporting the
+    # ci_regression ladder here makes the launcher die on a require_value
+    # mismatch before a single step runs.
     ;;
   ci_regression)
     export ICI_FSDP_PARALLELISM="${ICI_FSDP_PARALLELISM:-4}"
     export PER_DEVICE_BATCH="${PER_DEVICE_BATCH:-4}"
     export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
     export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0,1,2,3}"
+    # ci_regression is unconstrained by require_value, and this ladder is the
+    # one its ~1784.68 baseline was recorded under. It stays with the profile
+    # it belongs to.
+    export WEIGHT_DTYPE=float32 MU_DTYPE=float32
+    export AUTOTUNE_LEVEL=5
+    export REMAT_POLICY=minimal_flash_save_fp4col
+    export JA_FP4_REMAT_SAVE_COL=both
     ;;
   *) echo "unknown RECIPE_PROFILE: $RECIPE_PROFILE" >&2; exit 2 ;;
 esac
+# Canonical for both profiles; the launcher refuses anything else.
 export XLA_PYTHON_CLIENT_MEM_FRACTION=.97
-export WEIGHT_DTYPE=float32 MU_DTYPE=float32
-export AUTOTUNE_LEVEL=5
-export REMAT_POLICY=minimal_flash_save_fp4col
-export JA_FP4_REMAT_SAVE_COL=both
 
 cd "$JA_ROOT_DIR"
 bash scripts/recipes/run_nvfp4_match_8b.sh \
