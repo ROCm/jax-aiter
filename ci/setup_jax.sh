@@ -16,17 +16,26 @@
 #                 + mark repos safe for in-container git.
 #   --jax-only    ONLY (force-)reinstall the JAX stack. Used by the perf leg to
 #                 restore our pins after MaxText pulls its own deps.
+#   --no-apt      Everything default mode does EXCEPT the apt block. For legs
+#                 that consume a prebuilt wheel and compile nothing, so they
+#                 need none of git/curl/build-essential/pkg-config/zstd beyond
+#                 what the runtime image already ships. Some runner nodes deny
+#                 root a writable /var/lib/apt/lists inside docker exec, which
+#                 makes an unnecessary `apt-get update` a hard failure.
 #
 # Usage:
 #   bash ci/setup_jax.sh
 #   bash ci/setup_jax.sh --jax-only
+#   bash ci/setup_jax.sh --no-apt
 set -euxo pipefail
 
 JAX_ONLY=0
+NO_APT=0
 for arg in "$@"; do
   case "$arg" in
     --jax-only) JAX_ONLY=1 ;;
-    *) echo "ERROR: unknown arg '$arg' (expected --jax-only or nothing)." >&2; exit 2 ;;
+    --no-apt) NO_APT=1 ;;
+    *) echo "ERROR: unknown arg '$arg' (expected --jax-only, --no-apt, or nothing)." >&2; exit 2 ;;
   esac
 done
 
@@ -87,9 +96,13 @@ if [[ "$JAX_ONLY" == "1" ]]; then
   exit 0
 fi
 
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  git ca-certificates curl build-essential pkg-config zstd
+if [[ "$NO_APT" == "1" ]]; then
+  echo "[ci/setup_jax] --no-apt: skipping apt; relying on the image's toolchain."
+else
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git ca-certificates curl build-essential pkg-config zstd
+fi
 python3 -m pip install --break-system-packages cmake ninja pyyaml psutil pandas
 
 # JAX must be installed before the build (Makefile needs jax.ffi.include_dir()).

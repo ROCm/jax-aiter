@@ -151,9 +151,11 @@ jobs:
             -v "$JA_DATA_ROOT:/datasets:ro" \
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
-      # -u 0 throughout: the linux-jax-aiter-mi355-8 pool does not give root
-      # inside docker exec (unlike the other ARC pools this repo uses), so
-      # apt/pip writes fail without it. See the same note in nightly-perf.yml.
+      # -u 0 throughout: the project-wide convention, and harmless where exec is
+      # already root. It is NOT a fix for the apt failure the nightly perf leg
+      # hit -- that turned out to be per-node, not per-pool; see the note in
+      # nightly-perf.yml. These legs compile, so they need the apt tooling and
+      # cannot use setup_jax's --no-apt escape.
       - name: Install tooling and JAX
         run: docker exec -u 0 "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
 

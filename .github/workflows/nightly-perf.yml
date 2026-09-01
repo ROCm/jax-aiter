@@ -15,19 +15,28 @@ name: JAX-AITER Nightly (AITER bump + 8x MI355 MXFP4)
 #   tests   -> full suite at the new pin, in parallel with perf
 #   promote -> only if perf AND tests both pass, fast-forward main to the bump
 #
-# Why the perf job installs the manylinux wheel rather than building in place:
-# the manylinux image ships a different clang than the dev image and produces
-# measurably different attention libraries (libmha_fwd/bwd and librmsnorm_fwd
-# differ by 10-14% in size). Every throughput number recorded to date came from
-# a dev-image source build, so the artifact users actually receive has never
-# been measured. A baseline is only worth gating on if it was taken on the
-# shipped binary.
+# Why the perf job installs the wheel rather than building in place: it is the
+# artifact users actually receive, and until this workflow existed every
+# throughput number on record came from a dev-image source build. A baseline is
+# only worth gating on if it was taken on the shipped binary.
 #
-# Runner labels are load-bearing. `linux-jax-aiter-mi355-8` is served by the
-# repo-level runner smci355-ccs-aus-n15-13 and is the only label that pins a job
-# to fixed hardware; the 1- and 4-GPU labels are also served by org-managed
-# ephemeral pools, so a job carrying those can land on different hardware each
-# night. Throughput is therefore gated ONLY on the 8-GPU label.
+# Note what "the wheel" is, because the two images are easy to mix up. The
+# attention/rmsnorm JIT libs (librmsnorm_fwd, libmha_fwd, libmha_bwd) are built
+# by the `jit` job in the DEV image and downloaded here as artifacts; the
+# manylinux image contributes only the umbrella libjax_aiter.so and the FFI
+# shims, plus auditwheel and the wheel tags. So dev-vs-manylinux clang does NOT
+# apply to the attention kernels -- they are byte-identical to a dev build.
+# (Measured 2026-08-31 on m15-29, hardware held constant: the +full wheel ran
+# 1822.2915 vs the 1840.6644 source figure, -1.00%, N=1 each.)
+#
+# Runner labels are load-bearing only for hardware class, not for a fixed host.
+# All four pools this repo uses (build-only-jax-aiter, linux-jax-aiter-mi355-1
+# / -4 / -8) are org-managed ARC ephemeral pools -- verified from runner names
+# in runs 33458425029 and 33474028161. An earlier version of this comment
+# claimed the 8-GPU label pinned to smci355-ccs-aus-n15-13; it does not. Two
+# consecutive nights can therefore land on different nodes of the same pool,
+# which is exactly what a throughput gate has to absorb, and is one more reason
+# the gate stays opt-in until several nights are on record.
 
 on:
   workflow_dispatch:
@@ -391,16 +400,38 @@ jobs:
             -v "${{ github.workspace }}:/jax-aiter" \
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
+      - name: Container privilege snapshot (diagnostic, never fails the job)
+        continue-on-error: true
+        run: |
+          # Runs 33458425029 and 33467884782 both died here at `apt-get update`
+          # with "Could not open lock file /var/lib/apt/lists/lock (13)". Adding
+          # `-u 0` did not help, and a dedicated probe on this same pool
+          # (probe-runner-perms, run 33474028161) came back uid=0 with
+          # CapEff a80c25fb, an unmapped userns and /var/lib/apt/lists WRITABLE.
+          # So the pool is not uniformly root-less; whatever differs is
+          # per-node. Print it on every night so the next failure names itself.
+          echo "runner=$RUNNER_NAME"
+          docker info --format 'Rootless={{.Rootless}} Driver={{.Driver}}' || true
+          docker exec -u 0 "$CONTAINER_NAME" bash -lc '
+            echo "uid=$(id -u) gid=$(id -g)"
+            grep CapEff /proc/self/status
+            echo "uid_map: $(cat /proc/self/uid_map)"
+            echo "apt lists: $(stat -c "%U:%G %a" /var/lib/apt/lists 2>&1)"
+            touch /var/lib/apt/lists/.probe && echo "APT DIR WRITABLE" || echo "APT DIR NOT WRITABLE"
+            touch /usr/local/lib/.probe && echo "SITEPKG WRITABLE" || echo "SITEPKG NOT WRITABLE"
+          ' || true
+
       - name: Install JAX and tonight's wheel
         run: |
-          # -u 0: the linux-jax-aiter-mi355-8 pool does NOT give root inside
-          # docker exec, while build-only-jax-aiter and linux-jax-aiter-mi355-1
-          # and -4 do. All four are ARC ephemeral pools -- this is a property of
-          # that one pool's config, not of self-hosted vs ARC (verified against
-          # runner names in run 33458425029). setup_jax's apt-get then dies with
-          # "Could not open lock file /var/lib/apt/lists/lock". This matches the
-          # project-wide `docker exec -u 0` convention. Output ownership is
-          # already handled by the sudo chown step below.
+          # --no-apt: this leg installs a prebuilt wheel and compiles nothing, so
+          # it needs none of git/curl/build-essential/pkg-config/zstd beyond what
+          # the runtime image already ships. Some nodes in the
+          # linux-jax-aiter-mi355-8 pool deny even uid 0 a writable
+          # /var/lib/apt/lists inside docker exec, which turned an unnecessary
+          # `apt-get update` into a hard failure twice (runs 33458425029,
+          # 33467884782). -u 0 is kept: it is the project-wide convention and is
+          # harmless where exec is already root. Output ownership is handled by
+          # the sudo chown step below.
           docker exec -u 0 "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
             # Full mode, NOT --jax-only. --jax-only implies --no-deps and exists
@@ -408,7 +439,7 @@ jobs:
             # run_8b_fp4.sh already does for itself at the right moment. Running
             # it here, first, in a bare runtime container leaves numpy uninstalled
             # and setup_jax's own verify step dies importing jax.
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh
+            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --no-apt
             shopt -s nullglob
             wheels=(dist/jax_aiter-*+full-*.whl)
             test "${#wheels[@]}" -eq 1
