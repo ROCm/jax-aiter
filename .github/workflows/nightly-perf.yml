@@ -373,18 +373,6 @@ jobs:
           name: nightly-wheel
           path: dist
 
-      - name: Wait for an idle GPU
-        run: |
-          # Co-tenancy on this box is real. A run that starts against someone
-          # else's job produces a number that looks like a regression and is
-          # not one; two mid-run excursions traced to exactly this forced a
-          # measured run to be retired during the wheel-vs-source analysis.
-          if [ -x scripts/wait_for_idle_gpu.sh ]; then
-            bash scripts/wait_for_idle_gpu.sh || true
-          else
-            echo "::warning::scripts/wait_for_idle_gpu.sh absent; not gating on idle"
-          fi
-
       - name: Pull runtime image
         run: docker pull "$IMAGE"
 
@@ -444,6 +432,32 @@ jobs:
             python3 -c "import jax; from jax_aiter.mha import flash_attn_func; print(jax.devices()); print(flash_attn_func)"
           '
 
+      - name: Wait for an idle GPU
+        run: |
+          # Co-tenancy on these boxes is real. A run that starts against someone
+          # else's job produces a number that looks like a regression and is
+          # not one; two mid-run excursions traced to exactly this forced a
+          # measured run to be retired during the wheel-vs-source analysis.
+          # Runs inside the container because rocm-smi ships in the runtime
+          # image and is not guaranteed on the ARC runner host. Best-effort:
+          # a busy box warns and measures anyway rather than failing the build.
+          docker exec -u 0 -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+            "$CONTAINER_NAME" bash -lc 'bash scripts/wait_for_idle_gpu.sh' || true
+
+      - name: Capture GPU provenance (pre-run)
+        continue-on-error: true
+        run: |
+          # This pool is ephemeral: every nightly lands on a different physical
+          # host and that host is gone by the time anyone reads the result.
+          # Without machine state a flat offset against the frozen 1840.6644
+          # anchor cannot be told apart from a real kernel regression -- the
+          # recipe, XLA_FLAGS and COMMAND already diff clean, so the remaining
+          # candidates are all node-level (power cap first, then VBIOS/driver).
+          docker exec -u 0 -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+            -e RUNNER_NAME="$RUNNER_NAME" -e GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            "$CONTAINER_NAME" bash -lc \
+            'bash ci/perf/capture_gpu_provenance.sh /jax-aiter/ci_perf_out/gpu_provenance_pre.txt'
+
       - name: Run the blog_batch9 MXFP4 process
         id: recipe
         run: |
@@ -452,6 +466,15 @@ jobs:
             -e MAXTEXT_DIR=/maxtext_perf \
             -e RECIPE_PROFILE=blog_batch9 \
             "$CONTAINER_NAME" bash -lc 'bash ci/perf/run_8b_fp4.sh'
+
+      - name: Capture GPU provenance (post-run)
+        if: always()
+        continue-on-error: true
+        run: |
+          docker exec -u 0 -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+            -e RUNNER_NAME="$RUNNER_NAME" -e GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            "$CONTAINER_NAME" bash -lc \
+            'bash ci/perf/capture_gpu_provenance.sh /jax-aiter/ci_perf_out/gpu_provenance_post.txt' || true
 
       - name: Hand perf output back to the runner user
         if: always()
@@ -482,6 +505,16 @@ jobs:
           if [ -f ci_perf_out/perf_8b_fp4_fsdp8_summary.md ]; then
             cat ci_perf_out/perf_8b_fp4_fsdp8_summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
+          if [ -f ci_perf_out/gpu_provenance_pre.txt ]; then
+            {
+              echo ""
+              echo "### Node"
+              echo '```'
+              grep -E "^(runner_name|hostname|driver_version)=|max_power_w=" \
+                ci_perf_out/gpu_provenance_pre.txt | sort -u
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -491,6 +524,8 @@ jobs:
             ci_perf_out/mxfp4/train.log
             ci_perf_out/perf_8b_fp4_fsdp8.json
             ci_perf_out/perf_8b_fp4_fsdp8_summary.md
+            ci_perf_out/gpu_provenance_pre.txt
+            ci_perf_out/gpu_provenance_post.txt
           if-no-files-found: warn
 
       - name: Cleanup
