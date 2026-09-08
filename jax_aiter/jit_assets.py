@@ -6,7 +6,7 @@ Update this file whenever a hard JIT input changes. CPU CI checks these values
 against ``ci/jit_libs_manifest.py`` so a stale wheel binding cannot publish.
 """
 
-AITER_SHA = "24a62b1c122f23645a19b9d8b0abd4750c59359b"
+AITER_SHA = "0a3d269bccb68f2c7c04ec4b45c08dd9865fadae"
 GPU_ARCHS = "gfx950"
 ROCM_VERSION = "7.14.0"
 ASSET_CONTRACT_VERSION = 2
