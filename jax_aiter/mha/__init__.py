@@ -10,6 +10,8 @@ by AITER.
 Public API:
     flash_attn_func: Batch flash attention with custom_vjp
     flash_attn_varlen: Variable-length flash attention with custom_vjp
+    flash_attn_auto: Full-length rows, in the layout that reaches ASM
+    flash_attn_varlen_auto: Device-local varlen with a per-direction backend
 
 Default-wheel guard: the wheel includes the thin ``mha_*_ja.so`` FFI shims but
 omits the multi-GB ``libmha_fwd.so``/``libmha_bwd.so`` JIT libraries. Users add
@@ -59,8 +61,18 @@ from .mha import (
     flash_attn_varlen,
     flash_attn_varlen_raw,
 )
+from .select import (
+    flash_attn_auto,
+    flash_attn_varlen_auto,
+    full_row_layout,
+    varlen_bwd_backend,
+)
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen",
     "flash_attn_varlen_raw",
+    "flash_attn_auto",
+    "flash_attn_varlen_auto",
+    "full_row_layout",
+    "varlen_bwd_backend",
 ]

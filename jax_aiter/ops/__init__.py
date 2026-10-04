@@ -15,6 +15,15 @@ from .gemm_bf16 import gemm_bf16
 from .mha import mha_fwd, mha_bwd, MhaFwdConfig, MhaBwdConfig
 from .rmsnorm import rmsnorm_fwd
 from .activation import silu_and_mul
+from .buffers import uninitialized
+from .moe_mxfp4 import (
+    grouped_mxfp4_dw,
+    grouped_mxfp4_dw_wholeloop,
+    grouped_mxfp4_fwd_da,
+    grouped_mxfp4_fwd_da_wholeloop,
+    quantize_mxfp4_dim0,
+    quantize_mxfp4_dim1,
+)
 
 __all__ = [
     "gemm_fp4",
@@ -27,4 +36,11 @@ __all__ = [
     "MhaBwdConfig",
     "rmsnorm_fwd",
     "silu_and_mul",
+    "uninitialized",
+    "quantize_mxfp4_dim0",
+    "quantize_mxfp4_dim1",
+    "grouped_mxfp4_fwd_da",
+    "grouped_mxfp4_fwd_da_wholeloop",
+    "grouped_mxfp4_dw",
+    "grouped_mxfp4_dw_wholeloop",
 ]
