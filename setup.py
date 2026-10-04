@@ -280,6 +280,10 @@ setup(
             "_hsa/**/*.co",
             "_hsa/**/*.csv",
             "_hsa/**/*.py",
+            "THIRD_PARTY_NOTICES.md",
+            "licenses/*.txt",
+            "flydsl/kernels/mxfp4/ORIGIN.md",
+            "flydsl/kernels/mxfp4/wholeloop/ORIGIN.md",
         ],
     },
     cmdclass={
