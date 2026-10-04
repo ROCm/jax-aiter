@@ -78,10 +78,6 @@ hipify_output_dict_dump.txt
 Thumbs.db
 jax_aiter/_hsa/
 jax_aiter/_lib/
-
-# Local-only experimental modules (not committed upstream).
-jax_aiter/triton/
-
 # HLO dumps and investigation logs.
 hlo_dumps/
 
