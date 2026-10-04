@@ -146,6 +146,31 @@ def _resolve_bwd_dispatch(hard_block: bool, suspect_block: bool):
     return use_v3, atomic, bf16_cvt
 
 
+# gfx950 has group-mode ASM backwards for equal QK/V head dims (192/192 among
+# them, fp32 atomics only) but none for QK=192 / V=128, so AITER runs CK there.
+# Zero-extending V, O and dO to 192 reaches the 192/192 chain exactly: the zero
+# columns add nothing to dP = dO V^T or rowsum(dO * O), and their dV is sliced
+# off. JA_MHA_VARLEN_BWD_PAD_V=0 keeps the CK backward.
+_PAD_V_ENV = "JA_MHA_VARLEN_BWD_PAD_V"
+
+
+def _varlen_bwd_pad_v_to(q, v, *, use_v3, atomic_fp32, hard_block, deterministic):
+    """Head dim to zero-extend V/O/dO to for a group-mode backward, or None."""
+    if os.environ.get(_PAD_V_ENV, "1") == "0":
+        return None
+    if hard_block or deterministic or not (use_v3 and atomic_fp32):
+        return None
+    if get_gfx() != "gfx950" or q.dtype not in (jnp.bfloat16, jnp.float16):
+        return None
+    if (q.shape[-1], v.shape[-1]) != (192, 128):
+        return None
+    return q.shape[-1]
+
+
+def _widen_last(x, width):
+    return jnp.pad(x, ((0, 0),) * (x.ndim - 1) + ((0, width - x.shape[-1]),))
+
+
 # ---------------------------------------------------------------------------
 # Sharding helpers
 # ---------------------------------------------------------------------------
@@ -867,6 +892,10 @@ def _flash_attn_varlen_bwd(max_seqlen_q, max_seqlen_k, dropout_p,
     # The causal/gfx950/max_seqlen_k>256 block was retested on v0.1.19 and
     # cleared; see the dispatch notes above.
     use_v3, bwd_atomic, bf16_cvt = _resolve_bwd_dispatch(hard_block, suspect_block=False)
+    pad_to = _varlen_bwd_pad_v_to(q_p, v_p, use_v3=use_v3, atomic_fp32=bwd_atomic,
+                                  hard_block=hard_block, deterministic=res_det)
+    if pad_to is not None:
+        v_p, out_p, dout = (_widen_last(x, pad_to) for x in (v_p, out_p, dout))
 
     results = mha_bwd_unified(
         dout, q_p, k_p, v_p, out_p, lse,
@@ -925,7 +954,8 @@ def _favr_fwd(q, k, v, cu_q, cu_k, cu_q_log, cu_k_log, max_sq, max_sk,
         dropout_p=float(dropout_p), softmax_scale=float(softmax_scale),
         is_causal=causal, wl=int(wl), wr=int(wr),
         return_lse=True, return_randval=False,
-        use_asm_v3=True, how_v3_bf16_cvt=int(bf16_cvt),
+        use_asm_v3=os.environ.get("JA_MHA_FWD_USE_ASM_V3", "1") != "0",
+        how_v3_bf16_cvt=int(bf16_cvt),
         max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk), min_seqlen_q=0,
         logits_soft_cap=0.0, zero_tensors=_zero_pad(cu_q_log),
         cp_axis=None, cp_size=1, cp_load_balanced=True)
@@ -947,6 +977,11 @@ def _favr_bwd(max_sq, max_sk, dropout_p, softmax_scale, causal, window_size,
     # The causal/gfx950/max_seqlen_k>256 block was retested on v0.1.19 and
     # cleared; see the dispatch notes above.
     use_v3, bwd_atomic, bf16_cvt = _resolve_bwd_dispatch(hard_block, suspect_block=False)
+    hd_v = v.shape[-1]
+    pad_to = _varlen_bwd_pad_v_to(q, v, use_v3=use_v3, atomic_fp32=bwd_atomic,
+                                  hard_block=hard_block, deterministic=False)
+    if pad_to is not None:
+        v, out, dout = (_widen_last(x, pad_to) for x in (v, out, dout))
     cfg = MhaBwdConfig(
         dropout_p=float(dropout_p), softmax_scale=float(softmax_scale),
         is_causal=causal, wl=int(wl), wr=int(wr), deterministic=False,
@@ -959,7 +994,7 @@ def _favr_bwd(max_sq, max_sk, dropout_p, softmax_scale, causal, window_size,
         _empty(q.dtype), _empty(q.dtype), _empty(q.dtype),
         _empty(q.dtype), _empty(jnp.float32), rng, _empty(jnp.int64),
         cu_q_log, cu_k_log, cfg)
-    return (dq, dk, dv, None, None, None, None)
+    return (dq, dk, dv[..., :hd_v], None, None, None, None)
 
 
 flash_attn_varlen_raw.defvjp(_favr_fwd, _favr_bwd)

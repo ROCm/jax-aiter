@@ -34,6 +34,8 @@ SYMBOL_TO_MODULE_MAP = {
     "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualKeyedSrJA": "cast_mxfp4_ja.so",
+    "FlydslDispatchJA": "flydsl_bridge_ja.so",
+    "TritonDispatchJA": "triton_bridge_ja.so",
     "KvAliasProbeJA": "kv_alias_probe_ja.so",
     "AppendKvJA": "append_kv_ja.so",
     "PagedAttentionJA": "paged_attention_ja.so",
@@ -51,6 +53,8 @@ STANDALONE_SYMBOLS = {
     "AppendKvJA",
     "PagedAttentionJA",
     "PagedPrefillJA",
+    "FlydslDispatchJA",
+    "TritonDispatchJA",
 }
 
 
