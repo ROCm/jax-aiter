@@ -118,6 +118,20 @@ def _zero_pad(cu_logical) -> bool:
     return os.environ.get("JA_MHA_ZERO_PAD", "1") != "0"
 
 
+def _resolve_fwd_dispatch(cu_logical) -> bool:
+    """Whether forward may use ASM v3 for this physical/logical layout.
+
+    Fixed-shape packed metadata contains trailing zero-length sequence slots.
+    The gfx950 group-mode ASM forward is nondeterministic for that contract;
+    repeated identical calls can corrupt a few active rows. CK is stable.
+    Tight layouts without a separate logical-length array keep the ASM path.
+    ``JA_MHA_FWD_FORCE_ASM_V3=1`` exists only for reproducing the guarded case.
+    """
+    requested = os.environ.get("JA_MHA_FWD_USE_ASM_V3", "1") != "0"
+    force = os.environ.get("JA_MHA_FWD_FORCE_ASM_V3", "0") == "1"
+    return requested and (not _has_padding(cu_logical) or force)
+
+
 def _tag_context(*vals):
     """Name attention residuals so a layer-remat policy can save them."""
     if os.environ.get("JA_MHA_REMAT_CONTEXT", "1") == "0":
@@ -437,11 +451,9 @@ def mha_fwd_unified(q, k, v, dropout_p, softmax_scale, causal,
     is_fp8 = _is_fp8_dtype(q.dtype)
     out_dtype = jnp.bfloat16 if is_fp8 else q.dtype
 
-    # Forward uses the CK FA v3 ASM kernel by default (AITER falls back to v2 CK
-    # when use_asm_v3=False or the shape is unsupported). JA_MHA_FWD_USE_ASM_V3=0
-    # forces the v2 forward — used by the FAv3-vs-FAv2 forward numeric A/B
-    # (AIMA-164). Default 1 preserves existing behavior.
-    _fwd_use_asm_v3 = os.environ.get("JA_MHA_FWD_USE_ASM_V3", "1") != "0"
+    # Forward uses ASM v3 for tight layouts. Packed layouts with separate
+    # physical/logical metadata take the guarded CK path.
+    _fwd_use_asm_v3 = _resolve_fwd_dispatch(cu_seqlens_q_logical)
 
     config = MhaFwdConfig(
         dropout_p=float(dropout_p),
@@ -954,7 +966,7 @@ def _favr_fwd(q, k, v, cu_q, cu_k, cu_q_log, cu_k_log, max_sq, max_sk,
         dropout_p=float(dropout_p), softmax_scale=float(softmax_scale),
         is_causal=causal, wl=int(wl), wr=int(wr),
         return_lse=True, return_randval=False,
-        use_asm_v3=os.environ.get("JA_MHA_FWD_USE_ASM_V3", "1") != "0",
+        use_asm_v3=_resolve_fwd_dispatch(cu_q_log),
         how_v3_bf16_cvt=int(bf16_cvt),
         max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk), min_seqlen_q=0,
         logits_soft_cap=0.0, zero_tensors=_zero_pad(cu_q_log),
@@ -998,3 +1010,93 @@ def _favr_bwd(max_sq, max_sk, dropout_p, softmax_scale, causal, window_size,
 
 
 flash_attn_varlen_raw.defvjp(_favr_fwd, _favr_bwd)
+
+
+# ---------------------------------------------------------------------------
+# Several bounded group-mode calls sharing one output
+# ---------------------------------------------------------------------------
+# A packed shard is cheaper as a few calls with tight ``max_seqlen`` bounds,
+# each over the documents of one length range, than as one call bounded by the
+# longest document. The kernels write only the logical rows of their own
+# segments, so every call can update the same output and gradient buffers in
+# place: only the first call clears them, V/O/dO are widened once, and no
+# per-call result has to be merged.
+
+@partial(jax.custom_vjp, nondiff_argnums=(5, 6, 7))
+def flash_attn_varlen_buckets(q, k, v, buckets, owners, max_seqlens,
+                              softmax_scale, causal):
+    """Device-local self-attention over disjoint buckets of packed documents.
+
+    ``buckets`` holds one ``(seqstart, cu_seqlen)`` pair per call, the physical
+    offsets and logical lengths of :func:`flash_attn_varlen_raw`, used for both
+    Q and K. ``owners`` holds each call's ``[total]`` boolean mask of the tokens
+    it computes, and ``max_seqlens`` each call's static length bound. A token
+    belongs to at most one bucket; tokens in none (padding) get zeros. Requires
+    equal Q and K head counts, the AITER backward and no dropout or window.
+    """
+    out, _ = _favb_fwd(q, k, v, buckets, owners, max_seqlens, softmax_scale, causal)
+    return out
+
+
+def _favb_fwd(q, k, v, buckets, owners, max_seqlens, softmax_scale, causal):
+    from .select import varlen_bwd_backend
+
+    if q.shape[1] != k.shape[1]:
+        raise ValueError("flash_attn_varlen_buckets needs equal Q and K head counts")
+    backend = varlen_bwd_backend(q_dtype=q.dtype, hd_qk=q.shape[-1], hd_v=v.shape[-1],
+                                 causal=causal, dropout_p=0.0, window_size=(-1, -1))
+    if backend != "aiter":
+        raise ValueError(f"flash_attn_varlen_buckets needs the AITER backward, got {backend}")
+    bf16_cvt = 0 if get_gfx() == "gfx950" else 1
+    use_v3 = _resolve_fwd_dispatch(buckets[0][1])
+    out = lse = None
+    for (seqstart, cu_seqlen), owner, max_seqlen in zip(buckets, owners, max_seqlens):
+        first = out is None
+        cfg = MhaFwdConfig(
+            dropout_p=0.0, softmax_scale=float(softmax_scale),
+            is_causal=causal, wl=-1, wr=-1,
+            return_lse=True, return_randval=False,
+            use_asm_v3=use_v3, how_v3_bf16_cvt=int(bf16_cvt),
+            max_seqlen_q=int(max_seqlen), max_seqlen_k=int(max_seqlen), min_seqlen_q=0,
+            logits_soft_cap=0.0, zero_tensors=first,
+            cp_axis=None, cp_size=1, cp_load_balanced=True)
+        out_i, lse_i, _p, _rng = _mha_fwd_raw(
+            q, k, v, seqstart, seqstart, _empty(q.dtype) if first else out,
+            _empty(q.dtype), _empty(jnp.float32), _empty(jnp.int64),
+            cu_seqlen, cu_seqlen, cfg, alias_out=not first)
+        out = out_i
+        # Only the first call fills the padding rows of the LSE.
+        lse = lse_i if first else jnp.where(owner[None, :], lse_i, lse)
+    out, lse = _tag_context(out, lse)
+    return out, (q, k, v, out, lse, buckets)
+
+
+def _favb_bwd(max_seqlens, softmax_scale, causal, res, dout):
+    q, k, v, out, lse, buckets = res
+    use_v3, bwd_atomic, bf16_cvt = _resolve_bwd_dispatch(False, suspect_block=False)
+    hd_v = v.shape[-1]
+    pad_to = _varlen_bwd_pad_v_to(q, v, use_v3=use_v3, atomic_fp32=bwd_atomic,
+                                  hard_block=False, deterministic=False)
+    if pad_to is not None:
+        v, out, dout = (_widen_last(x, pad_to) for x in (v, out, dout))
+    grads = None
+    for (seqstart, cu_seqlen), max_seqlen in zip(buckets, max_seqlens):
+        first = grads is None
+        cfg = MhaBwdConfig(
+            dropout_p=0.0, softmax_scale=float(softmax_scale),
+            is_causal=causal, wl=-1, wr=-1, deterministic=False,
+            use_asm_v3=use_v3, is_v3_atomic_fp32=bwd_atomic, how_v3_bf16_cvt=int(bf16_cvt),
+            max_seqlen_q=int(max_seqlen), max_seqlen_k=int(max_seqlen),
+            zero_tensors=first,
+            cp_axis=None, cp_size=1, cp_load_balanced=True)
+        grads_i = _mha_bwd_raw(
+            dout, q, k, v, out, lse, seqstart, seqstart,
+            *((_empty(q.dtype),) * 3 if first else grads),
+            _empty(q.dtype), _empty(jnp.float32), _empty(jnp.int64), _empty(jnp.int64),
+            cu_seqlen, cu_seqlen, cfg, alias_grads=not first)[:3]
+        grads = grads_i
+    dq, dk, dv = grads
+    return dq, dk, dv[..., :hd_v], None, None
+
+
+flash_attn_varlen_buckets.defvjp(_favb_fwd, _favb_bwd)

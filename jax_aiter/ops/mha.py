@@ -53,7 +53,7 @@ def _si(x) -> np.int32:
     return np.int32(x)
 
 
-def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype):
+def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype, alias_out=False):
     call = jax.ffi.ffi_call(
         "MhaFwdUnifiedJA",
         (
@@ -66,6 +66,7 @@ def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype):
         input_layouts=[None] * 14,
         output_layouts=[None] * 4,
         has_side_effect=False,
+        input_output_aliases={5: 0} if alias_out else None,
     )
 
     def _invoke(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
@@ -96,7 +97,8 @@ def _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype):
         "logits_soft_cap", "zero_tensors"))
 
 
-def _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape, sd_shape, dbias_shape, dtype):
+def _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape, sd_shape, dbias_shape, dtype,
+                             alias_grads=False):
     call = jax.ffi.ffi_call(
         "MhaBwdUnifiedJA",
         (
@@ -110,6 +112,7 @@ def _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape, sd_shape, dbias_shape
         input_layouts=[None] * 17,
         output_layouts=[None] * 5,
         has_side_effect=False,
+        input_output_aliases={8: 0, 9: 1, 10: 2} if alias_grads else None,
     )
 
     def _invoke(dout, q, k, v, out, lse, cu_sq, cu_sk,
@@ -142,7 +145,7 @@ def _is_fp8_dtype(dtype):
 
 def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
             cu_sq_log=None, cu_skv_log=None, config=None,
-            q_descale=None, k_descale=None, v_descale=None):
+            q_descale=None, k_descale=None, v_descale=None, alias_out=False):
     """Raw MHA forward FFI call. Derives output shapes from per-shard Q.
 
     Args:
@@ -151,7 +154,9 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
         v: [B, Sk, Hk, Dv] or [total_k, Hk, Dv].
         cu_sq: Cumulative physical query offsets (varlen) or empty.
         cu_skv: Cumulative physical KV offsets (varlen) or empty.
-        out_prov: Provisioning tensor (empty).
+        out_prov: Provisioning tensor (empty), or with ``alias_out`` a buffer of
+            the output's shape that the kernel updates in place: rows it does
+            not write keep their values.
         bias: Attention bias or empty.
         alibi: ALiBi slopes or empty.
         gen: RNG generator state or empty.
@@ -197,7 +202,7 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
     k_desc = k_descale if k_descale is not None else empty_descale
     v_desc = v_descale if v_descale is not None else empty_descale
 
-    fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype)
+    fn = _cached_unified_fwd_call(out_shape, lse_shape, p_shape, out_dtype, alias_out)
     return fn(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
               cu_sq_log, cu_skv_log,
               q_desc, k_desc, v_desc,
@@ -218,7 +223,7 @@ def mha_fwd(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
 
 def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
             dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
-            cu_sq_log=None, cu_sk_log=None, config=None):
+            cu_sq_log=None, cu_sk_log=None, config=None, alias_grads=False):
     """Raw MHA backward FFI call. Derives output shapes from per-shard Q.
 
     Args:
@@ -227,7 +232,9 @@ def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
         out: Forward output.
         lse: Log-sum-exp from forward.
         cu_sq, cu_sk: Cumulative physical offsets (varlen) or empty.
-        dq_ws, dk_ws, dv_ws: Workspace tensors (empty).
+        dq_ws, dk_ws, dv_ws: Workspace tensors (empty), or with ``alias_grads``
+            buffers of the gradients' shapes that the kernel updates in place:
+            rows it does not write keep their values.
         bias, alibi, rng, gen: Same as forward.
         cu_sq_log, cu_sk_log: Cumulative logical lengths excluding padding, or
             empty.
@@ -263,7 +270,7 @@ def mha_bwd(dout, q, k, v, out, lse, cu_sq, cu_sk,
         sd_shape = (b, hq, sq)
         dbias_shape = (b, sq, hq, sk) if (bias.size > 0) else (0,)
     fn = _cached_unified_bwd_call(dq_shape, dk_shape, dv_shape,
-                                  sd_shape, dbias_shape, q.dtype)
+                                  sd_shape, dbias_shape, q.dtype, alias_grads)
     return fn(dout, q, k, v, out, lse, cu_sq, cu_sk,
               dq_ws, dk_ws, dv_ws, bias, alibi, rng, gen,
               cu_sq_log, cu_sk_log,
