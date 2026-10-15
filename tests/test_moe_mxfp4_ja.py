@@ -10,13 +10,19 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-pytest.importorskip("flydsl.compiler")
+from mxfp4_kernel_gate import require_mxfp4_kernels
+
+require_mxfp4_kernels()
+pytestmark = pytest.mark.mxfp4_kernels
 
 from jax_aiter.ops.moe_mxfp4 import (
     grouped_mxfp4_dw,
     grouped_mxfp4_fwd_da,
     quantize_mxfp4_dim0,
+    quantize_mxfp4_dim0_gather,
     quantize_mxfp4_dim1,
+    quantize_mxfp4_dim1_gather,
+    requantize_mxfp4_dim0_transposed,
 )
 
 _FP4_VALUES = np.asarray(
@@ -148,6 +154,133 @@ def test_dim1_row_chunking_matches_single_launch_bitwise():
             np.testing.assert_array_equal(
                 np.asarray(actual), np.asarray(reference)
             )
+
+
+@pytest.mark.parametrize("max_index_elements", [None, 128 * 1024])
+@pytest.mark.parametrize("limit", [0, 96, 256, 384])
+def test_row_limit_matches_unlimited_rows_below_limit(limit, max_index_elements):
+    value = jax.random.normal(
+        jax.random.key(29), (384, 1024), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    # Tail rows must not reach any output row below the limit.
+    poisoned = value.at[limit:].set(jnp.nan)
+    extra = {} if max_index_elements is None else {"_max_index_elements": max_index_elements}
+    for quantize, axis in ((quantize_mxfp4_dim0, 0), (quantize_mxfp4_dim1, 1)):
+        expected = jax.jit(quantize)(value)
+        limited = jax.jit(functools.partial(quantize, **extra))(
+            poisoned, row_limit=jnp.int32(limit)
+        )
+        for actual, reference, per_row in zip(limited, expected, (2, 32), strict=True):
+            valid = limit // per_row if axis else limit
+            index = (slice(None), slice(0, valid)) if axis else slice(0, valid)
+            np.testing.assert_array_equal(
+                np.asarray(actual)[index], np.asarray(reference)[index]
+            )
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("cols", [1024, 7168])
+@pytest.mark.parametrize("limit", [None, 0, 77, 300])
+def test_dim0_gather_matches_materialized_gather(dtype, cols, limit):
+    in_rows, out_rows = 200, 300
+    value = jax.random.normal(
+        jax.random.key(31), (in_rows, cols), dtype=jnp.float32
+    ).astype(dtype)
+    index = jax.random.randint(jax.random.key(37), (out_rows,), -1, in_rows)
+    index = index.at[:8].set(jnp.int32(-1)).at[8:16].set(jnp.int32(in_rows - 1))
+    index = index.astype(jnp.int32)
+    gathered = jnp.where(
+        (index >= 0)[:, None], value[jnp.maximum(index, 0)], jnp.zeros((), dtype)
+    )
+    expected = jax.jit(quantize_mxfp4_dim0)(gathered)
+    extra = {} if limit is None else {"row_limit": jnp.int32(limit)}
+    actual = jax.jit(functools.partial(quantize_mxfp4_dim0_gather, **extra))(
+        value, index
+    )
+    valid = out_rows if limit is None else limit
+    for result, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(result)[:valid], np.asarray(reference)[:valid]
+        )
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("cols", [1024, 7168, 2080])
+@pytest.mark.parametrize("limit", [None, 0, 77, 320])
+def test_dim1_gather_matches_materialized_gather(dtype, cols, limit):
+    in_rows, out_rows = 200, 384
+    value = jax.random.normal(
+        jax.random.key(41), (in_rows, cols), dtype=jnp.float32
+    ).astype(dtype)
+    # Rows no index selects hold NaN: a masked row must not read them.
+    value = value.at[in_rows - 8 :].set(jnp.nan)
+    index = jax.random.randint(jax.random.key(43), (out_rows,), -1, in_rows - 8)
+    index = index.at[:40].set(jnp.int32(-1)).astype(jnp.int32)
+    gathered = jnp.where(
+        (index >= 0)[:, None], value[jnp.maximum(index, 0)], jnp.zeros((), dtype)
+    )
+    expected = jax.jit(quantize_mxfp4_dim1)(gathered)
+    extra = {} if limit is None else {"row_limit": jnp.int32(limit)}
+    actual = jax.jit(functools.partial(quantize_mxfp4_dim1_gather, **extra))(
+        value, index
+    )
+    valid = out_rows if limit is None else limit
+    for result, reference, per_col in zip(actual, expected, (2, 32), strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(result)[:, : valid // per_col],
+            np.asarray(reference)[:, : valid // per_col],
+        )
+
+
+@pytest.mark.parametrize("limit", [None, 0, 77, 200, 320])
+@pytest.mark.parametrize(
+    "quantize, out_rows, axis",
+    [(quantize_mxfp4_dim0_gather, 300, 0), (quantize_mxfp4_dim1_gather, 384, 1)],
+)
+def test_gather_row_chunking_matches_single_launch_bitwise(quantize, out_rows, axis, limit):
+    in_rows, cols = 200, 1024
+    value = jax.random.normal(
+        jax.random.key(53), (in_rows, cols), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    index = jax.random.randint(jax.random.key(59), (out_rows,), -1, in_rows)
+    index = index.at[:40].set(jnp.int32(-1)).astype(jnp.int32)
+    extra = {} if limit is None else {"row_limit": jnp.int32(limit)}
+    single_launch = jax.jit(functools.partial(quantize, **extra))
+    chunked_launch = jax.jit(
+        functools.partial(quantize, _max_index_elements=128 * (cols // 2), **extra)
+    )
+    chunked_ir = str(chunked_launch.lower(value, index).compiler_ir()).lower()
+    assert chunked_ir.count("stablehlo.custom_call") == 3
+    valid = out_rows if limit is None else limit
+    for actual, reference, per_row in zip(
+        chunked_launch(value, index), single_launch(value, index), (2, 32), strict=True
+    ):
+        index_valid = (slice(None), slice(0, valid // per_row)) if axis else slice(0, valid)
+        np.testing.assert_array_equal(
+            np.asarray(actual)[index_valid], np.asarray(reference)[index_valid]
+        )
+
+
+@pytest.mark.parametrize("shape", [(64, 96), (3, 2048, 224)])
+def test_requantize_transposed_matches_dequantized_reference(shape):
+    value = jax.random.normal(jax.random.key(47), shape, dtype=jnp.float32)
+    value = value.at[..., :32, :32].set(0).astype(jnp.bfloat16)
+    *lead, rows, cols = shape
+    packed, scales = quantize_mxfp4_dim0(value.reshape(-1, cols))
+    packed = packed.reshape(*lead, rows, cols // 2)
+    scales = scales.reshape(*lead, rows, cols // 32)
+    actual = jax.jit(requantize_mxfp4_dim0_transposed)(packed, scales)
+    transposed = np.swapaxes(_dequantize(packed, scales), -1, -2)
+    # Requantized values often sit on rounding ties, which the numpy reference
+    # breaks differently from the kernel, so the kernel quantizes the exact
+    # numpy dequantization.
+    exact = jnp.asarray(transposed.reshape(-1, rows), dtype=jnp.bfloat16)
+    assert np.array_equal(np.asarray(exact, np.float32), transposed.reshape(-1, rows))
+    expected = jax.jit(quantize_mxfp4_dim0)(exact)
+    for result, reference, per_row in zip(actual, expected, (2, 32), strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(result), np.asarray(reference).reshape(*lead, cols, rows // per_row)
+        )
 
 
 def test_dim0_dispatches_on_multiple_devices_and_lowers_to_typed_ffi():
