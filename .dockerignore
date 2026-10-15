@@ -1,0 +1,22 @@
+.git
+.github
+.cursor
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.rocprofv3
+**/__pycache__
+**/*.py[cod]
+**/*.o
+**/*.so
+
+build
+dist
+*.egg-info
+third_party
+hlo_dumps
+ci_perf_out
+
+# Rights-gated and absent from Git. The MXFP4 Dockerfile accepts these only
+# through an explicit, independently verified BuildKit named context.
+jax_aiter/flydsl/kernels/mxfp4
