@@ -3,11 +3,18 @@
 
 These functions intentionally define no differentiation rule. MaxText's
 grouped-GEMM custom VJP selects the forward/dA and dW bodies explicitly.
+
+The FlyDSL kernel sources these operations launch are license-gated and
+distributed separately; they are not part of this repository or its wheels.
+Without them, the operations raise ``Mxfp4KernelsUnavailableError`` and
+``mxfp4_moe_kernels_available()`` returns ``False``. The rest of JAX-AITER does
+not depend on them.
 """
 
 from __future__ import annotations
 
 import functools
+import importlib.util
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +25,28 @@ _SCALE_BLOCK = 32
 _GROUP_ALIGNMENT = 128
 _WHOLELOOP_ALIGNMENT = 256
 _INT32_MAX = (1 << 31) - 1
+_KERNEL_PACKAGE = "jax_aiter.flydsl.kernels.mxfp4"
+
+
+class Mxfp4KernelsUnavailableError(ImportError):
+    """The separately distributed MXFP4 MoE kernel sources are not installed."""
+
+
+def mxfp4_moe_kernels_available() -> bool:
+    """Whether the license-gated MXFP4 MoE kernel sources are installed."""
+    return importlib.util.find_spec(_KERNEL_PACKAGE) is not None
+
+
+def _require_kernels() -> None:
+    if not mxfp4_moe_kernels_available():
+        raise Mxfp4KernelsUnavailableError(
+            "JAX-AITER's grouped MXFP4 MoE operations need FlyDSL kernel "
+            "sources that are license-gated and distributed separately; they "
+            "are not part of this repository or its wheels. Install an "
+            "authorized copy at jax_aiter/flydsl/kernels/mxfp4/ "
+            "(docker/mxfp4/mxfp4-kernels.sha256 lists the expected files). "
+            "The rest of JAX-AITER does not need them."
+        )
 
 
 def _row_chunks(
@@ -86,21 +115,34 @@ def _require_int32_indexing(name: str, element_count: int) -> None:
         )
 
 
-def _quantize_mxfp4_dim0_single(value):
+def _row_limit_operands(row_limit, start: int, end: int) -> tuple[jax.Array, ...]:
+    """Device ``int32[1]`` limit for rows ``[start, end)``, or nothing."""
+    if row_limit is None:
+        return ()
+    limit = jnp.clip(jnp.asarray(row_limit, jnp.int32) - jnp.int32(start), 0, end - start)
+    return (limit.reshape(1),)
+
+
+def _quantize_mxfp4_dim0_single(value, row_limit_operands=()):
     """One int32-addressable dim0 quantization launch."""
     rows, cols = value.shape
-    _require_int32_indexing("dim0 input", rows * cols)
+    # The kernel bases its input per wave; only the packed output is int32-indexed.
+    _require_int32_indexing("dim0 packed output", rows * cols // 2)
 
+    _require_kernels()
     from ..flydsl.kernels.mxfp4.quant_dim0 import (
-        BLOCK,
+        GROUPS_PER_WG,
         _compile_quant_dim0,
     )
 
-    launcher = _compile_quant_dim0(cols, _flydsl_dtype_name(value.dtype))
+    launcher = _compile_quant_dim0(
+        cols, _flydsl_dtype_name(value.dtype), bool(row_limit_operands)
+    )
     num_groups = rows * (cols // _SCALE_BLOCK)
-    grid_blocks = (num_groups + BLOCK - 1) // BLOCK
+    grid_blocks = (num_groups + GROUPS_PER_WG - 1) // GROUPS_PER_WG
     outputs = flydsl_call(
         value.reshape(-1),
+        *row_limit_operands,
         kernel=launcher,
         out_shape=(
             jax.ShapeDtypeStruct((rows * cols // 2,), jnp.uint8),
@@ -133,11 +175,14 @@ def _quantize_mxfp4_dim0_maybe_empty(value):
 
 
 def quantize_mxfp4_dim0(
-    value, *, _max_index_elements: int = _INT32_MAX
+    value, *, row_limit=None, _max_index_elements: int = _INT32_MAX
 ):
     """Compact RCEIL quantization along the contiguous matrix dimension.
 
     ``[M, K] -> ([M, K/2] packed FP4, [M, K/32] E8M0)``.
+
+    ``row_limit`` (device int32 scalar) leaves output rows at or past it
+    unwritten, for buffers whose tail rows no reader uses.
     """
     value = _validate_matrix(
         "value", value, dtypes=(jnp.bfloat16, jnp.float32)
@@ -147,18 +192,25 @@ def quantize_mxfp4_dim0(
         raise ValueError(f"dim0 quantization requires K % 32 == 0, got {cols}")
     chunks = _row_chunks(
         rows,
-        cols,
+        cols // 2,
         alignment=1,
         max_index_elements=_max_index_elements,
     )
     outputs = []
     for chunk_index, (start, end) in enumerate(chunks):
         chunk = value[start:end]
-        outputs.append(
-            _quantize_mxfp4_dim0_single(chunk)
-            if chunk_index == 0
-            else _quantize_mxfp4_dim0_maybe_empty(chunk)
-        )
+        if row_limit is not None:
+            outputs.append(
+                _quantize_mxfp4_dim0_single(
+                    chunk, _row_limit_operands(row_limit, start, end)
+                )
+            )
+        else:
+            outputs.append(
+                _quantize_mxfp4_dim0_single(chunk)
+                if chunk_index == 0
+                else _quantize_mxfp4_dim0_maybe_empty(chunk)
+            )
     if len(outputs) == 1:
         return outputs[0]
     return (
@@ -167,11 +219,116 @@ def quantize_mxfp4_dim0(
     )
 
 
-def _quantize_mxfp4_dim1_single(value):
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def requantize_mxfp4_dim0_transposed(packed, scales):
+    """Re-quantize dim0 MXFP4 ``x[..., R, C]`` as dim0 MXFP4 of ``x^T``.
+
+    ``([..., R, C/2], [..., R, C/32]) -> ([..., C, R/2], [..., C, R/32])``.
+    The values are dequantized exactly to bfloat16 and quantized again in
+    32-blocks along ``R``, so the result carries both roundings and is not
+    bit-equal to quantizing the original ``x^T``.
+    """
+    if packed.dtype != jnp.uint8 or scales.dtype != jnp.uint8:
+        raise TypeError(
+            f"Expected uint8 packed values and scales, got {packed.dtype}, {scales.dtype}"
+        )
+    *lead, rows, packed_cols = packed.shape
+    cols = packed_cols * 2
+    if scales.shape != (*lead, rows, cols // _SCALE_BLOCK):
+        raise ValueError(f"Scales {scales.shape} do not match packed {packed.shape}")
+    if rows % _SCALE_BLOCK:
+        raise ValueError(f"Transposed requantization requires R % 32 == 0, got {rows}")
+
+    table = jnp.asarray(_E2M1_VALUES + tuple(-v for v in _E2M1_VALUES), jnp.float32)
+    codes = jnp.stack((packed & 0xF, packed >> 4), axis=-1)
+    values = table[codes].reshape(*lead, rows, cols // _SCALE_BLOCK, _SCALE_BLOCK)
+    scale = jax.lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
+    values = (values * scale[..., None]).astype(jnp.bfloat16)
+    transposed = values.reshape(*lead, rows, cols).swapaxes(-1, -2)
+    out_packed, out_scales = quantize_mxfp4_dim0(transposed.reshape(-1, rows))
+    return (
+        out_packed.reshape(*lead, cols, rows // 2),
+        out_scales.reshape(*lead, cols, rows // _SCALE_BLOCK),
+    )
+
+
+def _quantize_mxfp4_dim0_gather_single(value, row_index, limit_operand):
+    """One int32-addressable gathered dim0 quantization launch."""
+    cols = value.shape[1]
+    rows = row_index.shape[0]
+    _require_int32_indexing("gather packed output", rows * cols // 2)
+
+    _require_kernels()
+    from ..flydsl.kernels.mxfp4.quant_dim0 import (
+        GROUPS_PER_WG,
+        _compile_quant_dim0_gather,
+    )
+
+    launcher = _compile_quant_dim0_gather(cols, _flydsl_dtype_name(value.dtype))
+    num_groups = rows * (cols // _SCALE_BLOCK)
+    grid_blocks = (num_groups + GROUPS_PER_WG - 1) // GROUPS_PER_WG
+    packed, scales = flydsl_call(
+        value.reshape(-1),
+        row_index,
+        limit_operand,
+        kernel=launcher,
+        out_shape=(
+            jax.ShapeDtypeStruct((rows * cols // 2,), jnp.uint8),
+            jax.ShapeDtypeStruct((rows * cols // _SCALE_BLOCK,), jnp.uint8),
+        ),
+        scalars={"n_groups": num_groups, "grid_blocks": grid_blocks},
+        output_positions=(2, 3),
+    )
+    return (
+        packed.reshape(rows, cols // 2),
+        scales.reshape(rows, cols // _SCALE_BLOCK),
+    )
+
+
+def quantize_mxfp4_dim0_gather(
+    value, row_index, *, row_limit=None, _max_index_elements: int = _INT32_MAX
+):
+    """dim0 quantization of gathered rows without materializing the gather.
+
+    Output row ``r`` is the dim0 quantization of ``value[row_index[r]]``; a
+    negative index gives an all-zero row. ``row_limit`` (device int32 scalar)
+    leaves output rows at or past it unwritten.
+    """
+    value, row_index = _validate_gather(value, row_index)
+    cols = value.shape[1]
+    rows = row_index.shape[0]
+    if value.size * value.dtype.itemsize >= 1 << 32:
+        raise ValueError(
+            f"dim0 gather source {value.shape} {value.dtype} exceeds 4 GiB "
+            "buffer addressing"
+        )
+    limit = rows if row_limit is None else row_limit
+    chunks = _row_chunks(
+        rows, cols // 2, alignment=1, max_index_elements=_max_index_elements
+    )
+    outputs = [
+        _quantize_mxfp4_dim0_gather_single(
+            value, row_index[start:end], _row_limit_operands(limit, start, end)[0]
+        )
+        for start, end in chunks
+    ]
+    if len(outputs) == 1:
+        return outputs[0]
+    return (
+        jnp.concatenate([output[0] for output in outputs], axis=0),
+        jnp.concatenate([output[1] for output in outputs], axis=0),
+    )
+
+
+def _quantize_mxfp4_dim1_single(value, row_limit_operands=()):
     """One int32-addressable dim1 quantization launch."""
     rows, cols = value.shape
-    _require_int32_indexing("dim1 input", rows * cols)
+    # The kernel bases its input per tile; only the packed output is int32-indexed.
+    _require_int32_indexing("dim1 packed output", rows * cols // 2)
 
+    _require_kernels()
     from ..flydsl.kernels.mxfp4.quant_dim1 import (
         _K_TILE,
         _compile_quant_dim1,
@@ -180,9 +337,12 @@ def _quantize_mxfp4_dim1_single(value):
 
     dtype_name = _flydsl_dtype_name(value.dtype)
     stack = _pick_layout(rows, cols, value.dtype.itemsize)
-    launcher, tile_rows = _compile_quant_dim1(cols, dtype_name, stack)
+    launcher, tile_rows = _compile_quant_dim1(
+        cols, dtype_name, stack, bool(row_limit_operands)
+    )
     outputs = flydsl_call(
         value.reshape(-1),
+        *row_limit_operands,
         kernel=launcher,
         out_shape=(
             jax.ShapeDtypeStruct((cols * rows // 2,), jnp.uint8),
@@ -219,11 +379,14 @@ def _quantize_mxfp4_dim1_maybe_empty(value):
 
 
 def quantize_mxfp4_dim1(
-    value, *, _max_index_elements: int = _INT32_MAX
+    value, *, row_limit=None, _max_index_elements: int = _INT32_MAX
 ):
     """Compact RCEIL quantization while transposing the token dimension.
 
     ``[M, K] -> ([K, M/2] packed FP4, [K, M/32] E8M0)``.
+
+    ``row_limit`` (device int32 scalar) skips source rows from the 32-128 row
+    tile holding it onward; their output columns are left unwritten.
     """
     value = _validate_matrix(
         "value", value, dtypes=(jnp.bfloat16, jnp.float32)
@@ -236,18 +399,111 @@ def quantize_mxfp4_dim1(
         )
     chunks = _row_chunks(
         rows,
-        cols,
+        cols // 2,
         alignment=_SCALE_BLOCK,
         max_index_elements=_max_index_elements,
     )
     outputs = []
     for chunk_index, (start, end) in enumerate(chunks):
         chunk = value[start:end]
-        outputs.append(
-            _quantize_mxfp4_dim1_single(chunk)
-            if chunk_index == 0
-            else _quantize_mxfp4_dim1_maybe_empty(chunk)
+        if row_limit is not None:
+            outputs.append(
+                _quantize_mxfp4_dim1_single(
+                    chunk, _row_limit_operands(row_limit, start, end)
+                )
+            )
+        else:
+            outputs.append(
+                _quantize_mxfp4_dim1_single(chunk)
+                if chunk_index == 0
+                else _quantize_mxfp4_dim1_maybe_empty(chunk)
+            )
+    if len(outputs) == 1:
+        return outputs[0]
+    return (
+        jnp.concatenate([output[0] for output in outputs], axis=1),
+        jnp.concatenate([output[1] for output in outputs], axis=1),
+    )
+
+
+def _validate_gather(value, row_index):
+    value = _validate_matrix(
+        "value", value, dtypes=(jnp.bfloat16, jnp.float32)
+    )
+    row_index = jnp.asarray(row_index)
+    if row_index.ndim != 1 or row_index.dtype != jnp.int32:
+        raise TypeError(
+            f"row_index must be rank-1 int32, got {row_index.shape} {row_index.dtype}"
         )
+    if value.shape[1] % _SCALE_BLOCK:
+        raise ValueError(f"MXFP4 quantization requires K % 32 == 0, got {value.shape[1]}")
+    _require_int32_indexing("gather source", value.size)
+    return value, row_index
+
+
+def _quantize_mxfp4_dim1_gather_single(value, row_index, limit_operand):
+    """One int32-addressable gathered dim1 quantization launch."""
+    cols = value.shape[1]
+    rows = row_index.shape[0]
+    _require_int32_indexing("gather packed output", rows * cols // 2)
+
+    _require_kernels()
+    from ..flydsl.kernels.mxfp4.quant_dim1 import (
+        _K_TILE,
+        _compile_quant_dim1,
+        _pick_layout,
+    )
+
+    stack = _pick_layout(rows, cols, value.dtype.itemsize)
+    launcher, tile_rows = _compile_quant_dim1(
+        cols, _flydsl_dtype_name(value.dtype), stack, gather=True
+    )
+    packed, scales = flydsl_call(
+        value.reshape(-1),
+        row_index,
+        limit_operand,
+        kernel=launcher,
+        out_shape=(
+            jax.ShapeDtypeStruct((cols * rows // 2,), jnp.uint8),
+            jax.ShapeDtypeStruct((cols * rows // _SCALE_BLOCK,), jnp.uint8),
+        ),
+        scalars={
+            "m_rows": rows,
+            "grid_m": rows // tile_rows,
+            "grid_k": (cols + _K_TILE - 1) // _K_TILE,
+        },
+        output_positions=(2, 3),
+    )
+    return (
+        packed.reshape(cols, rows // 2),
+        scales.reshape(cols, rows // _SCALE_BLOCK),
+    )
+
+
+def quantize_mxfp4_dim1_gather(
+    value, row_index, *, row_limit=None, _max_index_elements: int = _INT32_MAX
+):
+    """dim1 quantization of gathered rows without materializing the gather.
+
+    Equals ``quantize_mxfp4_dim1`` of the ``[M, K]`` matrix whose row ``r`` is
+    ``value[row_index[r]]``, or zero for a negative index. ``row_limit`` is as
+    in :func:`quantize_mxfp4_dim1`.
+    """
+    value, row_index = _validate_gather(value, row_index)
+    cols = value.shape[1]
+    rows = row_index.shape[0]
+    if rows % _SCALE_BLOCK:
+        raise ValueError(f"dim1 quantization requires M % 32 == 0, got {rows}")
+    limit = rows if row_limit is None else row_limit
+    chunks = _row_chunks(
+        rows, cols // 2, alignment=_SCALE_BLOCK, max_index_elements=_max_index_elements
+    )
+    outputs = [
+        _quantize_mxfp4_dim1_gather_single(
+            value, row_index[start:end], _row_limit_operands(limit, start, end)[0]
+        )
+        for start, end in chunks
+    ]
     if len(outputs) == 1:
         return outputs[0]
     return (
@@ -317,6 +573,7 @@ def _grouped_mxfp4_fwd_da_single(
     ):
         raise ValueError("rhs_scales shape does not match rhs_packed")
 
+    _require_kernels()
     from ..flydsl.kernels.mxfp4._fwd_kernel_fp4 import (
         BLOCK_R,
         cached_launch,
@@ -477,6 +734,7 @@ def grouped_mxfp4_dw(
     )
 
     experts = offsets.shape[0]
+    _require_kernels()
     from ..flydsl.kernels.mxfp4._wgrad_kernel_fp4 import (
         BLOCK_C,
         BLOCK_R,
@@ -541,6 +799,7 @@ def _int64_bound_table(bounds: jax.Array) -> jax.Array:
 
 @functools.lru_cache(maxsize=None)
 def _wholeloop_fwd_da_launcher(contraction, experts, out_cols, schedule):
+    _require_kernels()
     from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
 
     group_m, num_xcds, group_n, xcd_span, streaming_store = schedule
@@ -563,10 +822,15 @@ def _wholeloop_fwd_da_launcher(contraction, experts, out_cols, schedule):
 
 @functools.lru_cache(maxsize=None)
 def _wholeloop_dw_launcher(out_rows, out_cols, experts, schedule):
+    _require_kernels()
     from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
 
     group_m, num_xcds, group_n, streaming_store, wg_tiles = schedule
     # The bf16 epilogue needs a full LDS drain at the phase barrier (elgk=0).
+    # dW also drains vmcnt there (wlv=0): its last global->LDS loads of a phase
+    # are read by other waves in the next phase with no further wait, so any
+    # left in flight race under memory-latency spikes (wlv=10 corrupted ~1 in
+    # 2000 calls).
     launcher, _ = grouped_gemm_mxfp4_kernel._compile_grouped_mxfp4_wgrad_fused(
         out_rows,
         out_cols,
@@ -576,7 +840,7 @@ def _wholeloop_dw_launcher(out_rows, out_cols, experts, schedule):
         group_n,
         streaming_store,
         wg_tiles,
-        wlv=10,
+        wlv=0,
         elgk=0,
         out_fp16=False,
         beta_is_one=False,
@@ -639,10 +903,11 @@ def _grouped_mxfp4_fwd_da_wholeloop_single(
         contraction // _SCALE_BLOCK,
     ):
         raise ValueError("rhs_scales shape does not match rhs_packed")
+    # The output needs no limit: the kernel stores through 64-bit row-band bases.
     _require_int32_indexing("grouped lhs", rows * packed_k)
     _require_int32_indexing("grouped rhs", experts * out_cols * packed_k)
-    _require_int32_indexing("grouped output", rows * out_cols)
 
+    _require_kernels()
     from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
 
     schedule = grouped_gemm_mxfp4_kernel._select_gmxfp4_nt_cfg(
@@ -713,7 +978,7 @@ def grouped_mxfp4_fwd_da_wholeloop(
         )
     chunks = _row_chunks(
         rows,
-        max(packed_k, lhs_scales.shape[1], out_cols),
+        max(packed_k, lhs_scales.shape[1]),
         alignment=_WHOLELOOP_ALIGNMENT,
         max_index_elements=_max_index_elements,
     )
@@ -824,6 +1089,7 @@ def grouped_mxfp4_dw_wholeloop(
         "grouped dW output", experts * out_rows * out_cols
     )
 
+    _require_kernels()
     from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
 
     schedule = grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(

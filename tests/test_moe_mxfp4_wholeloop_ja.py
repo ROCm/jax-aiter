@@ -10,7 +10,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-pytest.importorskip("flydsl.compiler")
+from mxfp4_kernel_gate import require_mxfp4_kernels
+
+require_mxfp4_kernels()
+pytestmark = pytest.mark.mxfp4_kernels
 
 from jax_aiter.ops.moe_mxfp4 import (
     grouped_mxfp4_dw,
