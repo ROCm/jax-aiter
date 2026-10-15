@@ -10,12 +10,15 @@
 // in fp32 must be provided. Output is always bf16 for fp8 input.
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <hip/hip_runtime.h>
 
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
+#define FMHA_FWD_BF16_OPUS_LAUNCH_IMPL
+#include "fmha_fwd_bf16_opus_launch.h"
 #include "hip_utils.h"
 #include "mha_common_utils.h"
 #include "mha_fwd.h"
@@ -376,6 +379,80 @@ MhaFwdUnified_Bridge(
 
   if (return_dropout_randval && !is_varlen && p->size_bytes() > 0) {
     HIP_CHECK(hipMemsetAsync(p->untyped_data(), 0, p->size_bytes(), stream));
+  }
+
+  // Mirror AITER's default gfx950 D_QK=192/D_V=128 varlen routing. The OPUS
+  // kernel accepts separate logical sequence lengths and physical padded
+  // offsets, unlike the generic ASM-v3 group kernel whose padded path is
+  // nondeterministic on this shape. Keep AITER_DISABLE_FMHA_OPUS as the
+  // upstream-compatible escape hatch for CK/ASM-v3 comparisons.
+  const char *disable_opus = std::getenv("AITER_DISABLE_FMHA_OPUS");
+  const bool opus_disabled =
+      disable_opus != nullptr && disable_opus[0] != '\0' &&
+      std::strcmp(disable_opus, "0") != 0;
+  const bool full_attention_window =
+      window_size_left == -1 && window_size_right == -1;
+  static const bool opus_arch = get_gpu_arch() == "gfx950";
+  const bool can_use_opus =
+      !opus_disabled && opus_arch && is_varlen &&
+      q_dtype == ffi::DataType::BF16 &&
+      head_size_q == 192 && head_size_v == 128 &&
+      seqstart_q_ptr != nullptr && seqstart_k_ptr != nullptr &&
+      max_seqlen_q > 0 && max_seqlen_k > 0 &&
+      dropout_p == 0.0f && !return_dropout_randval &&
+      !has_bias && !has_alibi && logits_soft_cap == 0.0f &&
+      q_descale_ptr == nullptr && k_descale_ptr == nullptr &&
+      v_descale_ptr == nullptr && min_seqlen_q == 0 &&
+      full_attention_window;
+
+  if (can_use_opus) {
+    // OPUS names the real cumulative lengths seqstart_* and the physical
+    // offsets seqstart_*_pad. JAX-AITER's unified API uses the opposite
+    // naming convention: seqstart_* are physical and cu_seqlen_* are real.
+    const auto *logical_q =
+        cu_seqlen_q_ptr != nullptr ? cu_seqlen_q_ptr : seqstart_q_ptr;
+    const auto *logical_k =
+        cu_seqlen_k_ptr != nullptr ? cu_seqlen_k_ptr : seqstart_k_ptr;
+
+    fmha_fwd_bf16_opus_args opus_args{};
+    opus_args.q_ptr = q.untyped_data();
+    opus_args.k_ptr = k.untyped_data();
+    opus_args.v_ptr = v.untyped_data();
+    opus_args.o_ptr = o->untyped_data();
+    opus_args.lse_ptr =
+        return_softmax_lse ? lse->untyped_data() : nullptr;
+    opus_args.seqstart_q_ptr =
+        reinterpret_cast<const int *>(logical_q);
+    opus_args.seqstart_k_ptr =
+        reinterpret_cast<const int *>(logical_k);
+    opus_args.seqstart_q_pad_ptr =
+        reinterpret_cast<const int *>(seqstart_q_ptr);
+    opus_args.seqstart_k_pad_ptr =
+        reinterpret_cast<const int *>(seqstart_k_ptr);
+    opus_args.batch = static_cast<int>(batch_size);
+    opus_args.nhead = static_cast<int>(num_heads);
+    opus_args.nhead_k = static_cast<int>(num_heads_k);
+    opus_args.seqlen_q = static_cast<int>(max_seqlen_q);
+    opus_args.seqlen_k = static_cast<int>(max_seqlen_k);
+    opus_args.hdim_q = static_cast<int>(head_size_q);
+    opus_args.hdim_v = static_cast<int>(head_size_v);
+    opus_args.stride_q_n = static_cast<int>(stride_q);
+    opus_args.stride_q_h = static_cast<int>(nhead_stride_q);
+    opus_args.stride_k_n = static_cast<int>(stride_k);
+    opus_args.stride_k_h = static_cast<int>(nhead_stride_k);
+    opus_args.stride_v_n = static_cast<int>(stride_v);
+    opus_args.stride_v_h = static_cast<int>(nhead_stride_v);
+    opus_args.stride_o_n = static_cast<int>(stride_o);
+    opus_args.stride_o_h = static_cast<int>(nhead_stride_o);
+    opus_args.stride_lse_h = static_cast<int>(nhead_stride_lse);
+    opus_args.softmax_scale = softmax_scale;
+    opus_args.causal = eff_causal;
+
+    // The launcher declines before launching anything, so a declined
+    // configuration can still take the generic path below.
+    if (fmha_fwd_bf16_opus_launch(opus_args, stream)) {
+      return ffi::Error::Success();
+    }
   }
 
   auto args = aiter::mha_fwd_args{

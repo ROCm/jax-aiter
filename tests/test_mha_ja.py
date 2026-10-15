@@ -718,6 +718,37 @@ class TestPaddedGroupMode:
             assert pad_max == 0.0, f"{name} nonzero on padding: {pad_max}"
 
 
+class TestQk192V128PaddedGroupMode:
+    """Padded group-mode forward for D_QK=192/D_V=128, the OPUS route on gfx950."""
+
+    ROWS, ROW_LEN, HQ, HK, D_QK, D_V = 2, 256, 4, 2, 192, 128
+    SEG_LENS = [[100, 56], [200]]
+
+    @pytest.mark.parametrize("disable_opus", ["0", "1"], ids=["opus", "generic"])
+    def test_padded_matches_reference(self, monkeypatch, disable_opus):
+        monkeypatch.setenv("AITER_DISABLE_FMHA_OPUS", disable_opus)
+        n = self.ROWS * self.ROW_LEN
+        k1, k2, k3 = jax.random.split(jax.random.PRNGKey(52), 3)
+        q = jax.random.normal(k1, (n, self.HQ, self.D_QK), jnp.float32).astype(jnp.bfloat16)
+        k_t = jax.random.normal(k2, (n, self.HK, self.D_QK), jnp.float32).astype(jnp.bfloat16)
+        v = jax.random.normal(k3, (n, self.HK, self.D_V), jnp.float32).astype(jnp.bfloat16)
+        seqstart, cu, real = _padded_layout(self.ROWS, self.ROW_LEN, self.SEG_LENS)
+        scale = self.D_QK ** -0.5
+
+        out = flash_attn_varlen(
+            q, k_t, v, seqstart, seqstart,
+            cu_seqlens_q_logical=cu, cu_seqlens_k_logical=cu,
+            max_seqlen_q=self.ROW_LEN, max_seqlen_k=self.ROW_LEN,
+            softmax_scale=scale, causal=True,
+        )[0]
+
+        ref = _segment_ref(q, k_t, v, seqstart, cu, scale)
+        got = np.asarray(out.astype(jnp.float32))[np.asarray(real)]
+        exp = ref[np.asarray(real)]
+        rel = np.linalg.norm(got - exp) / max(np.linalg.norm(exp), 1e-30)
+        assert rel < 2e-2, f"D192/V128 padded group-mode rel_l2={rel:.6f}"
+
+
 # ===========================================================================
 # FUSED GQA dK/dV REDUCTION
 # ===========================================================================
