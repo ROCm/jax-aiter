@@ -193,6 +193,7 @@ def _fwd(q, k, v, cu_q, cu_k, max_sq, max_sk, softmax_scale, causal):
         "IS_CAUSAL": True,
         "NUM_Q_HEADS": int(hq),
         "NUM_K_HEADS": int(hk),
+        "SWIZZLE": os.environ.get("AITER_TRITON_MHA_SWIZZLE", "default"),
         "PRELOAD_V": bool(cfg["PRELOAD_V"]),
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
@@ -213,14 +214,22 @@ def _fwd(q, k, v, cu_q, cu_k, max_sq, max_sk, softmax_scale, causal):
             and k_strides[1] % 8 == 0
             and v_strides[1] % 8 == 0
         ),
-        "descale_q_ptr": None,
-        "descale_k_ptr": None,
-        "descale_v_ptr": None,
-        "alibi_slopes_ptr": None,
-        "s_dmask_ptr": None,
-        "dropout_mask_ptr": None,
-        "sink_ptr": None,
     }
+    constexprs.update(
+        {
+            name: None
+            for name in (
+                "descale_q_ptr",
+                "descale_k_ptr",
+                "descale_v_ptr",
+                "alibi_slopes_ptr",
+                "s_dmask_ptr",
+                "dropout_mask_ptr",
+                "sink_ptr",
+            )
+            if name in _attn_fwd.arg_names
+        }
+    )
     if pe > 0 and (
         dv != constexprs["BLOCK_DMODEL_POW2"]
         or pe != constexprs["BLOCK_DMODEL_PE"]
