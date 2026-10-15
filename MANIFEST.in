@@ -6,6 +6,9 @@ recursive-include jax_aiter/_hsa *.co
 recursive-include jax_aiter/_hsa *.csv
 recursive-include jax_aiter/_hsa *.py
 
+# License-gated MXFP4 MoE kernel sources are distributed separately.
+prune jax_aiter/flydsl/kernels/mxfp4
+
 # Include README and license
 include README.md
 include LICENSE

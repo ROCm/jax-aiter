@@ -250,7 +250,12 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/ROCm/jax-aiter.git",
     license="MIT",
-    packages=find_packages(include=["jax_aiter", "jax_aiter.*"]),
+    # The MXFP4 MoE kernel sources are license-gated and must never ship in a
+    # wheel or sdist, even when a local copy is installed in the source tree.
+    packages=find_packages(
+        include=["jax_aiter", "jax_aiter.*"],
+        exclude=["jax_aiter.flydsl.kernels.mxfp4", "jax_aiter.flydsl.kernels.mxfp4.*"],
+    ),
     include_package_data=True,  # picks up MANIFEST.in entries for sdist.
     python_requires="==3.12.*",
     # Alpha2 supports one tested runtime. Pin all four distributions so a bare
@@ -282,8 +287,6 @@ setup(
             "_hsa/**/*.py",
             "THIRD_PARTY_NOTICES.md",
             "licenses/*.txt",
-            "flydsl/kernels/mxfp4/ORIGIN.md",
-            "flydsl/kernels/mxfp4/wholeloop/ORIGIN.md",
         ],
     },
     cmdclass={
