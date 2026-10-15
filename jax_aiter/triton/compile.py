@@ -111,6 +111,17 @@ def prepare_aiter_triton() -> None:
 
         import jaxlib.gpu_triton as gpu_triton
 
+        # AITER e4ceb9dd passes the device ordinal as "0". JAX 0.11.2
+        # tightened this pybind API to accept only an integer, so adapt the
+        # legacy call at our dependency boundary without patching AITER.
+        get_arch_details = gpu_triton.get_arch_details
+
+        def get_arch_details_compat(device):
+            if isinstance(device, str):
+                device = int(device)
+            return get_arch_details(device)
+
+        gpu_triton.get_arch_details = get_arch_details_compat
         sys.modules.setdefault("jax._src.lib.gpu_triton", gpu_triton)
         _AITER_READY = True
 
