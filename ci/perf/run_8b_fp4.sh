@@ -28,8 +28,8 @@ git -C "$MAXTEXT_DIR" fetch --depth=1 origin "$MAXTEXT_COMMIT"
 git -C "$MAXTEXT_DIR" checkout --detach "$MAXTEXT_COMMIT"
 
 # Install MaxText's decoupled dependencies without replacing the validated JAX
-# 0.11 ROCm stack. The pinned branch's requirements predate alpha2 and contain
-# a bare jax==0.10.0 line.
+# ROCm stack. The pinned branch's requirements predate it and contain a bare
+# jax==0.10.0 line.
 REQ_SOURCE="$MAXTEXT_DIR/$MAXTEXT_REQUIREMENTS"
 REQ_FILTERED="$(mktemp)"
 python3 - "$REQ_SOURCE" "$REQ_FILTERED" <<'PY'
@@ -40,7 +40,7 @@ source, dest = map(Path, sys.argv[1:])
 lines = [
     line for line in source.read_text().splitlines()
     if not line.strip().startswith(
-        ("jax==", "jaxlib==", "jax-rocm7-plugin", "jax-rocm7-pjrt")
+        ("jax==", "jaxlib==", "jax-rocm7-", "jax-rocm10-")
     )
 ]
 dest.write_text("\n".join(lines) + "\n")
@@ -50,7 +50,7 @@ rm -f "$REQ_FILTERED"
 python3 -m pip install --break-system-packages --no-deps -e "$MAXTEXT_DIR"
 
 # Restore and prove the exact runtime after dependency resolution.
-JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash "$JA_ROOT_DIR/ci/setup_jax.sh" --jax-only
+bash "$JA_ROOT_DIR/ci/setup_jax.sh" --jax-only
 (
   cd /tmp
   env -u JA_ROOT_DIR -u AITER_ASM_DIR python3 - <<'PY'
@@ -61,7 +61,7 @@ import jax
 import jax_aiter
 from jax_aiter.mha import flash_attn_func
 
-assert jax.__version__ == "0.11.0", jax.__version__
+assert jax.__version__ == "0.11.2", jax.__version__
 # The nightly builds its wheel from a moving AITER pin, so its version is not
 # knowable here. Pin it only when the caller states an expectation (the release
 # path does); otherwise just record what got installed.

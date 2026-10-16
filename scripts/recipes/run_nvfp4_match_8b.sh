@@ -268,8 +268,8 @@ import importlib.metadata as metadata
 for name in (
     "jax",
     "jaxlib",
-    "jax-rocm7-plugin",
-    "jax-rocm7-pjrt",
+    "jax-rocm10-plugin",
+    "jax-rocm10-pjrt",
     "jax-aiter",
     "maxtext",
     "flax",

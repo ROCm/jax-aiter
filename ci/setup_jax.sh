@@ -3,11 +3,11 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # Install build tooling + the ROCm JAX runtime INSIDE the CI container
-# (ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14). Shared by every workflow so
+# (ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0). Shared by every workflow so
 # the install commands live in one place.
 #
 # The stack is plain PyPI: jax/jaxlib from upstream, and the ROCm backend from
-# the jax-rocm7-{plugin,pjrt} wheels AMD publishes there. Those wheels are
+# the jax-rocm10-{plugin,pjrt} wheels AMD publishes there. Those wheels are
 # TheRock builds -- their RUNPATH resolves through the _rocm_sdk_* pip packages
 # that the container already provides -- so nothing here installs ROCm itself.
 #
@@ -33,8 +33,8 @@ done
 JA_ROOT_DIR="${JA_ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # Overridable so a bump is a workflow input, not a script edit.
-JAX_VERSION="${JA_JAX_VERSION:-0.11.0}"
-ROCM_PLUGIN_VERSION="${JA_ROCM_PLUGIN_VERSION:-0.11.0}"
+JAX_VERSION="${JA_JAX_VERSION:-0.11.2}"
+ROCM_PLUGIN_VERSION="${JA_ROCM_PLUGIN_VERSION:-0.11.2}"
 
 install_jax_stack() {
   # ${FORCE} is empty in default mode and "--force-reinstall --no-deps" in
@@ -44,13 +44,13 @@ install_jax_stack() {
     "jax==${JAX_VERSION}" "jaxlib==${JAX_VERSION}"
   # shellcheck disable=SC2086
   python3 -m pip install --break-system-packages ${FORCE:-} \
-    "jax-rocm7-plugin==${ROCM_PLUGIN_VERSION}" "jax-rocm7-pjrt==${ROCM_PLUGIN_VERSION}"
+    "jax-rocm10-plugin==${ROCM_PLUGIN_VERSION}" "jax-rocm10-pjrt==${ROCM_PLUGIN_VERSION}"
 }
 
 verify_jax_stack() {
   # Distribution names are not necessarily import names. In particular,
-  # jax-rocm7-pjrt installs the `jax_plugins.xla_rocm7` namespace; there is no
-  # Python module named `jax_rocm7_pjrt`.
+  # jax-rocm10-pjrt installs the `jax_plugins.xla_rocm10` namespace; there is no
+  # Python module named `jax_rocm10_pjrt`.
   python3 - "$JAX_VERSION" "$ROCM_PLUGIN_VERSION" <<'PY'
 import importlib
 from importlib import metadata
@@ -64,8 +64,8 @@ assert jax.__version__ == expected_jax, (jax.__version__, expected_jax)
 assert jaxlib.__version__ == expected_jax, (jaxlib.__version__, expected_jax)
 
 for distribution, module in (
-    ("jax-rocm7-plugin", "jax_rocm7_plugin"),
-    ("jax-rocm7-pjrt", "jax_plugins.xla_rocm7"),
+    ("jax-rocm10-plugin", "jax_rocm10_plugin"),
+    ("jax-rocm10-pjrt", "jax_plugins.xla_rocm10"),
 ):
     version = metadata.version(distribution)
     assert version == expected_rocm, (distribution, version, expected_rocm)

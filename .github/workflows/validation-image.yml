@@ -79,7 +79,7 @@ jobs:
         # release job exercises the GPU path when it validates a wheel.
         run: |
           docker run --rm "${{ steps.ref.outputs.image }}" \
-            python3 -c "import jax, jaxlib, jax_rocm7_plugin; print('validation image OK', jax.__version__)"
+            python3 -c "import jax, jaxlib, jax_rocm10_plugin; print('validation image OK', jax.__version__)"
 
       - name: Push
         if: steps.preflight.outputs.exists != 'true'
