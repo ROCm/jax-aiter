@@ -63,22 +63,42 @@ git -C third_party/aiter submodule update --init --recursive --depth=1
 # string replace: the file also carries CACHE_ID and asset names that embed
 # hashes, and clobbering those would break the JIT-release lookup.
 python3 - "$ASSETS" "$target" <<'PY'
+import importlib.util
 import re
 import sys
 
 path, target = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("jlm", "ci/jit_libs_manifest.py")
+jlm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(jlm)
 with open(path) as fh:
     text = fh.read()
-new, n = re.subn(
-    r'(?m)^(AITER_SHA\s*=\s*)"[0-9a-f]{40}"',
-    lambda m: f'{m.group(1)}"{target}"',
-    text,
+
+
+def value(name):
+    match = re.search(rf'(?m)^{name}\s*=\s*"([^"]+)"', text)
+    if match is None:
+        raise SystemExit(f"missing {name} in {path}")
+    return match.group(1)
+
+
+# AITER_SHA is a CACHE_ID input, so CACHE_ID moves with it.
+cache_id = jlm.compute_cache_id(
+    aiter_sha=target,
+    gpu_archs=value("GPU_ARCHS"),
+    patch_hash=jlm.compute_patch_hash("."),
+    rocm_version=value("ROCM_VERSION"),
 )
-if n != 1:
-    raise SystemExit(f"expected exactly 1 AITER_SHA assignment, found {n}")
+for name, pattern, replacement in (
+    ("AITER_SHA", r'(?m)^(AITER_SHA\s*=\s*)"[0-9a-f]{40}"', target),
+    ("CACHE_ID", r'(?m)^(CACHE_ID\s*=\s*)"[0-9a-f]{16}"', cache_id),
+):
+    text, n = re.subn(pattern, lambda m: f'{m.group(1)}"{replacement}"', text)
+    if n != 1:
+        raise SystemExit(f"expected exactly 1 {name} assignment, found {n}")
 with open(path, "w") as fh:
-    fh.write(new)
-print(f"[bump] {path}: AITER_SHA -> {target}")
+    fh.write(text)
+print(f"[bump] {path}: AITER_SHA -> {target}, CACHE_ID -> {cache_id}")
 PY
 
 git add third_party/aiter "$ASSETS"
