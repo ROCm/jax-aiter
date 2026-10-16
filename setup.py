@@ -262,10 +262,10 @@ setup(
     # `pip install jax-aiter` cannot silently resolve a future incompatible JAX
     # frontend/backend combination.
     install_requires=[
-        "jax==0.11.0",
-        "jaxlib==0.11.0",
-        "jax-rocm7-plugin==0.11.0.post1",
-        "jax-rocm7-pjrt==0.11.0.post1",
+        "jax==0.11.2",
+        "jaxlib==0.11.2",
+        "jax-rocm10-plugin==0.11.2",
+        "jax-rocm10-pjrt==0.11.2",
         "zstandard",
     ],
     extras_require={

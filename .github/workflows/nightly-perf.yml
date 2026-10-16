@@ -68,12 +68,12 @@ permissions:
   contents: write
 
 env:
-  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
-  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0
+  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-10.0:10.0
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
-  ROCM_VERSION: "7.14.0"
+  ROCM_VERSION: "10.0.0"
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
   JA_WHEEL_PLAT_NAME: manylinux_2_39_x86_64
   BUMP_BRANCH: nightly/aiter-auto-bump
@@ -192,7 +192,7 @@ jobs:
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       - name: Build umbrella library
         run: |
@@ -307,7 +307,7 @@ jobs:
             # provide the JAX runtime requirements first.
             python3 -m pip install --break-system-packages \
               numpy ml_dtypes scipy opt_einsum
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
+            bash ci/setup_jax.sh --jax-only
             python3 -m pip install --break-system-packages pandas auditwheel
             # build_wheel.sh runs pip wheel --no-build-isolation, so the PEP 517
             # backend must already be importable. wheel is capped because
@@ -423,7 +423,7 @@ jobs:
           # chown step below.
           docker exec -u 0 "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax_runtime.sh
+            bash ci/setup_jax_runtime.sh
             shopt -s nullglob
             wheels=(dist/jax_aiter-*+full-*.whl)
             test "${#wheels[@]}" -eq 1
@@ -575,7 +575,7 @@ jobs:
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       - name: Build against the candidate pin
         run: |

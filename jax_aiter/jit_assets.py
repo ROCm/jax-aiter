@@ -8,10 +8,10 @@ against ``ci/jit_libs_manifest.py`` so a stale wheel binding cannot publish.
 
 AITER_SHA = "a3158e4800b6080e3adb25eb58bc48686bc1859c"
 GPU_ARCHS = "gfx950"
-ROCM_VERSION = "7.14.0"
+ROCM_VERSION = "10.0.0"
 ASSET_CONTRACT_VERSION = 2
 JIT_RECIPE_HASH = (
-    "sha256:86d3c6cfd5d10bf11e525e24ddbdac900fbd7d4d6754b44c5e6d15e05f3b06e8"
+    "sha256:664ada9d12e18b61beaa923cf82888b31aff110683f4a9abd6dc4970a63a4c26"
 )
-CACHE_ID = "6c4ff74316215479"
+CACHE_ID = "9c9ec53233a801b4"
 RELEASE_TAG = f"jit-libs-{CACHE_ID}"

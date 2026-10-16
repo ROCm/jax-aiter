@@ -22,12 +22,12 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0
   CONTAINER_NAME: ja_ci_nightly
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
-  ROCM_VERSION: "7.14.0"
+  ROCM_VERSION: "10.0.0"
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
 
 jobs:
@@ -80,7 +80,7 @@ jobs:
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       # After setup_jax.sh: the base image ships no jax, so importing it any
       # earlier fails the job before a single test runs.

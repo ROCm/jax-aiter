@@ -9,7 +9,7 @@
 # scripts/validate_wheel.sh), proving a downstream user can install and run
 # the lite wheel with no source tree.
 #
-# TheRock 7.14 GA ships ROCm through the rocm-sdk pip packages (no /opt/rocm)
+# TheRock 10.0 ships ROCm through the rocm-sdk pip packages (no /opt/rocm)
 # but no importable JAX stack. Install the same four PyPI distributions CI uses.
 #
 # Base choice is about transfer cost, not content. The runtime-only
@@ -22,24 +22,24 @@
 # layer is unused here; nothing in the smoke tests compiles, and the clean-room
 # guarantees that matter are unchanged: no AITER source, no MaxText, no build of
 # this repo, and the wheel is pip-installed as a non-root user.
-FROM ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+FROM ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0
 
-ARG JAX_VERSION=0.11.0
+ARG JAX_VERSION=0.11.2
 # The ROCm plugin/pjrt pair is versioned independently of jax/jaxlib and must
 # match setup.py install_requires exactly. The wheel is installed --no-deps in
 # validate_wheel.sh, so a mismatch here would silently validate a runtime no
 # user can actually get from `pip install jax_aiter`.
-ARG ROCM_PLUGIN_VERSION=0.11.0.post1
+ARG ROCM_PLUGIN_VERSION=0.11.2
 
 # Install upstream JAX/JAXlib plus the ROCm PJRT/plugin backend from PyPI.
 # The build-time import check fails fast if the stack is broken.
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
       "jax==${JAX_VERSION}" \
       "jaxlib==${JAX_VERSION}" \
-      "jax-rocm7-plugin==${ROCM_PLUGIN_VERSION}" \
-      "jax-rocm7-pjrt==${ROCM_PLUGIN_VERSION}" \
+      "jax-rocm10-plugin==${ROCM_PLUGIN_VERSION}" \
+      "jax-rocm10-pjrt==${ROCM_PLUGIN_VERSION}" \
       "zstandard" \
- && python3 -c "import jax, jaxlib, jax_rocm7_plugin, jax_plugins.xla_rocm7; print('[validation base] jax', jax.__version__, 'jaxlib', jaxlib.__version__)"
+ && python3 -c "import jax, jaxlib, jax_rocm10_plugin, jax_plugins.xla_rocm10; print('[validation base] jax', jax.__version__, 'jaxlib', jaxlib.__version__)"
 
 WORKDIR /test
 

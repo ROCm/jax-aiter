@@ -6,7 +6,7 @@ name: JAX-AITER Release Build + Validate
 # The wheels are tagged manylinux_2_39, not 2_28. Broad manylinux compatibility
 # is not a goal for alpha2: the bundled JIT libraries come from jit-libs.yml,
 # which builds them on Ubuntu 24.04, so they need GLIBCXX_3.4.31 regardless of
-# which image packages the wheel. Alpha2 targets ROCm 7.14 on Ubuntu 24.04
+# which image packages the wheel. The wheels target ROCm 10.0 on Ubuntu 24.04
 # anyway, and an honest tag makes pip refuse an unusable install up front
 # instead of failing at import.
 #
@@ -35,11 +35,11 @@ permissions:
   packages: read
 
 env:
-  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14
+  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-10.0:10.0
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
-  ROCM_VERSION: "7.14.0"
+  ROCM_VERSION: "10.0.0"
   JA_WHEEL_ARCH: gfx950
   JA_WHEEL_PLAT_NAME: manylinux_2_39_x86_64
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
@@ -112,7 +112,7 @@ jobs:
             # provide the JAX runtime requirements first.
             python3 -m pip install --break-system-packages \
               numpy ml_dtypes scipy opt_einsum
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
+            bash ci/setup_jax.sh --jax-only
             python3 -m pip install --break-system-packages pandas auditwheel
             # build_wheel.sh runs pip wheel --no-build-isolation, so the PEP 517
             # backend must already be importable, and this minimal image ships
