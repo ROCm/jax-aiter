@@ -5,8 +5,6 @@ From the JAX-AITER repository root:
 ```bash
 DOCKER_BUILDKIT=1 docker build --progress=plain \
   -f docker/mxfp4/Dockerfile \
-  --build-context \
-    mxfp4-kernels=./jax_aiter/flydsl/kernels/mxfp4 \
   --build-arg BUILD_JOBS=32 \
   -t jax-aiter-mxfp4:local .
 ```
@@ -20,14 +18,10 @@ deliberately absent; the MXFP4 training recipe uses `attention=jax_aiter_flash`.
 A GPU is not needed during the image build. The MHA compile can take hours and
 use substantial host memory and disk.
 
-The named context must point to an authorized copy of the license-gated MXFP4
-kernel directory, which is intentionally absent from Git and excluded from the
-normal build context. The Dockerfile copies only the authorized file list and
-checks it against `mxfp4-kernels.sha256`; missing, extra-version, or modified
-sources fail the build. A normal clone therefore cannot build this project's
-MXFP4 MoE image without that separately supplied directory. The resulting
-image contains those sources; keep it internal unless redistribution rights
-are confirmed.
+The MXFP4 MoE casts and grouped GEMMs are the Primus-Turbo FlyDSL kernels
+vendored in JAX-AITER; `jax_aiter/THIRD_PARTY_NOTICES.md` lists their sources
+and licenses. A normal clone builds the image. The build fails if a
+license-gated `jax_aiter/flydsl/kernels/mxfp4/` tree reaches it.
 
 Run on an MI355X host:
 
