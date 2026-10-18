@@ -288,6 +288,7 @@ setup(
             "THIRD_PARTY_NOTICES.md",
             "licenses/*.txt",
         ],
+        "jax_aiter.flydsl.kernels.primus_turbo": ["LICENSE*", "ORIGIN.md"],
     },
     cmdclass={
         "build_py": build_py,
