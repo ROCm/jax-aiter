@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Whole-loop MXFP4 grouped kernels against the ragged FlyDSL kernels."""
+"""Whole-loop MXFP4 grouped kernels against dequantized references."""
 
 from __future__ import annotations
 
@@ -10,21 +10,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from mxfp4_kernel_gate import require_mxfp4_kernels
-
-require_mxfp4_kernels()
-pytestmark = pytest.mark.mxfp4_kernels
+pytest.importorskip("flydsl.compiler")
 
 from jax_aiter.ops.moe_mxfp4 import (
-    grouped_mxfp4_dw,
     grouped_mxfp4_dw_wholeloop,
-    grouped_mxfp4_fwd_da,
     grouped_mxfp4_fwd_da_wholeloop,
     quantize_mxfp4_dim0,
     quantize_mxfp4_dim1,
 )
 
-from test_moe_mxfp4_ja import _dequantize, _relative_error
+from test_moe_mxfp4_ja import _FP4_VALUES, _dequantize, _relative_error
 
 _MOE_EXPERTS = 32
 _MOE_ROWS = 16384
@@ -41,6 +36,48 @@ def _bounds(sizes):
 
 def _bits(value):
     return np.asarray(value).view(np.uint16)
+
+
+def _dequantize_on_device(packed, scales):
+    """:func:`_dequantize` on the GPU, for operands too large for numpy."""
+    table = jnp.asarray(np.concatenate((_FP4_VALUES, -_FP4_VALUES)))
+    codes = jnp.stack((packed & 0xF, packed >> 4), axis=-1)
+    scale = jax.lax.bitcast_convert_type(
+        scales.astype(jnp.uint32) << 23, jnp.float32
+    )
+    values = table[codes.reshape(*packed.shape[:-1], -1)]
+    return values * jnp.repeat(scale, 32, axis=-1)
+
+
+def _group_ranges(sizes):
+    ends = np.cumsum(sizes)
+    return [(int(end - size), int(end)) for size, end in zip(sizes, ends)]
+
+
+def _matmul_nt(lhs, rhs):
+    return np.asarray(
+        jnp.matmul(lhs, rhs.T, precision=jax.lax.Precision.HIGHEST)
+    )
+
+
+def _assert_forward_matches_reference(actual, operands, sizes):
+    lhs = _dequantize_on_device(operands[0], operands[2])
+    rhs = _dequantize_on_device(operands[1], operands[3])
+    for expert, (start, end) in enumerate(_group_ranges(sizes)):
+        if end > start:
+            expected = _matmul_nt(lhs[start:end], rhs[expert])
+            assert _relative_error(actual[start:end], expected) < 0.01, expert
+
+
+def _assert_dw_matches_reference(actual, operands, sizes):
+    grad = _dequantize_on_device(operands[0], operands[1])
+    lhs = _dequantize_on_device(operands[2], operands[3])
+    for expert, (start, end) in enumerate(_group_ranges(sizes)):
+        if end > start:
+            expected = _matmul_nt(grad[:, start:end], lhs[:, start:end])
+            assert _relative_error(actual[expert], expected) < 0.01, expert
+        else:
+            np.testing.assert_array_equal(np.asarray(actual[expert]), 0)
 
 
 def _forward_operands(seed, rows, contraction, output, experts, live_rows):
@@ -83,7 +120,7 @@ def _dw_operands(seed, rows, out_rows, out_cols, live_rows):
     ],
     ids=["small", "moe_up", "moe_down"],
 )
-def test_wholeloop_forward_matches_ragged_kernel_bitwise(
+def test_wholeloop_forward_matches_dequantized_reference(
     rows, contraction, output, sizes
 ):
     bounds = _bounds(sizes)
@@ -92,18 +129,15 @@ def test_wholeloop_forward_matches_ragged_kernel_bitwise(
         7, rows, contraction, output, len(sizes), live_rows
     )
 
-    expected = jax.jit(grouped_mxfp4_fwd_da)(*operands, bounds[1:])
     actual = jax.jit(grouped_mxfp4_fwd_da_wholeloop)(*operands, bounds)
     unmasked = jax.jit(
         functools.partial(grouped_mxfp4_fwd_da_wholeloop, zero_tail=False)
     )(*operands, bounds)
 
-    np.testing.assert_array_equal(
-        _bits(actual[:live_rows]), _bits(expected[:live_rows])
-    )
+    _assert_forward_matches_reference(actual, operands, sizes)
     np.testing.assert_array_equal(np.asarray(actual[live_rows:]), 0)
     np.testing.assert_array_equal(
-        _bits(unmasked[:live_rows]), _bits(expected[:live_rows])
+        _bits(unmasked[:live_rows]), _bits(actual[:live_rows])
     )
 
 
@@ -168,45 +202,43 @@ def test_wholeloop_forward_row_chunking_matches_single_launch_bitwise():
     ],
     ids=["small", "moe_up", "moe_down"],
 )
-def test_wholeloop_dw_matches_ragged_kernel_bitwise(
+def test_wholeloop_dw_matches_dequantized_reference(
     rows, out_rows, out_cols, sizes
 ):
     bounds = _bounds(sizes)
     operands = _dw_operands(5, rows, out_rows, out_cols, int(bounds[-1]))
 
-    expected = jax.jit(grouped_mxfp4_dw)(*operands, bounds[1:])
     actual = jax.jit(grouped_mxfp4_dw_wholeloop)(*operands, bounds)
 
     assert actual.shape == (len(sizes), out_rows, out_cols)
     assert actual.dtype == jnp.bfloat16
-    np.testing.assert_array_equal(_bits(actual), _bits(expected))
-    np.testing.assert_array_equal(np.asarray(actual[sizes == 0]), 0)
+    _assert_dw_matches_reference(actual, operands, sizes)
 
 
 def test_wholeloop_dw_schedules_agree_bitwise():
     rows, out_rows, out_cols = 16640, 512, 1024
-    bounds = _bounds([8192, 4096])
+    sizes = np.asarray([8192, 4096])
+    bounds = _bounds(sizes)
     operands = _dw_operands(9, rows, out_rows, out_cols, int(bounds[-1]))
 
-    from jax_aiter.flydsl.kernels.mxfp4.wholeloop import (
-        grouped_gemm_mxfp4_kernel as wholeloop,
+    from jax_aiter.flydsl.kernels.primus_turbo.grouped_gemm import (
+        grouped_gemm_mxfp4_kernel,
     )
 
-    long_schedule = wholeloop._select_gmxfp4_wgrad_cfg(
+    long_schedule = grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(
         rows, 2, out_rows, out_cols
     )
-    short_schedule = wholeloop._select_gmxfp4_wgrad_cfg(
+    short_schedule = grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(
         8192, 2, out_rows, out_cols
     )
     assert long_schedule != short_schedule
 
-    expected = jax.jit(grouped_mxfp4_dw)(*operands, bounds[1:])
     default = jax.jit(grouped_mxfp4_dw_wholeloop)(*operands, bounds)
     short = jax.jit(
         functools.partial(grouped_mxfp4_dw_wholeloop, schedule_rows=8192)
     )(*operands, bounds)
-    np.testing.assert_array_equal(_bits(default), _bits(expected))
-    np.testing.assert_array_equal(_bits(short), _bits(expected))
+    np.testing.assert_array_equal(_bits(short), _bits(default))
+    _assert_dw_matches_reference(default, operands, sizes)
 
 
 def test_wholeloop_rejects_unsupported_shapes():

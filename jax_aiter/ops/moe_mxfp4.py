@@ -4,17 +4,14 @@
 These functions intentionally define no differentiation rule. MaxText's
 grouped-GEMM custom VJP selects the forward/dA and dW bodies explicitly.
 
-The FlyDSL kernel sources these operations launch are license-gated and
-distributed separately; they are not part of this repository or its wheels.
-Without them, the operations raise ``Mxfp4KernelsUnavailableError`` and
-``mxfp4_moe_kernels_available()`` returns ``False``. The rest of JAX-AITER does
-not depend on them.
+The casts and grouped GEMMs launch the Primus-Turbo FlyDSL kernels vendored
+under ``jax_aiter/flydsl/kernels/primus_turbo/`` and JAX-AITER's own casts
+built on them (``jax_aiter/flydsl/kernels/primus_turbo_mxfp4_quant.py``).
 """
 
 from __future__ import annotations
 
 import functools
-import importlib.util
 
 import jax
 import jax.numpy as jnp
@@ -22,31 +19,9 @@ import jax.numpy as jnp
 from ..flydsl import flydsl_call
 
 _SCALE_BLOCK = 32
-_GROUP_ALIGNMENT = 128
+_COL_TILE = 128  # rows and columns of the column-wise cast's tiles
 _WHOLELOOP_ALIGNMENT = 256
 _INT32_MAX = (1 << 31) - 1
-_KERNEL_PACKAGE = "jax_aiter.flydsl.kernels.mxfp4"
-
-
-class Mxfp4KernelsUnavailableError(ImportError):
-    """The separately distributed MXFP4 MoE kernel sources are not installed."""
-
-
-def mxfp4_moe_kernels_available() -> bool:
-    """Whether the license-gated MXFP4 MoE kernel sources are installed."""
-    return importlib.util.find_spec(_KERNEL_PACKAGE) is not None
-
-
-def _require_kernels() -> None:
-    if not mxfp4_moe_kernels_available():
-        raise Mxfp4KernelsUnavailableError(
-            "JAX-AITER's grouped MXFP4 MoE operations need FlyDSL kernel "
-            "sources that are license-gated and distributed separately; they "
-            "are not part of this repository or its wheels. Install an "
-            "authorized copy at jax_aiter/flydsl/kernels/mxfp4/ "
-            "(docker/mxfp4/mxfp4-kernels.sha256 lists the expected files). "
-            "The rest of JAX-AITER does not need them."
-        )
 
 
 def _row_chunks(
@@ -99,12 +74,15 @@ def _validate_matrix(name: str, value, *, dtypes) -> jax.Array:
     return value
 
 
-def _flydsl_dtype_name(dtype) -> str:
-    if dtype == jnp.bfloat16:
-        return "bfloat16"
-    if dtype == jnp.float32:
-        return "float32"
-    raise TypeError(f"Unsupported MXFP4 quantization input dtype: {dtype}")
+def _validate_cast_input(value) -> jax.Array:
+    value = jnp.asarray(value)
+    if value.dtype != jnp.bfloat16:
+        raise TypeError(
+            f"MXFP4 casts take bfloat16 input, got {value.dtype}; convert with "
+            ".astype(jnp.bfloat16) first. The scales then follow the rounded "
+            "values, so they can differ from scales of the original values."
+        )
+    return _validate_matrix("value", value, dtypes=(jnp.bfloat16,))
 
 
 def _require_int32_indexing(name: str, element_count: int) -> None:
@@ -123,55 +101,72 @@ def _row_limit_operands(row_limit, start: int, end: int) -> tuple[jax.Array, ...
     return (limit.reshape(1),)
 
 
-def _quantize_mxfp4_dim0_single(value, row_limit_operands=()):
-    """One int32-addressable dim0 quantization launch."""
-    rows, cols = value.shape
-    # The kernel bases its input per wave; only the packed output is int32-indexed.
-    _require_int32_indexing("dim0 packed output", rows * cols // 2)
+def _chunk_row_limit(row_limit, start: int):
+    """``row_limit`` relative to a row chunk starting at ``start``."""
+    if row_limit is None or start == 0:
+        return row_limit
+    return jnp.asarray(row_limit, jnp.int32) - jnp.int32(start)
 
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.quant_dim0 import (
-        GROUPS_PER_WG,
-        _compile_quant_dim0,
-    )
 
-    launcher = _compile_quant_dim0(
-        cols, _flydsl_dtype_name(value.dtype), bool(row_limit_operands)
-    )
-    num_groups = rows * (cols // _SCALE_BLOCK)
-    grid_blocks = (num_groups + GROUPS_PER_WG - 1) // GROUPS_PER_WG
-    outputs = flydsl_call(
-        value.reshape(-1),
-        *row_limit_operands,
-        kernel=launcher,
-        out_shape=(
-            jax.ShapeDtypeStruct((rows * cols // 2,), jnp.uint8),
-            jax.ShapeDtypeStruct(
-                (rows * cols // _SCALE_BLOCK,), jnp.uint8
-            ),
-        ),
-        scalars={"n_groups": num_groups, "grid_blocks": grid_blocks},
-        output_positions=(1, 2),
-    )
-    packed, scales = outputs
+def _concat_chunks(outputs, axis: int):
+    if len(outputs) == 1:
+        return outputs[0]
     return (
-        packed.reshape(rows, cols // 2),
-        scales.reshape(rows, cols // _SCALE_BLOCK),
+        jnp.concatenate([output[0] for output in outputs], axis=axis),
+        jnp.concatenate([output[1] for output in outputs], axis=axis),
     )
 
 
-def _quantize_mxfp4_dim0_maybe_empty(value):
-    """Skip a tail launch when masked expert padding made it all zero."""
-    rows, cols = value.shape
-    return jax.lax.cond(
-        jnp.any(value != jnp.zeros((), value.dtype)),
-        _quantize_mxfp4_dim0_single,
-        lambda _: (
-            jnp.zeros((rows, cols // 2), jnp.uint8),
-            jnp.zeros((rows, cols // _SCALE_BLOCK), jnp.uint8),
-        ),
-        value,
+def _empty_mxfp4(shape: tuple[int, int]):
+    """All-zero packed values and scales of a ``shape`` cast output."""
+    rows, cols = shape
+    return (
+        jnp.zeros((rows, cols // 2), jnp.uint8),
+        jnp.zeros((rows, cols // _SCALE_BLOCK), jnp.uint8),
     )
+
+
+def _quantize_chunks(quantize, value, chunks, row_limit, *, rowwise: bool):
+    """``quantize`` each row chunk of ``value`` and join the outputs.
+
+    Without ``row_limit``, a tail chunk that masked expert padding made all
+    zero skips its launch.
+    """
+
+    def zeros(chunk):
+        rows, cols = chunk.shape
+        return _empty_mxfp4((rows, cols) if rowwise else (cols, rows))
+
+    outputs = []
+    for start, end in chunks:
+        chunk = value[start:end]
+        if row_limit is not None or start == 0:
+            outputs.append(
+                quantize(chunk, row_limit=_chunk_row_limit(row_limit, start))
+            )
+        else:
+            outputs.append(
+                jax.lax.cond(
+                    jnp.any(chunk != jnp.zeros((), chunk.dtype)),
+                    quantize,
+                    zeros,
+                    chunk,
+                )
+            )
+    return _concat_chunks(outputs, axis=0 if rowwise else 1)
+
+
+def _take_rows(value, row_index):
+    """``value[row_index]``, with a zero row for each negative index."""
+    if value.shape[0] == 0:
+        return jnp.zeros((row_index.shape[0], value.shape[1]), value.dtype)
+    rows = jnp.take(value, jnp.maximum(row_index, 0), axis=0)
+    return jnp.where((row_index >= 0)[:, None], rows, jnp.zeros((), value.dtype))
+
+
+def _gather_source_fits(value) -> bool:
+    """Whether the gather kernels can address ``value`` and a row of 32-bit offsets past its end."""
+    return value.size * value.dtype.itemsize + 4 * value.shape[1] <= 1 << 32
 
 
 def quantize_mxfp4_dim0(
@@ -184,38 +179,21 @@ def quantize_mxfp4_dim0(
     ``row_limit`` (device int32 scalar) leaves output rows at or past it
     unwritten, for buffers whose tail rows no reader uses.
     """
-    value = _validate_matrix(
-        "value", value, dtypes=(jnp.bfloat16, jnp.float32)
-    )
+    from .moe_mxfp4_ptquant import quantize_mxfp4_rows
+
+    value = _validate_cast_input(value)
     rows, cols = value.shape
     if cols % _SCALE_BLOCK:
         raise ValueError(f"dim0 quantization requires K % 32 == 0, got {cols}")
+    if value.size == 0:
+        return _empty_mxfp4((rows, cols))
+    # The kernel bases its input per wave; only the packed output is int32-indexed.
+    # A smaller _max_index_elements is the test hook that forces chunked launches.
     chunks = _row_chunks(
-        rows,
-        cols // 2,
-        alignment=1,
-        max_index_elements=_max_index_elements,
+        rows, cols // 2, alignment=1, max_index_elements=_max_index_elements
     )
-    outputs = []
-    for chunk_index, (start, end) in enumerate(chunks):
-        chunk = value[start:end]
-        if row_limit is not None:
-            outputs.append(
-                _quantize_mxfp4_dim0_single(
-                    chunk, _row_limit_operands(row_limit, start, end)
-                )
-            )
-        else:
-            outputs.append(
-                _quantize_mxfp4_dim0_single(chunk)
-                if chunk_index == 0
-                else _quantize_mxfp4_dim0_maybe_empty(chunk)
-            )
-    if len(outputs) == 1:
-        return outputs[0]
-    return (
-        jnp.concatenate([output[0] for output in outputs], axis=0),
-        jnp.concatenate([output[1] for output in outputs], axis=0),
+    return _quantize_chunks(
+        quantize_mxfp4_rows, value, chunks, row_limit, rowwise=True
     )
 
 
@@ -254,39 +232,6 @@ def requantize_mxfp4_dim0_transposed(packed, scales):
     )
 
 
-def _quantize_mxfp4_dim0_gather_single(value, row_index, limit_operand):
-    """One int32-addressable gathered dim0 quantization launch."""
-    cols = value.shape[1]
-    rows = row_index.shape[0]
-    _require_int32_indexing("gather packed output", rows * cols // 2)
-
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.quant_dim0 import (
-        GROUPS_PER_WG,
-        _compile_quant_dim0_gather,
-    )
-
-    launcher = _compile_quant_dim0_gather(cols, _flydsl_dtype_name(value.dtype))
-    num_groups = rows * (cols // _SCALE_BLOCK)
-    grid_blocks = (num_groups + GROUPS_PER_WG - 1) // GROUPS_PER_WG
-    packed, scales = flydsl_call(
-        value.reshape(-1),
-        row_index,
-        limit_operand,
-        kernel=launcher,
-        out_shape=(
-            jax.ShapeDtypeStruct((rows * cols // 2,), jnp.uint8),
-            jax.ShapeDtypeStruct((rows * cols // _SCALE_BLOCK,), jnp.uint8),
-        ),
-        scalars={"n_groups": num_groups, "grid_blocks": grid_blocks},
-        output_positions=(2, 3),
-    )
-    return (
-        packed.reshape(rows, cols // 2),
-        scales.reshape(rows, cols // _SCALE_BLOCK),
-    )
-
-
 def quantize_mxfp4_dim0_gather(
     value, row_index, *, row_limit=None, _max_index_elements: int = _INT32_MAX
 ):
@@ -294,87 +239,34 @@ def quantize_mxfp4_dim0_gather(
 
     Output row ``r`` is the dim0 quantization of ``value[row_index[r]]``; a
     negative index gives an all-zero row. ``row_limit`` (device int32 scalar)
-    leaves output rows at or past it unwritten.
+    leaves output rows at or past it unwritten. A source too large for the
+    gather kernel's buffer addressing is gathered first, with the same bytes.
     """
+    from .moe_mxfp4_ptquant import quantize_mxfp4_rows_gather
+
     value, row_index = _validate_gather(value, row_index)
-    cols = value.shape[1]
-    rows = row_index.shape[0]
-    if value.size * value.dtype.itemsize >= 1 << 32:
-        raise ValueError(
-            f"dim0 gather source {value.shape} {value.dtype} exceeds 4 GiB "
-            "buffer addressing"
+    if not _gather_source_fits(value):
+        return quantize_mxfp4_dim0(
+            _take_rows(value, row_index),
+            row_limit=row_limit,
+            _max_index_elements=_max_index_elements,
         )
-    limit = rows if row_limit is None else row_limit
+    rows, cols = row_index.shape[0], value.shape[1]
+    if rows == 0 or cols == 0:
+        return _empty_mxfp4((rows, cols))
     chunks = _row_chunks(
         rows, cols // 2, alignment=1, max_index_elements=_max_index_elements
     )
-    outputs = [
-        _quantize_mxfp4_dim0_gather_single(
-            value, row_index[start:end], _row_limit_operands(limit, start, end)[0]
-        )
-        for start, end in chunks
-    ]
-    if len(outputs) == 1:
-        return outputs[0]
-    return (
-        jnp.concatenate([output[0] for output in outputs], axis=0),
-        jnp.concatenate([output[1] for output in outputs], axis=0),
-    )
-
-
-def _quantize_mxfp4_dim1_single(value, row_limit_operands=()):
-    """One int32-addressable dim1 quantization launch."""
-    rows, cols = value.shape
-    # The kernel bases its input per tile; only the packed output is int32-indexed.
-    _require_int32_indexing("dim1 packed output", rows * cols // 2)
-
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.quant_dim1 import (
-        _K_TILE,
-        _compile_quant_dim1,
-        _pick_layout,
-    )
-
-    dtype_name = _flydsl_dtype_name(value.dtype)
-    stack = _pick_layout(rows, cols, value.dtype.itemsize)
-    launcher, tile_rows = _compile_quant_dim1(
-        cols, dtype_name, stack, bool(row_limit_operands)
-    )
-    outputs = flydsl_call(
-        value.reshape(-1),
-        *row_limit_operands,
-        kernel=launcher,
-        out_shape=(
-            jax.ShapeDtypeStruct((cols * rows // 2,), jnp.uint8),
-            jax.ShapeDtypeStruct(
-                (cols * rows // _SCALE_BLOCK,), jnp.uint8
-            ),
-        ),
-        scalars={
-            "m_rows": rows,
-            "grid_m": rows // tile_rows,
-            "grid_k": (cols + _K_TILE - 1) // _K_TILE,
-        },
-        output_positions=(1, 2),
-    )
-    packed, scales = outputs
-    return (
-        packed.reshape(cols, rows // 2),
-        scales.reshape(cols, rows // _SCALE_BLOCK),
-    )
-
-
-def _quantize_mxfp4_dim1_maybe_empty(value):
-    """Skip a transposing tail launch when every source row is zero."""
-    rows, cols = value.shape
-    return jax.lax.cond(
-        jnp.any(value != jnp.zeros((), value.dtype)),
-        _quantize_mxfp4_dim1_single,
-        lambda _: (
-            jnp.zeros((cols, rows // 2), jnp.uint8),
-            jnp.zeros((cols, rows // _SCALE_BLOCK), jnp.uint8),
-        ),
-        value,
+    return _concat_chunks(
+        [
+            quantize_mxfp4_rows_gather(
+                value,
+                row_index[start:end],
+                row_limit=_chunk_row_limit(row_limit, start),
+            )
+            for start, end in chunks
+        ],
+        axis=0,
     )
 
 
@@ -385,51 +277,43 @@ def quantize_mxfp4_dim1(
 
     ``[M, K] -> ([K, M/2] packed FP4, [K, M/32] E8M0)``.
 
-    ``row_limit`` (device int32 scalar) skips source rows from the 32-128 row
-    tile holding it onward; their output columns are left unwritten.
+    ``row_limit`` (device int32 scalar) skips the kernel's 128- or 256-row
+    tiles that start at or past it; their output columns are left unwritten.
     """
-    value = _validate_matrix(
-        "value", value, dtypes=(jnp.bfloat16, jnp.float32)
-    )
+    from .moe_mxfp4_ptquant import quantize_mxfp4_cols
+
+    value = _validate_cast_input(value)
     rows, cols = value.shape
     if rows % _SCALE_BLOCK or cols % _SCALE_BLOCK:
         raise ValueError(
             "dim1 quantization requires M and K divisible by 32, got "
             f"{value.shape}"
         )
+    if value.size == 0:
+        return _empty_mxfp4((cols, rows))
+    # The kernel takes 128 x 128 tiles. Zero rows padded to fill them form 32-row
+    # blocks of their own, and zero columns only add output rows; both are cut off.
+    pad_rows, pad_cols = -rows % _COL_TILE, -cols % _COL_TILE
+    if pad_rows or pad_cols:
+        value = jnp.pad(value, ((0, pad_rows), (0, pad_cols)))
+    # The kernel bases its input per tile; only the packed output is int32-indexed.
+    # A smaller _max_index_elements is the test hook that forces chunked launches.
     chunks = _row_chunks(
-        rows,
-        cols // 2,
-        alignment=_SCALE_BLOCK,
+        value.shape[0],
+        value.shape[1] // 2,
+        alignment=_COL_TILE,
         max_index_elements=_max_index_elements,
     )
-    outputs = []
-    for chunk_index, (start, end) in enumerate(chunks):
-        chunk = value[start:end]
-        if row_limit is not None:
-            outputs.append(
-                _quantize_mxfp4_dim1_single(
-                    chunk, _row_limit_operands(row_limit, start, end)
-                )
-            )
-        else:
-            outputs.append(
-                _quantize_mxfp4_dim1_single(chunk)
-                if chunk_index == 0
-                else _quantize_mxfp4_dim1_maybe_empty(chunk)
-            )
-    if len(outputs) == 1:
-        return outputs[0]
-    return (
-        jnp.concatenate([output[0] for output in outputs], axis=1),
-        jnp.concatenate([output[1] for output in outputs], axis=1),
+    packed, scales = _quantize_chunks(
+        quantize_mxfp4_cols, value, chunks, row_limit, rowwise=False
     )
+    if pad_rows or pad_cols:
+        packed, scales = packed[:cols, : rows // 2], scales[:cols, : rows // _SCALE_BLOCK]
+    return packed, scales
 
 
 def _validate_gather(value, row_index):
-    value = _validate_matrix(
-        "value", value, dtypes=(jnp.bfloat16, jnp.float32)
-    )
+    value = _validate_cast_input(value)
     row_index = jnp.asarray(row_index)
     if row_index.ndim != 1 or row_index.dtype != jnp.int32:
         raise TypeError(
@@ -437,47 +321,7 @@ def _validate_gather(value, row_index):
         )
     if value.shape[1] % _SCALE_BLOCK:
         raise ValueError(f"MXFP4 quantization requires K % 32 == 0, got {value.shape[1]}")
-    _require_int32_indexing("gather source", value.size)
     return value, row_index
-
-
-def _quantize_mxfp4_dim1_gather_single(value, row_index, limit_operand):
-    """One int32-addressable gathered dim1 quantization launch."""
-    cols = value.shape[1]
-    rows = row_index.shape[0]
-    _require_int32_indexing("gather packed output", rows * cols // 2)
-
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.quant_dim1 import (
-        _K_TILE,
-        _compile_quant_dim1,
-        _pick_layout,
-    )
-
-    stack = _pick_layout(rows, cols, value.dtype.itemsize)
-    launcher, tile_rows = _compile_quant_dim1(
-        cols, _flydsl_dtype_name(value.dtype), stack, gather=True
-    )
-    packed, scales = flydsl_call(
-        value.reshape(-1),
-        row_index,
-        limit_operand,
-        kernel=launcher,
-        out_shape=(
-            jax.ShapeDtypeStruct((cols * rows // 2,), jnp.uint8),
-            jax.ShapeDtypeStruct((cols * rows // _SCALE_BLOCK,), jnp.uint8),
-        ),
-        scalars={
-            "m_rows": rows,
-            "grid_m": rows // tile_rows,
-            "grid_k": (cols + _K_TILE - 1) // _K_TILE,
-        },
-        output_positions=(2, 3),
-    )
-    return (
-        packed.reshape(cols, rows // 2),
-        scales.reshape(cols, rows // _SCALE_BLOCK),
-    )
 
 
 def quantize_mxfp4_dim1_gather(
@@ -487,291 +331,48 @@ def quantize_mxfp4_dim1_gather(
 
     Equals ``quantize_mxfp4_dim1`` of the ``[M, K]`` matrix whose row ``r`` is
     ``value[row_index[r]]``, or zero for a negative index. ``row_limit`` is as
-    in :func:`quantize_mxfp4_dim1`.
+    in :func:`quantize_mxfp4_dim1`. ``K % 128 != 0``, or a source too large
+    for the gather kernel's buffer addressing, is gathered first, with the
+    same bytes.
     """
+    from .moe_mxfp4_ptquant import quantize_mxfp4_cols_gather
+
     value, row_index = _validate_gather(value, row_index)
-    cols = value.shape[1]
-    rows = row_index.shape[0]
+    rows, cols = row_index.shape[0], value.shape[1]
     if rows % _SCALE_BLOCK:
         raise ValueError(f"dim1 quantization requires M % 32 == 0, got {rows}")
-    limit = rows if row_limit is None else row_limit
+    if cols % _COL_TILE or not _gather_source_fits(value):
+        return quantize_mxfp4_dim1(
+            _take_rows(value, row_index),
+            row_limit=row_limit,
+            _max_index_elements=_max_index_elements,
+        )
+    if rows == 0 or cols == 0:
+        return _empty_mxfp4((cols, rows))
+    # Index -1 reads a zero row, so it fills the kernel's 128-row tiles.
+    pad_rows = -rows % _COL_TILE
+    if pad_rows:
+        row_index = jnp.pad(row_index, (0, pad_rows), constant_values=-1)
     chunks = _row_chunks(
-        rows, cols // 2, alignment=_SCALE_BLOCK, max_index_elements=_max_index_elements
-    )
-    outputs = [
-        _quantize_mxfp4_dim1_gather_single(
-            value, row_index[start:end], _row_limit_operands(limit, start, end)[0]
-        )
-        for start, end in chunks
-    ]
-    if len(outputs) == 1:
-        return outputs[0]
-    return (
-        jnp.concatenate([output[0] for output in outputs], axis=1),
-        jnp.concatenate([output[1] for output in outputs], axis=1),
-    )
-
-
-def _grouped_mxfp4_fwd_da_single(
-    lhs_packed,
-    rhs_packed,
-    lhs_scales,
-    rhs_scales,
-    group_end_offsets,
-):
-    """Ragged grouped MXFP4 GEMM used by both forward and dA.
-
-    Args:
-      lhs_packed: ``[M, K/2]`` uint8.
-      rhs_packed: ``[E, N, K/2]`` uint8.
-      lhs_scales: ``[M, K/32]`` uint8.
-      rhs_scales: ``[E, N, K/32]`` uint8.
-      group_end_offsets: device ``int32[E]`` cumulative padded row ends.
-    """
-    lhs_packed = _validate_matrix(
-        "lhs_packed", lhs_packed, dtypes=(jnp.uint8,)
-    )
-    rhs_packed = jnp.asarray(rhs_packed)
-    lhs_scales = _validate_matrix(
-        "lhs_scales", lhs_scales, dtypes=(jnp.uint8,)
-    )
-    rhs_scales = jnp.asarray(rhs_scales)
-    offsets = jnp.asarray(group_end_offsets)
-
-    if rhs_packed.ndim != 3 or rhs_packed.dtype != jnp.uint8:
-        raise TypeError("rhs_packed must be uint8[E, N, K/2]")
-    if rhs_scales.ndim != 3 or rhs_scales.dtype != jnp.uint8:
-        raise TypeError("rhs_scales must be uint8[E, N, K/32]")
-    if offsets.ndim != 1 or offsets.dtype != jnp.int32:
-        raise TypeError("group_end_offsets must be int32[E]")
-
-    rows, packed_k = lhs_packed.shape
-    experts, out_cols, rhs_packed_k = rhs_packed.shape
-    logical_k = packed_k * 2
-    if rhs_packed_k != packed_k:
-        raise ValueError("lhs and rhs packed contraction dimensions differ")
-    if offsets.shape != (experts,):
-        raise ValueError(
-            f"Expected {experts} group offsets, got {offsets.shape}"
-        )
-    if logical_k % 128 or (logical_k + 255) // 256 < 4:
-        raise ValueError(
-            "grouped forward/dA requires K divisible by 128 and at least "
-            f"four pipeline steps, got K={logical_k}"
-        )
-    _require_int32_indexing("grouped lhs", rows * packed_k)
-    _require_int32_indexing(
-        "grouped rhs", experts * out_cols * rhs_packed_k
-    )
-    _require_int32_indexing("grouped output", rows * out_cols)
-    if lhs_scales.shape != (rows, logical_k // _SCALE_BLOCK):
-        raise ValueError("lhs_scales shape does not match lhs_packed")
-    if rhs_scales.shape != (
-        experts,
-        out_cols,
-        logical_k // _SCALE_BLOCK,
-    ):
-        raise ValueError("rhs_scales shape does not match rhs_packed")
-
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4._fwd_kernel_fp4 import (
-        BLOCK_R,
-        cached_launch,
-        ceildiv,
-        pick_block_c,
-    )
-
-    block_cols = pick_block_c(out_cols)
-    col_tiles = ceildiv(out_cols, block_cols)
-    block_count = (ceildiv(rows, BLOCK_R) + experts) * col_tiles
-    launcher = cached_launch(logical_k, out_cols, experts, block_cols)
-
-    # The kernel writes every row, including zeros after offsets[-1], so the
-    # output needs no zero-filled seed.
-    output = flydsl_call(
-        lhs_packed.reshape(-1),
-        rhs_packed.reshape(-1),
-        lhs_scales.reshape(-1),
-        rhs_scales.reshape(-1),
-        offsets,
-        kernel=launcher,
-        out_shape=jax.ShapeDtypeStruct(
-            (rows * out_cols,), jnp.bfloat16
-        ),
-        scalars={
-            "n_blocks": block_count,
-            "n_c_tiles": col_tiles,
-            "out_m": rows,
-            "out_n": out_cols,
-        },
-        output_positions=(2,),
-    )
-    return output.reshape(rows, out_cols)
-
-
-def grouped_mxfp4_fwd_da(
-    lhs_packed,
-    rhs_packed,
-    lhs_scales,
-    rhs_scales,
-    group_end_offsets,
-    *,
-    _max_index_elements: int = _INT32_MAX,
-):
-    """Ragged grouped forward/dA, split into int32-addressable row slabs."""
-    lhs_packed = _validate_matrix(
-        "lhs_packed", lhs_packed, dtypes=(jnp.uint8,)
-    )
-    rhs_packed = jnp.asarray(rhs_packed)
-    lhs_scales = _validate_matrix(
-        "lhs_scales", lhs_scales, dtypes=(jnp.uint8,)
-    )
-    offsets = jnp.asarray(group_end_offsets)
-    if rhs_packed.ndim != 3 or rhs_packed.dtype != jnp.uint8:
-        raise TypeError("rhs_packed must be uint8[E, N, K/2]")
-    if offsets.ndim != 1 or offsets.dtype != jnp.int32:
-        raise TypeError("group_end_offsets must be int32[E]")
-
-    rows, packed_k = lhs_packed.shape
-    experts, out_cols, _ = rhs_packed.shape
-    if offsets.shape != (experts,):
-        raise ValueError(
-            f"Expected {experts} group offsets, got {offsets.shape}"
-        )
-    chunks = _row_chunks(
-        rows,
-        max(packed_k, lhs_scales.shape[1], out_cols),
-        alignment=_GROUP_ALIGNMENT,
+        row_index.shape[0],
+        cols // 2,
+        alignment=_COL_TILE,
         max_index_elements=_max_index_elements,
     )
-    if len(chunks) == 1:
-        return _grouped_mxfp4_fwd_da_single(
-            lhs_packed,
-            rhs_packed,
-            lhs_scales,
-            rhs_scales,
-            offsets,
-        )
-
-    bounds = jnp.concatenate((jnp.zeros((1,), jnp.int32), offsets))
-    outputs = []
-    for chunk_index, (start, end) in enumerate(chunks):
-        local_offsets = _local_group_bounds(bounds, start, end)[1:]
-        operands = (
-            lhs_packed[start:end],
-            rhs_packed,
-            lhs_scales[start:end],
-            rhs_scales,
-            local_offsets,
-        )
-        if chunk_index == 0:
-            outputs.append(_grouped_mxfp4_fwd_da_single(*operands))
-        else:
-            outputs.append(
-                jax.lax.cond(
-                    local_offsets[-1] > 0,
-                    lambda args: _grouped_mxfp4_fwd_da_single(*args),
-                    lambda args: jnp.zeros(
-                        (args[0].shape[0], args[1].shape[1]),
-                        jnp.bfloat16,
-                    ),
-                    operands,
-                )
+    packed, scales = _concat_chunks(
+        [
+            quantize_mxfp4_cols_gather(
+                value,
+                row_index[start:end],
+                row_limit=_chunk_row_limit(row_limit, start),
             )
-    return jnp.concatenate(outputs, axis=0)
-
-
-def grouped_mxfp4_dw(
-    grad_output_transposed,
-    grad_output_scales,
-    input_transposed,
-    input_scales,
-    group_end_offsets,
-    *,
-    out_dtype=jnp.bfloat16,
-):
-    """Ragged grouped weight gradient with FP32 accumulation."""
-    grad_output_transposed = _validate_matrix(
-        "grad_output_transposed",
-        grad_output_transposed,
-        dtypes=(jnp.uint8,),
+            for start, end in chunks
+        ],
+        axis=1,
     )
-    input_transposed = _validate_matrix(
-        "input_transposed", input_transposed, dtypes=(jnp.uint8,)
-    )
-    grad_output_scales = _validate_matrix(
-        "grad_output_scales", grad_output_scales, dtypes=(jnp.uint8,)
-    )
-    input_scales = _validate_matrix(
-        "input_scales", input_scales, dtypes=(jnp.uint8,)
-    )
-    offsets = jnp.asarray(group_end_offsets)
-    if offsets.ndim != 1 or offsets.dtype != jnp.int32:
-        raise TypeError("group_end_offsets must be int32[E]")
-    if out_dtype != jnp.bfloat16:
-        raise TypeError("grouped_mxfp4_dw currently returns bfloat16 only")
-
-    out_rows, packed_tokens = grad_output_transposed.shape
-    out_cols, packed_tokens_rhs = input_transposed.shape
-    if packed_tokens_rhs != packed_tokens:
-        raise ValueError("dW operands must share the packed token dimension")
-    token_rows = packed_tokens * 2
-    if token_rows % _GROUP_ALIGNMENT:
-        raise ValueError(
-            f"dW token capacity must be divisible by 128, got {token_rows}"
-        )
-    expected_scale_cols = token_rows // _SCALE_BLOCK
-    if grad_output_scales.shape != (out_rows, expected_scale_cols):
-        raise ValueError("grad_output_scales shape mismatch")
-    if input_scales.shape != (out_cols, expected_scale_cols):
-        raise ValueError("input_scales shape mismatch")
-    _require_int32_indexing(
-        "grouped dW operand",
-        max(out_rows, out_cols) * packed_tokens,
-    )
-    _require_int32_indexing(
-        "grouped dW output", offsets.shape[0] * out_rows * out_cols
-    )
-
-    experts = offsets.shape[0]
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4._wgrad_kernel_fp4 import (
-        BLOCK_C,
-        BLOCK_R,
-        cached_launch,
-        ceildiv_py,
-    )
-
-    row_tiles = ceildiv_py(out_rows, BLOCK_R)
-    col_tiles = ceildiv_py(out_cols, BLOCK_C)
-    block_count = experts * row_tiles * col_tiles
-    scale_pair = token_rows % (2 * _GROUP_ALIGNMENT) == 0
-    order = "lpt" if experts <= 32 else "id"
-    launcher = cached_launch(
-        out_rows, out_cols, experts, scale_pair, order
-    )
-
-    output = flydsl_call(
-        grad_output_transposed.reshape(-1),
-        input_transposed.reshape(-1),
-        grad_output_scales.reshape(-1),
-        input_scales.reshape(-1),
-        offsets,
-        kernel=launcher,
-        out_shape=jax.ShapeDtypeStruct(
-            (experts * out_rows * out_cols,), jnp.float32
-        ),
-        scalars={
-            "n_blocks": block_count,
-            "n_r_tiles": row_tiles,
-            "n_c_tiles": col_tiles,
-            "out_r": out_rows,
-            "out_c": out_cols,
-            "m_row": token_rows,
-        },
-        output_positions=(2,),
-    )
-    return output.reshape(experts, out_rows, out_cols).astype(out_dtype)
+    if pad_rows:
+        packed, scales = packed[:, : rows // 2], scales[:, : rows // _SCALE_BLOCK]
+    return packed, scales
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -799,11 +400,10 @@ def _int64_bound_table(bounds: jax.Array) -> jax.Array:
 
 @functools.lru_cache(maxsize=None)
 def _wholeloop_fwd_da_launcher(contraction, experts, out_cols, schedule):
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
+    from ..flydsl.kernels import primus_turbo_mxfp4
 
     group_m, num_xcds, group_n, xcd_span, streaming_store = schedule
-    launcher, _ = grouped_gemm_mxfp4_kernel._compile_grouped_mxfp4_nt_fused(
+    launcher, n_blocks = primus_turbo_mxfp4.compile_grouped_mxfp4_nt(
         contraction,
         experts,
         out_cols,
@@ -817,13 +417,12 @@ def _wholeloop_fwd_da_launcher(contraction, experts, out_cols, schedule):
         span=xcd_span,
         cst_nt=streaming_store,
     )
-    return launcher
+    return launcher, n_blocks
 
 
 @functools.lru_cache(maxsize=None)
 def _wholeloop_dw_launcher(out_rows, out_cols, experts, schedule):
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
+    from ..flydsl.kernels.primus_turbo.grouped_gemm import grouped_gemm_mxfp4_kernel
 
     group_m, num_xcds, group_n, streaming_store, wg_tiles = schedule
     # The bf16 epilogue needs a full LDS drain at the phase barrier (elgk=0).
@@ -860,9 +459,14 @@ def _grouped_mxfp4_fwd_da_wholeloop_single(
 ):
     """Whole-loop ragged grouped MXFP4 GEMM used by both forward and dA.
 
-    Operands match :func:`grouped_mxfp4_fwd_da`, except that ``group_bounds``
-    is device ``int32[E+1]`` holding ``[0, end_0, ..., end_{E-1}]``. Groups
-    need no row alignment. The kernel does not write rows at or after
+    Args:
+      lhs_packed: ``[M, K/2]`` uint8.
+      rhs_packed: ``[E, N, K/2]`` uint8.
+      lhs_scales: ``[M, K/32]`` uint8.
+      rhs_scales: ``[E, N, K/32]`` uint8.
+      group_bounds: device ``int32[E+1]`` holding ``[0, end_0, ..., end_{E-1}]``.
+
+    Groups need no row alignment. The kernel does not write rows at or after
     ``group_bounds[-1]``; ``zero_tail`` masks them to zero.
 
     ``schedule_rows`` is the static row count that picks the tile schedule
@@ -907,19 +511,22 @@ def _grouped_mxfp4_fwd_da_wholeloop_single(
     _require_int32_indexing("grouped lhs", rows * packed_k)
     _require_int32_indexing("grouped rhs", experts * out_cols * packed_k)
 
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
+    from ..flydsl.kernels.primus_turbo.grouped_gemm import grouped_gemm_mxfp4_kernel
 
     schedule = grouped_gemm_mxfp4_kernel._select_gmxfp4_nt_cfg(
         rows if schedule_rows is None else int(schedule_rows), experts
     )
-    launcher = _wholeloop_fwd_da_launcher(
+    launcher, n_blocks = _wholeloop_fwd_da_launcher(
         contraction, experts, out_cols, schedule
     )
     scale_words = contraction // 128
     slab_rows = (
         _ceil_div(rows, _WHOLELOOP_ALIGNMENT) + experts
     ) * _WHOLELOOP_ALIGNMENT
+    preshuffle_words = (
+        grouped_gemm_mxfp4_kernel._PRESHUF_FO
+        * grouped_gemm_mxfp4_kernel._PRESHUF_BLK
+    )
     rhs_scale_rows = (
         _ceil_div(out_cols, _WHOLELOOP_ALIGNMENT) * _WHOLELOOP_ALIGNMENT
     )
@@ -937,7 +544,15 @@ def _grouped_mxfp4_fwd_da_wholeloop_single(
                 (experts * rhs_scale_rows * scale_words,), jnp.int32
             ),
         ),
-        scalars={"c_m": rows, "slab_rows": slab_rows},
+        scalars={
+            "c_m": rows,
+            "c_n": out_cols,
+            "slab_rows": slab_rows,
+            "a_pre_grid": _ceil_div(slab_rows * scale_words, preshuffle_words),
+            "grid_upper": (
+                _ceil_div(rows, _WHOLELOOP_ALIGNMENT) + experts
+            ) * n_blocks,
+        },
         output_positions=(2, 5, 6),
         compile_hints=grouped_gemm_mxfp4_kernel._GMXFP4_SCHED_HINTS,
     )
@@ -1042,10 +657,12 @@ def grouped_mxfp4_dw_wholeloop(
 ):
     """Whole-loop ragged grouped weight gradient, returning bf16 ``[E, R, C]``.
 
-    Operands match :func:`grouped_mxfp4_dw`, except that ``group_bounds`` is
-    device ``int32[E+1]`` holding ``[0, end_0, ..., end_{E-1}]`` with every
-    entry a multiple of 256. Token rows at or after ``group_bounds[-1]`` are
-    ignored.
+    ``grad_output_transposed`` ``[R, T/2]`` and ``input_transposed``
+    ``[C, T/2]`` are uint8 FP4 packed along the ``T`` token rows, with E8M0
+    scales ``grad_output_scales`` ``[R, T/32]`` and ``input_scales``
+    ``[C, T/32]``. ``group_bounds`` is device ``int32[E+1]`` holding
+    ``[0, end_0, ..., end_{E-1}]`` with every entry a multiple of 256. Token
+    rows at or after ``group_bounds[-1]`` are ignored.
 
     ``schedule_rows`` is the static token count that picks the tile schedule
     and defaults to the token capacity of the operands.
@@ -1089,8 +706,7 @@ def grouped_mxfp4_dw_wholeloop(
         "grouped dW output", experts * out_rows * out_cols
     )
 
-    _require_kernels()
-    from ..flydsl.kernels.mxfp4.wholeloop import grouped_gemm_mxfp4_kernel
+    from ..flydsl.kernels.primus_turbo.grouped_gemm import grouped_gemm_mxfp4_kernel
 
     schedule = grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(
         token_rows if schedule_rows is None else int(schedule_rows),
@@ -1135,8 +751,6 @@ def grouped_mxfp4_dw_wholeloop(
 __all__ = [
     "quantize_mxfp4_dim0",
     "quantize_mxfp4_dim1",
-    "grouped_mxfp4_fwd_da",
     "grouped_mxfp4_fwd_da_wholeloop",
-    "grouped_mxfp4_dw",
     "grouped_mxfp4_dw_wholeloop",
 ]

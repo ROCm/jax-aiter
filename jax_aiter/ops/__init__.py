@@ -17,11 +17,7 @@ from .rmsnorm import rmsnorm_fwd
 from .activation import silu_and_mul
 from .buffers import uninitialized
 from .moe_mxfp4 import (
-    Mxfp4KernelsUnavailableError,
-    mxfp4_moe_kernels_available,
-    grouped_mxfp4_dw,
     grouped_mxfp4_dw_wholeloop,
-    grouped_mxfp4_fwd_da,
     grouped_mxfp4_fwd_da_wholeloop,
     quantize_mxfp4_dim0,
     quantize_mxfp4_dim1,
@@ -39,12 +35,8 @@ __all__ = [
     "rmsnorm_fwd",
     "silu_and_mul",
     "uninitialized",
-    "Mxfp4KernelsUnavailableError",
-    "mxfp4_moe_kernels_available",
     "quantize_mxfp4_dim0",
     "quantize_mxfp4_dim1",
-    "grouped_mxfp4_fwd_da",
     "grouped_mxfp4_fwd_da_wholeloop",
-    "grouped_mxfp4_dw",
     "grouped_mxfp4_dw_wholeloop",
 ]

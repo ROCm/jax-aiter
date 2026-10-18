@@ -17,6 +17,5 @@ third_party
 hlo_dumps
 ci_perf_out
 
-# Rights-gated and absent from Git. The MXFP4 Dockerfile accepts these only
-# through an explicit, independently verified BuildKit named context.
+# Rights-gated, absent from Git and unused: no image may contain them.
 jax_aiter/flydsl/kernels/mxfp4

@@ -20,5 +20,4 @@ markers = [
     "gpu: needs a GPU (an AITER FFI kernel actually executes)",
     "multigpu: needs at least 4 visible devices; skipped on a single-GPU runner",
     "slow: exhaustive sweeps and large shapes; nightly only, not on the PR path",
-    "mxfp4_kernels: needs FlyDSL and the separately distributed MXFP4 MoE kernels; skipped without them unless JA_REQUIRE_MXFP4_KERNELS=1",
 ]
