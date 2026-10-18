@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Correctness coverage for collaborator-derived MXFP4 grouped operations."""
+"""Correctness coverage for the MXFP4 MoE casts."""
 
 from __future__ import annotations
 
@@ -10,20 +10,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from mxfp4_kernel_gate import require_mxfp4_kernels
-
-require_mxfp4_kernels()
-pytestmark = pytest.mark.mxfp4_kernels
+pytest.importorskip("flydsl.compiler")
 
 from jax_aiter.ops.moe_mxfp4 import (
-    grouped_mxfp4_dw,
-    grouped_mxfp4_fwd_da,
     quantize_mxfp4_dim0,
     quantize_mxfp4_dim0_gather,
     quantize_mxfp4_dim1,
     quantize_mxfp4_dim1_gather,
     requantize_mxfp4_dim0_transposed,
 )
+from jax_aiter.ops.moe_mxfp4_ptquant import quantize_mxfp4_dual
 
 _FP4_VALUES = np.asarray(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32
@@ -99,10 +95,11 @@ def test_dim0_matches_rceil_reference():
     np.testing.assert_array_equal(np.asarray(actual_packed), expected_packed)
 
 
-def test_dim1_matches_dim0_of_transpose():
+@pytest.mark.parametrize("shape", [(128, 64), (160, 96), (96, 384), (384, 1024)])
+def test_dim1_matches_dim0_of_transpose(shape):
     rng = np.random.default_rng(9)
     value = jnp.asarray(
-        rng.normal(size=(128, 64)).astype(np.float32), dtype=jnp.bfloat16
+        rng.normal(size=shape).astype(np.float32), dtype=jnp.bfloat16
     )
     dim1_packed, dim1_scales = jax.jit(quantize_mxfp4_dim1)(value)
     dim0_packed, dim0_scales = jax.jit(quantize_mxfp4_dim0)(value.T)
@@ -178,19 +175,18 @@ def test_row_limit_matches_unlimited_rows_below_limit(limit, max_index_elements)
             )
 
 
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("cols", [1024, 7168])
 @pytest.mark.parametrize("limit", [None, 0, 77, 300])
-def test_dim0_gather_matches_materialized_gather(dtype, cols, limit):
+def test_dim0_gather_matches_materialized_gather(cols, limit):
     in_rows, out_rows = 200, 300
     value = jax.random.normal(
         jax.random.key(31), (in_rows, cols), dtype=jnp.float32
-    ).astype(dtype)
+    ).astype(jnp.bfloat16)
     index = jax.random.randint(jax.random.key(37), (out_rows,), -1, in_rows)
     index = index.at[:8].set(jnp.int32(-1)).at[8:16].set(jnp.int32(in_rows - 1))
     index = index.astype(jnp.int32)
     gathered = jnp.where(
-        (index >= 0)[:, None], value[jnp.maximum(index, 0)], jnp.zeros((), dtype)
+        (index >= 0)[:, None], value[jnp.maximum(index, 0)], jnp.zeros((), value.dtype)
     )
     expected = jax.jit(quantize_mxfp4_dim0)(gathered)
     extra = {} if limit is None else {"row_limit": jnp.int32(limit)}
@@ -204,20 +200,20 @@ def test_dim0_gather_matches_materialized_gather(dtype, cols, limit):
         )
 
 
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("cols", [1024, 7168, 2080])
 @pytest.mark.parametrize("limit", [None, 0, 77, 320])
-def test_dim1_gather_matches_materialized_gather(dtype, cols, limit):
-    in_rows, out_rows = 200, 384
+@pytest.mark.parametrize("out_rows", [384, 288])
+def test_dim1_gather_matches_materialized_gather(cols, limit, out_rows):
+    in_rows = 200
     value = jax.random.normal(
         jax.random.key(41), (in_rows, cols), dtype=jnp.float32
-    ).astype(dtype)
+    ).astype(jnp.bfloat16)
     # Rows no index selects hold NaN: a masked row must not read them.
     value = value.at[in_rows - 8 :].set(jnp.nan)
     index = jax.random.randint(jax.random.key(43), (out_rows,), -1, in_rows - 8)
     index = index.at[:40].set(jnp.int32(-1)).astype(jnp.int32)
     gathered = jnp.where(
-        (index >= 0)[:, None], value[jnp.maximum(index, 0)], jnp.zeros((), dtype)
+        (index >= 0)[:, None], value[jnp.maximum(index, 0)], jnp.zeros((), value.dtype)
     )
     expected = jax.jit(quantize_mxfp4_dim1)(gathered)
     extra = {} if limit is None else {"row_limit": jnp.int32(limit)}
@@ -230,6 +226,22 @@ def test_dim1_gather_matches_materialized_gather(dtype, cols, limit):
             np.asarray(result)[:, : valid // per_col],
             np.asarray(reference)[:, : valid // per_col],
         )
+
+
+@pytest.mark.parametrize(
+    "quantize",
+    [
+        quantize_mxfp4_dim0,
+        quantize_mxfp4_dim1,
+        lambda value: quantize_mxfp4_dim0_gather(value, jnp.arange(256, dtype=jnp.int32)),
+        lambda value: quantize_mxfp4_dim1_gather(value, jnp.arange(256, dtype=jnp.int32)),
+        quantize_mxfp4_dual,
+    ],
+    ids=["dim0", "dim1", "dim0_gather", "dim1_gather", "dual"],
+)
+def test_casts_reject_float32(quantize):
+    with pytest.raises(TypeError, match="take bfloat16 input, got float32"):
+        quantize(jnp.zeros((256, 256), jnp.float32))
 
 
 @pytest.mark.parametrize("limit", [None, 0, 77, 200, 320])
@@ -303,181 +315,3 @@ def test_dim0_dispatches_on_multiple_devices_and_lowers_to_typed_ffi():
 
     lowered = jax.jit(quantize_mxfp4_dim0).lower(value[0])
     assert "FlydslDispatchJA" in str(lowered.compiler_ir())
-
-
-def test_grouped_forward_matches_dequantized_reference():
-    experts, rows, contraction, output = 2, 384, 1024, 256
-    key_lhs, key_rhs = jax.random.split(jax.random.key(11))
-    lhs = jax.random.normal(
-        key_lhs, (rows, contraction), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
-    rhs = jax.random.normal(
-        key_rhs, (experts, output, contraction), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
-    lhs_packed, lhs_scales = quantize_mxfp4_dim0(lhs)
-    rhs_packed, rhs_scales = quantize_mxfp4_dim0(
-        rhs.reshape(experts * output, contraction)
-    )
-    rhs_packed = rhs_packed.reshape(experts, output, contraction // 2)
-    rhs_scales = rhs_scales.reshape(experts, output, contraction // 32)
-    offsets = jnp.asarray([128, 256], dtype=jnp.int32)
-    compiled = jax.jit(grouped_mxfp4_fwd_da).lower(
-        lhs_packed, rhs_packed, lhs_scales, rhs_scales, offsets
-    ).compile()
-    actual = compiled(
-        lhs_packed, rhs_packed, lhs_scales, rhs_scales, offsets
-    )
-    lhs_dequantized = _dequantize(lhs_packed, lhs_scales)
-    rhs_dequantized = _dequantize(rhs_packed, rhs_scales)
-    expected = np.concatenate(
-        (
-            lhs_dequantized[:128] @ rhs_dequantized[0].T,
-            lhs_dequantized[128:256] @ rhs_dequantized[1].T,
-            np.zeros((128, output), dtype=np.float32),
-        )
-    )
-    assert _relative_error(actual, expected) < 0.01
-
-    # Route values change while shapes stay fixed: the same executable must
-    # accept an empty first expert and move all valid rows to expert 1.
-    changed_offsets = jnp.asarray([0, 256], dtype=jnp.int32)
-    changed = compiled(
-        lhs_packed,
-        rhs_packed,
-        lhs_scales,
-        rhs_scales,
-        changed_offsets,
-    )
-    changed_expected = np.concatenate(
-        (
-            lhs_dequantized[:256] @ rhs_dequantized[1].T,
-            np.zeros((128, output), dtype=np.float32),
-        )
-    )
-    assert _relative_error(changed, changed_expected) < 0.01
-
-
-def test_grouped_forward_defines_slack_rows_without_zero_seed():
-    experts, rows, contraction, output = 2, 1024, 1024, 256
-    key_lhs, key_rhs = jax.random.split(jax.random.key(17))
-    lhs = jax.random.normal(
-        key_lhs, (rows, contraction), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
-    # Rows past the last group hold large non-zero values: exact-zero output
-    # there must come from the kernel, not from zero inputs.
-    lhs = lhs.at[256:].multiply(1000.0)
-    rhs = jax.random.normal(
-        key_rhs, (experts, output, contraction), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
-    lhs_packed, lhs_scales = quantize_mxfp4_dim0(lhs)
-    rhs_packed, rhs_scales = quantize_mxfp4_dim0(
-        rhs.reshape(experts * output, contraction)
-    )
-    rhs_packed = rhs_packed.reshape(experts, output, contraction // 2)
-    rhs_scales = rhs_scales.reshape(experts, output, contraction // 32)
-    offsets = jnp.asarray([128, 256], dtype=jnp.int32)
-
-    lowered = jax.jit(grouped_mxfp4_fwd_da).lower(
-        lhs_packed, rhs_packed, lhs_scales, rhs_scales, offsets
-    )
-    assert "output_operand_aliases" not in str(lowered.compiler_ir())
-    compiled = lowered.compile()
-    chunked = jax.jit(
-        functools.partial(
-            grouped_mxfp4_fwd_da,
-            _max_index_elements=256 * (contraction // 2),
-        )
-    ).lower(
-        lhs_packed, rhs_packed, lhs_scales, rhs_scales, offsets
-    )
-    chunked_ir = str(chunked.compiler_ir()).lower()
-    assert "stablehlo.case" in chunked_ir
-    assert "host_callback" not in chunked_ir
-    chunked_compiled = chunked.compile()
-    actual = np.asarray(
-        compiled(lhs_packed, rhs_packed, lhs_scales, rhs_scales, offsets)
-    )
-    chunked_actual = np.asarray(
-        chunked_compiled(
-            lhs_packed, rhs_packed, lhs_scales, rhs_scales, offsets
-        )
-    )
-
-    np.testing.assert_array_equal(actual[256:], 0)
-    np.testing.assert_array_equal(chunked_actual, actual)
-    lhs_dequantized = _dequantize(lhs_packed, lhs_scales)
-    rhs_dequantized = _dequantize(rhs_packed, rhs_scales)
-    expected = np.concatenate(
-        (
-            lhs_dequantized[:128] @ rhs_dequantized[0].T,
-            lhs_dequantized[128:256] @ rhs_dequantized[1].T,
-        )
-    )
-    assert _relative_error(actual[:256], expected) < 0.01
-
-    all_empty = np.asarray(
-        compiled(
-            lhs_packed,
-            rhs_packed,
-            lhs_scales,
-            rhs_scales,
-            jnp.asarray([0, 0], dtype=jnp.int32),
-        )
-    )
-    np.testing.assert_array_equal(all_empty, 0)
-    chunked_all_empty = np.asarray(
-        chunked_compiled(
-            lhs_packed,
-            rhs_packed,
-            lhs_scales,
-            rhs_scales,
-            jnp.asarray([0, 0], dtype=jnp.int32),
-        )
-    )
-    np.testing.assert_array_equal(chunked_all_empty, all_empty)
-
-    no_slack = np.asarray(
-        compiled(
-            lhs_packed,
-            rhs_packed,
-            lhs_scales,
-            rhs_scales,
-            jnp.asarray([0, rows], dtype=jnp.int32),
-        )
-    )
-    expected_no_slack = lhs_dequantized @ rhs_dequantized[1].T
-    assert _relative_error(no_slack, expected_no_slack) < 0.01
-    chunked_no_slack = np.asarray(
-        chunked_compiled(
-            lhs_packed,
-            rhs_packed,
-            lhs_scales,
-            rhs_scales,
-            jnp.asarray([0, rows], dtype=jnp.int32),
-        )
-    )
-    np.testing.assert_array_equal(chunked_no_slack, no_slack)
-
-
-def test_grouped_dw_matches_dequantized_reference_and_zeros_empty_expert():
-    experts, rows, contraction, output = 2, 256, 1024, 256
-    key_lhs, key_grad = jax.random.split(jax.random.key(13))
-    lhs = jax.random.normal(
-        key_lhs, (rows, contraction), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
-    grad = jax.random.normal(
-        key_grad, (rows, output), dtype=jnp.float32
-    ).astype(jnp.bfloat16)
-    grad_packed, grad_scales = quantize_mxfp4_dim1(grad)
-    lhs_packed, lhs_scales = quantize_mxfp4_dim1(lhs)
-    offsets = jnp.asarray([0, rows], dtype=jnp.int32)
-
-    actual = jax.jit(grouped_mxfp4_dw)(
-        grad_packed, grad_scales, lhs_packed, lhs_scales, offsets
-    )
-    grad_dequantized = _dequantize(grad_packed, grad_scales)
-    lhs_dequantized = _dequantize(lhs_packed, lhs_scales)
-    expected_nonempty = grad_dequantized @ lhs_dequantized.T
-
-    np.testing.assert_array_equal(np.asarray(actual[0]), 0)
-    assert _relative_error(actual[1], expected_nonempty) < 0.01
