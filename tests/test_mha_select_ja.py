@@ -441,3 +441,133 @@ def test_flash_attn_auto_full_rows_matches_oracle():
     assert _rel(flat(out), ref_out, real) < 2e-2
     for name, got, ref in zip(("dq", "dk", "dv"), grads, ref_grads):
         assert _rel(flat(got), ref, real) < 3e-2, (name, _rel(flat(got), ref, real))
+
+
+# ---------------------------------------------------------------------------
+# Full-row QK=192 / V=128 forward through OPUS, batch backward unchanged
+# ---------------------------------------------------------------------------
+
+BATCH_OPUS_ENV = "JA_MHA_BATCH_FWD_OPUS"
+
+
+def _full_rows(b, s, h, seed):
+    rng = np.random.default_rng(seed)
+    bf = lambda d: jnp.asarray(rng.normal(size=(b, s, h, d)), jnp.bfloat16)
+    return bf(192), bf(192), bf(128), bf(128)
+
+
+def _batch_fwd_bwd(q, k, v, dout, scale):
+    from jax_aiter.mha import flash_attn_func
+
+    def loss(q_, k_, v_):
+        out, lse = flash_attn_func(q_, k_, v_, softmax_scale=scale, causal=True,
+                                   deterministic=False, return_lse=True)
+        return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32)), (out, lse)
+
+    (_, (out, lse)), grads = jax.jit(
+        jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))(q, k, v)
+    return out, lse, grads
+
+
+@gpu
+@on_gfx950
+def test_full_row_opus_forward_matches_batch_asm_and_oracle(monkeypatch):
+    b, s, h = 2, 512, 4
+    q, k, v, dout = _full_rows(b, s, h, seed=7)
+    scale = 192 ** -0.5
+    monkeypatch.delenv(BATCH_OPUS_ENV, raising=False)
+    monkeypatch.delenv("AITER_DISABLE_FMHA_OPUS", raising=False)
+    opus = _batch_fwd_bwd(q, k, v, dout, scale)
+    monkeypatch.setenv(BATCH_OPUS_ENV, "0")
+    asm = _batch_fwd_bwd(q, k, v, dout, scale)
+
+    flat = lambda x: np.asarray(x, np.float32).reshape(b * s, h, -1)
+    seg_id = np.repeat(np.arange(1, b + 1), s)
+    real = seg_id > 0
+    ref_out, *ref_grads = _oracle(*(flat(x) for x in (q, k, v, dout)), seg_id, scale)
+    assert opus[1].shape == asm[1].shape == (b, h, s)
+    assert _rel(opus[1], asm[1], slice(None)) < 1e-4
+    assert _rel(flat(opus[0]), ref_out, real) < 2e-2
+    assert _rel(flat(opus[0]), flat(asm[0]), real) < 1e-2
+    for name, got, base, ref in zip(("dq", "dk", "dv"), opus[2], asm[2], ref_grads):
+        assert _rel(flat(got), ref, real) < 3e-2, (name, _rel(flat(got), ref, real))
+        assert _rel(flat(got), flat(base), real) < 1e-2, (name, _rel(flat(got), flat(base), real))
+
+
+@gpu
+@on_gfx950
+def test_full_row_opus_forward_is_repeatable(monkeypatch):
+    monkeypatch.delenv(BATCH_OPUS_ENV, raising=False)
+    q, k, v, _ = _full_rows(2, 512, 4, seed=8)
+    fwd = jax.jit(lambda q_, k_, v_: select.flash_attn_auto(q_, k_, v_, softmax_scale=192 ** -0.5))
+    first = np.asarray(fwd(q, k, v), np.float32)
+    for _ in range(20):
+        assert np.array_equal(np.asarray(fwd(q, k, v), np.float32), first)
+
+
+_FULL_ROW_PROBE = textwrap.dedent("""
+    import numpy as np, jax, jax.numpy as jnp
+    from jax_aiter.mha import select
+
+    rng = np.random.default_rng(0)
+    bf = lambda d: jnp.asarray(rng.normal(size=(2, 256, 2, d)), jnp.bfloat16)
+    q, k, v, dout = bf(192), bf(192), bf(128), bf(128)
+
+    def loss(q_, k_, v_):
+        out = select.flash_attn_auto(q_, k_, v_, softmax_scale=192 ** -0.5)
+        return jnp.sum(out.astype(jnp.float32) * dout.astype(jnp.float32))
+
+    jax.block_until_ready(jax.jit(jax.grad(loss, argnums=(0, 1, 2)))(q, k, v))
+""")
+
+
+@gpu
+@on_gfx950
+@pytest.mark.parametrize("opus,expect_asm_fwd", [(None, False), ("0", True)],
+                         ids=["default", "opus-off"])
+def test_full_row_forward_dispatch(opus, expect_asm_fwd):
+    env = {k: v for k, v in os.environ.items()
+           if k not in (BATCH_OPUS_ENV, "AITER_DISABLE_FMHA_OPUS")}
+    if opus is not None:
+        env[BATCH_OPUS_ENV] = opus
+    proc = subprocess.run([sys.executable, "-c", _FULL_ROW_PROBE], env=env,
+                          capture_output=True, text=True, timeout=900)
+    log = proc.stdout + proc.stderr
+    assert proc.returncode == 0, log[-4000:]
+    assert ("fwd_hd192_hd128_bf16_causal" in log) == expect_asm_fwd, log[-4000:]
+    assert "fwd_hd192_hd128_bf16_causal_group" not in log, log[-4000:]
+    assert "bwd_hd192_128_bf16_causal" in log, log[-4000:]
+
+
+@gpu
+@on_gfx950
+@pytest.mark.skipif(len(jax.devices()) < 2, reason="needs 2 devices")
+@pytest.mark.parametrize("shardy", [False, True], ids=["gspmd", "shardy"])
+def test_full_row_opus_forward_sharded_matches_single_device(monkeypatch, shardy):
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    monkeypatch.delenv(BATCH_OPUS_ENV, raising=False)
+    b, s, h = 4, 256, 2
+    q, k, v, dout = _full_rows(b, s, h, seed=9)
+    scale = 192 ** -0.5
+
+    # The backward partitioner keeps each operand's own sharding, so dout must
+    # arrive batch-sharded like q, as it does in training.
+    def loss(q_, k_, v_, g_):
+        out = select.flash_attn_auto(q_, k_, v_, softmax_scale=scale)
+        return jnp.sum(out.astype(jnp.float32) * g_.astype(jnp.float32)), out
+
+    step = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)
+    (_, out1), grads1 = jax.jit(step)(q, k, v, dout)
+    sharding = NamedSharding(Mesh(np.array(jax.devices()[:2]), ("data",)), P("data", None, None, None))
+    old = jax.config.jax_use_shardy_partitioner
+    jax.config.update("jax_use_shardy_partitioner", shardy)
+    try:
+        (_, out2), grads2 = jax.jit(step, in_shardings=(sharding,) * 4)(
+            *(jax.device_put(x, sharding) for x in (q, k, v, dout)))
+    finally:
+        jax.config.update("jax_use_shardy_partitioner", old)
+    rows = slice(None)
+    assert _rel(out2, out1, rows) < 1e-3
+    for name, got, base in zip(("dq", "dk", "dv"), grads2, grads1):
+        assert _rel(got, base, rows) < 1e-2, (name, _rel(got, base, rows))

@@ -207,6 +207,63 @@ def _get_rank(t):
 
 
 # ---------------------------------------------------------------------------
+# Batch forward through OPUS
+# ---------------------------------------------------------------------------
+#
+# AITER's own gfx950 dispatch prefers its OPUS kernel for bf16 QK=192 / V=128
+# forwards, but the FFI reaches OPUS only in group mode. Full self-attention
+# rows are therefore run as one tight segment per row, and the head-major LSE
+# is transposed back to the [b, hq, sq] layout the batch backward reads.
+# JA_MHA_BATCH_FWD_OPUS=0 (or AITER_DISABLE_FMHA_OPUS=1, which the FFI also
+# honours) keeps the batch ASM v3 forward.
+_BATCH_FWD_OPUS_ENV = "JA_MHA_BATCH_FWD_OPUS"
+
+
+def _opus_disabled() -> bool:
+    return os.environ.get("AITER_DISABLE_FMHA_OPUS", "") not in ("", "0")
+
+
+def _batch_fwd_via_opus(q, k, v, bias, alibi, config, q_descale) -> bool:
+    if q.ndim != 4 or os.environ.get(_BATCH_FWD_OPUS_ENV, "1") == "0" or _opus_disabled():
+        return False
+    _, sq, hq, d_qk = q.shape
+    _, sk, hk, d_v = v.shape
+    return (
+        get_gfx() == "gfx950" and q.dtype == jnp.bfloat16
+        and (d_qk, d_v) == (192, 128) and k.shape[-1] == d_qk
+        and sq == sk and hq % hk == 0
+        and config.use_asm_v3 and config.dropout_p == 0.0 and not config.return_randval
+        and config.wl == -1 and config.wr == -1 and config.logits_soft_cap == 0.0
+        and config.min_seqlen_q == 0 and (config.cp_size or 1) <= 1
+        and bias.size == 0 and alibi.size == 0
+        and (q_descale is None or q_descale.size == 0)
+    )
+
+
+def _mha_fwd_local(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
+                   cu_sq_log, cu_skv_log, config, q_descale, k_descale, v_descale):
+    """One device's forward; full bf16 192/128 rows go through OPUS."""
+    if not _batch_fwd_via_opus(q, k, v, bias, alibi, config, q_descale):
+        return _mha_fwd_raw(q, k, v, cu_sq, cu_skv, out_prov,
+                            bias, alibi, gen, cu_sq_log, cu_skv_log, config,
+                            q_descale=q_descale,
+                            k_descale=k_descale,
+                            v_descale=v_descale)
+    b, sq, hq, _ = q.shape
+    seqstart = jnp.arange(b + 1, dtype=jnp.int32) * sq
+    flat = lambda x: x.reshape(b * sq, *x.shape[2:])
+    cfg = config._replace(max_seqlen_q=sq, max_seqlen_k=sq, zero_tensors=False)
+    out, lse, p, rng = _mha_fwd_raw(
+        flat(q), flat(k), flat(v), seqstart, seqstart, out_prov,
+        bias, alibi, gen, _empty(jnp.int32), _empty(jnp.int32), cfg,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
+    out = out.reshape(b, sq, hq, out.shape[-1])
+    if config.return_lse:
+        lse = lse.reshape(hq, b, sq).transpose(1, 0, 2)
+    return out, lse, p, rng
+
+
+# ---------------------------------------------------------------------------
 # custom_partitioning: forward
 # ---------------------------------------------------------------------------
 
@@ -214,11 +271,9 @@ def _get_rank(t):
 def _mha_fwd_partitioned(q, k, v, cu_sq, cu_skv, out_prov,
                          bias, alibi, gen, cu_sq_log, cu_skv_log,
                          q_descale, k_descale, v_descale, config):
-    return _mha_fwd_raw(q, k, v, cu_sq, cu_skv, out_prov,
-                        bias, alibi, gen, cu_sq_log, cu_skv_log, config,
-                        q_descale=q_descale,
-                        k_descale=k_descale,
-                        v_descale=v_descale)
+    return _mha_fwd_local(q, k, v, cu_sq, cu_skv, out_prov,
+                          bias, alibi, gen, cu_sq_log, cu_skv_log, config,
+                          q_descale, k_descale, v_descale)
 
 
 def _mha_fwd_infer_sharding(config, mesh, arg_shapes, result_shapes):
@@ -266,11 +321,9 @@ def _mha_fwd_partition(config, mesh, arg_shapes, result_shapes):
 
     def _lowered(q, k, v, cu_sq, cu_skv, out_prov, bias, alibi, gen,
                  cu_sq_log, cu_skv_log, q_descale, k_descale, v_descale):
-        return _mha_fwd_raw(q, k, v, cu_sq, cu_skv, out_prov,
-                            bias, alibi, gen, cu_sq_log, cu_skv_log, config,
-                            q_descale=q_descale,
-                            k_descale=k_descale,
-                            v_descale=v_descale)
+        return _mha_fwd_local(q, k, v, cu_sq, cu_skv, out_prov,
+                              bias, alibi, gen, cu_sq_log, cu_skv_log, config,
+                              q_descale, k_descale, v_descale)
 
     return mesh, _lowered, out_shardings, arg_shardings
 
