@@ -8,14 +8,12 @@
 #
 #   DOCKER_BUILDKIT=1 docker build --progress=plain \
 #     -f docker/mxfp4/Dockerfile \
-#     --build-context \
-#       mxfp4-kernels=./jax_aiter/flydsl/kernels/mxfp4 \
 #     --build-arg BUILD_JOBS=32 \
 #     -t jax-aiter-mxfp4:local .
 #
-# The MXFP4 kernel source is license-gated and deliberately absent from Git.
-# It must be supplied as an explicit BuildKit named context. The normal build
-# context excludes it, and the build verifies every authorized source hash.
+# The MXFP4 MoE kernels are the Primus-Turbo kernels vendored in JAX-AITER.
+# The build fails if a license-gated jax_aiter/flydsl/kernels/mxfp4/ tree
+# reaches the image.
 #
 # JAX-AITER's MHA JIT libraries are compiled from the pinned AITER source.
 # This is an offline gfx950 compilation and does not need /dev/kfd, but it can
@@ -173,31 +171,9 @@ RUN git init /opt/maxtext \
 # the rights-gated MXFP4 kernel tree.
 COPY . /opt/jax-aiter
 
-COPY --from=mxfp4-kernels \
-  /ORIGIN.md \
-  /__init__.py \
-  /_buffer_ops.py \
-  /_fwd_kernel_fp4.py \
-  /_gemm_utils.py \
-  /_rt.py \
-  /_wgrad_kernel_fp4.py \
-  /quant_dim0.py \
-  /quant_dim1.py \
-  /opt/jax-aiter/jax_aiter/flydsl/kernels/mxfp4/
-
-COPY --from=mxfp4-kernels \
-  /wholeloop/ORIGIN.md \
-  /wholeloop/__init__.py \
-  /wholeloop/buffer_ops.py \
-  /wholeloop/gemm_helper.py \
-  /wholeloop/gemm_mxfp4_kernel.py \
-  /wholeloop/grouped_gemm_mxfp4_kernel.py \
-  /opt/jax-aiter/jax_aiter/flydsl/kernels/mxfp4/wholeloop/
-
-RUN mkdir -p /opt/jax-aiter/third_party \
+RUN test ! -e /opt/jax-aiter/jax_aiter/flydsl/kernels/mxfp4 \
+ && mkdir -p /opt/jax-aiter/third_party \
  && ln -s /opt/aiter /opt/jax-aiter/third_party/aiter \
- && cd /opt/jax-aiter/jax_aiter/flydsl/kernels/mxfp4 \
- && sha256sum -c /opt/jax-aiter/docker/mxfp4/mxfp4-kernels.sha256 \
  && python3 - "${AITER_REF}" <<'PY'
 import ast
 from pathlib import Path

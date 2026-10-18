@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+# Thin TensorWave Pollara networking layer over the validated ROCm 10 image.
+#
+# Build from the JAX-AITER repository root:
+#
+#   docker build --progress=plain \
+#     -f docker/mxfp4/Dockerfile.tensorwave \
+#     -t jax-aiter-mxfp4:rocm10-opus-tw .
+
+ARG BASE_IMAGE=docker.io/rocm/jax-private@sha256:88c877f48e5d121b2d35b7b231ebfc71db8ccb1af83c93cf42b711acbe6d9460
+FROM ${BASE_IMAGE}
+
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG AINIC_VERSION=1.117.5-a-77
+ARG AINIC_REPO=https://repo.radeon.com
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# TensorWave reports nicctl 1.117.5-a-77. Pollara's libionic userspace must
+# match that host stack; generic rdma-core alone is not sufficient.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gnupg \
+ && install -d -m 0755 /etc/apt/keyrings \
+ && curl --fail --location --retry 5 "${AINIC_REPO}/rocm/rocm.gpg.key" \
+      | gpg --dearmor --yes -o /etc/apt/keyrings/rocm.gpg \
+ && . /etc/os-release \
+ && printf '%s\n' \
+      'Types: deb' \
+      "URIs: ${AINIC_REPO}/amdainic/pensando/ubuntu/${AINIC_VERSION}" \
+      "Suites: ${VERSION_CODENAME}" \
+      'Components: main' \
+      'Signed-By: /etc/apt/keyrings/rocm.gpg' \
+      > /etc/apt/sources.list.d/amdainic.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bc \
+      ethtool \
+      ibverbs-utils \
+      infiniband-diags \
+      iproute2 \
+      iputils-ping \
+      jq \
+      libibverbs1 \
+      libionic1 \
+      pciutils \
+      perftest \
+      rdma-core \
+ && rm -rf /var/lib/apt/lists/*
+
+# Not grep -q: it exits at the first match, and under pipefail the writer's
+# SIGPIPE (exit 141) fails the step.
+RUN ldconfig \
+ && ldconfig -p | grep -F 'libibverbs.so.1' >/dev/null \
+ && ldconfig -p | grep -F 'libionic' >/dev/null \
+ && command -v ibv_devices \
+ && command -v ib_write_bw \
+ && dpkg-query -W -f='${Package}=${Version}\n' \
+      libibverbs1 libionic1 rdma-core
+
+LABEL org.opencontainers.image.tensorwave.ainic="${AINIC_VERSION}"
+LABEL org.opencontainers.image.tensorwave.network="Pollara RoCE"
