@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Adds Primus-Turbo's intranode DeepEP JAX module, built from source, to an
+# MXFP4 image (docker/mxfp4/Dockerfile, optionally plus Dockerfile.tensorwave).
+#
+# Build from the JAX-AITER repository root:
+#
+#   docker build --progress=plain \
+#     -f docker/mxfp4/Dockerfile.deepep \
+#     --build-arg BASE_IMAGE=<MXFP4 image> \
+#     -t jax-aiter-mxfp4:deepep .
+
+ARG BASE_IMAGE
+ARG PRIMUS_TURBO_REPO=https://github.com/AMD-AGI/Primus-Turbo.git
+ARG PRIMUS_TURBO_REF=e2d9f1d7285f3e77e9f02bdc2ad802f9322ab5f0
+
+FROM ${BASE_IMAGE} AS deepep
+
+ARG PRIMUS_TURBO_REPO
+ARG PRIMUS_TURBO_REF
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Only csrc/ and primus_turbo/ are read; no submodule is needed.
+RUN git init /src/Primus-Turbo \
+ && git -C /src/Primus-Turbo remote add origin "${PRIMUS_TURBO_REPO}" \
+ && git -C /src/Primus-Turbo fetch --depth=1 --filter=blob:none origin "${PRIMUS_TURBO_REF}" \
+ && git -C /src/Primus-Turbo checkout --detach FETCH_HEAD \
+ && test "$(git -C /src/Primus-Turbo rev-parse HEAD)" = "${PRIMUS_TURBO_REF}"
+
+COPY docker/mxfp4/deepep /src/deepep
+
+# The build links its package to the sources; copy it with links resolved.
+RUN PT=/src/Primus-Turbo PT_COMMIT="${PRIMUS_TURBO_REF}" OUT=/build/deepep \
+      bash /src/deepep/build_deepep_jax.sh \
+ && mkdir -p /opt/primus-turbo-deepep \
+ && cp -rL /build/deepep/pkg/primus_turbo /opt/primus-turbo-deepep/ \
+ && cp /src/Primus-Turbo/LICENSE /src/Primus-Turbo/LICENSE-APACHE /opt/primus-turbo-deepep/ \
+ && find /opt/primus-turbo-deepep -type d -name __pycache__ -prune -exec rm -rf {} +
+
+FROM ${BASE_IMAGE}
+
+ARG PRIMUS_TURBO_REF
+
+COPY --from=deepep /opt/primus-turbo-deepep /opt/primus-turbo-deepep
+
+ENV PYTHONPATH=/opt/primus-turbo-deepep:${PYTHONPATH}
+
+LABEL org.opencontainers.image.primus-turbo="${PRIMUS_TURBO_REF}"
+
+RUN cd / && python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+expected = {
+    "maxtext": "/opt/maxtext/src/maxtext/",
+    "jax_aiter": "/opt/jax-aiter/jax_aiter/",
+    "primus_turbo": "/opt/primus-turbo-deepep/primus_turbo/",
+}
+for name, prefix in expected.items():
+    origin = importlib.util.find_spec(name).origin
+    assert origin.startswith(prefix), (name, origin)
+    print(f"{name}: {origin}")
+assert importlib.util.find_spec("jax_aiter.flydsl.kernels.mxfp4") is None
+assert "jax_aiter_mxfp4_dual_grad_cast" in Path(
+    "/opt/maxtext/src/maxtext/configs/base.yml").read_text()
+
+import primus_turbo.jax as ptj
+
+ptj.initialize()
+from primus_turbo.jax._C import registrations
+from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch, setup
+
+print("deepep registrations:", sorted(registrations()))
+PY
