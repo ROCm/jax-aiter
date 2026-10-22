@@ -17,6 +17,17 @@ and `create_llvm_ptr` from `ROCm/FlyDSL` `kernels/common/buffer_ops.py` at
 `7dac0826746b158a3d44a7fd323faf2ed02aa2db`. Both are Apache-2.0 (FlyDSL
 Project Contributors, with AMD modifications); see `licenses/Apache-2.0.txt`.
 
+## Primus-Turbo DeepEP image layer
+
+`docker/mxfp4/deepep/bindings_deepep_jax.cpp` is the DeepEP subset of
+`AMD-AGI/Primus-Turbo` `csrc/jax/bindings_jax.cpp`, and
+`docker/mxfp4/deepep/primitive__init__.py` is its
+`primus_turbo/jax/primitive/__init__.py` reduced to the MoE primitives, both at
+commit `e2d9f1d7285f3e77e9f02bdc2ad802f9322ab5f0` (MIT, Advanced Micro
+Devices, Inc.; Primus-Turbo `LICENSE`). `Dockerfile.deepep` compiles the
+remaining DeepEP sources from that Primus-Turbo commit and copies its `LICENSE`
+and `LICENSE-APACHE` into the image.
+
 ## MXFP4 casts
 
 `jax_aiter/flydsl/kernels/primus_turbo_mxfp4_quant.py` applies Primus-Turbo's
