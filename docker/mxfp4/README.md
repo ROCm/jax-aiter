@@ -37,3 +37,27 @@ docker run --rm -it \
 JAX-AITER is under `/opt/jax-aiter`, pinned AITER under `/opt/aiter`, and
 MaxText under `/opt/maxtext`. The image contains the software environment, not
 project datasets, tokenizers, model checkpoints, or benchmark launch configs.
+
+## Multi-node MoE layers
+
+The DeepSeek-V3 MXFP4 recipe also needs Primus-Turbo's intranode DeepEP
+dispatch. Clusters with AMD Pollara (AINIC) RoCE adapters need the matching
+`libionic` userspace first. Build both on top of the image above:
+
+```bash
+# Pollara RoCE userspace; the version must match the hosts' nicctl.
+docker build --progress=plain \
+  -f docker/mxfp4/Dockerfile.tensorwave \
+  --build-arg BASE_IMAGE=jax-aiter-mxfp4:local \
+  --build-arg AINIC_VERSION=1.117.5-a-77 \
+  -t jax-aiter-mxfp4:local-ainic .
+
+# Primus-Turbo DeepEP, compiled from the pinned Primus-Turbo commit.
+docker build --progress=plain \
+  -f docker/mxfp4/Dockerfile.deepep \
+  --build-arg BASE_IMAGE=jax-aiter-mxfp4:local-ainic \
+  -t jax-aiter-mxfp4:local-deepep .
+```
+
+The DeepEP module is under `/opt/primus-turbo-deepep`, ahead of the other
+packages on `PYTHONPATH`.
