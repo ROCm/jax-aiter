@@ -5,9 +5,10 @@
 #
 #   docker build --progress=plain \
 #     -f docker/mxfp4/Dockerfile.tensorwave \
-#     -t jax-aiter-mxfp4:rocm10-opus-tw .
+#     --build-arg BASE_IMAGE=<MXFP4 image> \
+#     -t jax-aiter-mxfp4:local-ainic .
 
-ARG BASE_IMAGE=docker.io/rocm/jax-private@sha256:88c877f48e5d121b2d35b7b231ebfc71db8ccb1af83c93cf42b711acbe6d9460
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 USER root
