@@ -132,15 +132,21 @@ def _rocm_toolkit_path() -> Path:
     lld_wrapper = toolkit / "llvm" / "bin" / "ld.lld"
     amdgcn_link = toolkit / "amdgcn"
     lld_wrapper.parent.mkdir(parents=True, exist_ok=True)
+    # Several processes on one node may build this shim concurrently.
     if not amdgcn_link.exists():
-        amdgcn_link.symlink_to(real_amdgcn, target_is_directory=True)
+        try:
+            amdgcn_link.symlink_to(real_amdgcn, target_is_directory=True)
+        except FileExistsError:
+            pass
     if not lld_wrapper.exists():
-        lld_wrapper.write_text(
+        tmp_wrapper = lld_wrapper.with_name(f".ld.lld.{os.getpid()}.tmp")
+        tmp_wrapper.write_text(
             "#!/bin/sh\n"
             f'exec "{real_lld}" "$@"\n',
             encoding="utf-8",
         )
-        lld_wrapper.chmod(0o755)
+        tmp_wrapper.chmod(0o755)
+        os.replace(tmp_wrapper, lld_wrapper)
     if not _valid_rocm_toolkit(toolkit):
         raise RuntimeError(f"Failed to construct ROCm toolkit shim at {toolkit}")
     return toolkit
