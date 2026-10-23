@@ -28,20 +28,16 @@ def _load_library() -> ctypes.CDLL:
         if _library is not None:
             return _library
 
-        path = ja_config.get_jax_aiter_lib_dir() / _BRIDGE_LIBRARY
-        if not path.is_file():
+        from ..ffi import registry
+
+        if registry.find_standalone_module(_BRIDGE_LIBRARY) is None:
             raise FileNotFoundError(
-                f"Triton bridge not found at {path}. "
+                f"Triton bridge {_BRIDGE_LIBRARY} not found (JA_TRITON_BRIDGE_LIB "
+                f"or {ja_config.get_jax_aiter_lib_dir()}). "
                 "Run `make -f Makefile.triton bridge` in the jax-aiter checkout."
             )
-
-        library = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
-        library.TritonBridgeRegister.restype = ctypes.c_int32
-        library.TritonBridgeRegister.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint64,
-            ctypes.c_char_p,
-            ctypes.c_int32,
+        library = registry.standalone_module_handle(_BRIDGE_LIBRARY)
+        tail = [
             ctypes.c_int32,
             ctypes.c_int32,
             ctypes.c_int32,
@@ -50,6 +46,15 @@ def _load_library() -> ctypes.CDLL:
             ctypes.POINTER(ctypes.c_int32),
             ctypes.c_int32,
         ]
+        head = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p]
+        if hasattr(library, "TritonBridgeRegisterOrdinals"):
+            library.TritonBridgeRegisterOrdinals.restype = ctypes.c_int32
+            library.TritonBridgeRegisterOrdinals.argtypes = (
+                head + [ctypes.POINTER(ctypes.c_int32), ctypes.c_int32] + tail
+            )
+        else:
+            library.TritonBridgeRegister.restype = ctypes.c_int32
+            library.TritonBridgeRegister.argtypes = head + [ctypes.c_int32] + tail
         for name in (
             "TritonBridgeMaxArgs",
             "TritonBridgeMaxDevices",
@@ -94,7 +99,7 @@ def max_compiles() -> int:
 def register_kernel(
     hsaco: bytes,
     kernel_name: str,
-    num_devices: int,
+    ordinals: list[int],
     num_warps: int,
     num_ctas: int,
     shared: int,
@@ -105,16 +110,34 @@ def register_kernel(
 ) -> int:
     if not hsaco:
         raise ValueError("HSACO blob is empty")
-    if num_devices < 1 or num_devices > max_devices():
-        raise ValueError(f"Unsupported device count {num_devices}")
+    ordinals = [int(ordinal) for ordinal in ordinals]
+    if (
+        not ordinals
+        or len(set(ordinals)) != len(ordinals)
+        or min(ordinals) < 0
+        or max(ordinals) >= max_devices()
+    ):
+        raise ValueError(f"Unsupported device ordinals {ordinals}")
+    library = _load_library()
+    if hasattr(library, "TritonBridgeRegisterOrdinals"):
+        register = library.TritonBridgeRegisterOrdinals
+        devices = [(ctypes.c_int32 * len(ordinals))(*ordinals), len(ordinals)]
+    elif sorted(ordinals) == list(range(len(ordinals))):
+        register = library.TritonBridgeRegister
+        devices = [len(ordinals)]
+    else:
+        raise RuntimeError(
+            f"Triton bridge at {library._name} cannot register device ordinals "
+            f"{ordinals}; rebuild it with `make -f Makefile.triton bridge`"
+        )
     kinds = (ctypes.c_int32 * len(abi_kinds))(*abi_kinds)
     blob = ctypes.create_string_buffer(hsaco, len(hsaco))
     index = int(
-        _load_library().TritonBridgeRegister(
+        register(
             ctypes.cast(blob, ctypes.c_void_p),
             len(hsaco),
             kernel_name.encode("utf-8"),
-            int(num_devices),
+            *devices,
             int(num_warps),
             int(num_ctas),
             int(shared),
