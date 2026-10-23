@@ -241,6 +241,41 @@ def test_wholeloop_dw_schedules_agree_bitwise():
     _assert_dw_matches_reference(default, operands, sizes)
 
 
+@pytest.mark.parametrize("out_rows,out_cols", [(1024, 4096), (4096, 1024)])
+def test_wholeloop_dw_shape_table_agrees_bitwise(out_rows, out_cols):
+    from jax_aiter.flydsl.kernels.primus_turbo.grouped_gemm import (
+        grouped_gemm_mxfp4_kernel,
+    )
+    from jax_aiter.ops import moe_mxfp4
+
+    experts = 64
+    rows = experts * moe_mxfp4._DW_SCHEDULE_ROWS[0]
+    outside = experts * (moe_mxfp4._DW_SCHEDULE_ROWS[1] + 256)
+    table = moe_mxfp4._DW_SCHEDULES[(out_rows, out_cols, experts)]
+    assert moe_mxfp4._dw_schedule(rows, experts, out_rows, out_cols) == table
+    fallback = moe_mxfp4._dw_schedule(outside, experts, out_rows, out_cols)
+    assert fallback == grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(
+        outside, experts, out_rows, out_cols
+    )
+    assert fallback != table
+    for shape in ((7168, 2048, 32), (2048, 7168, 32), (4096, 7168, 32)):
+        assert moe_mxfp4._dw_schedule(rows, shape[2], *shape[:2]) == (
+            grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(
+                rows, shape[2], *shape[:2]
+            )
+        )
+
+    sizes = np.random.default_rng(3).choice([0, 4, 12, 20], experts) * 256
+    bounds = _bounds(sizes)
+    operands = _dw_operands(11, rows, out_rows, out_cols, int(bounds[-1]))
+    tabled = jax.jit(grouped_mxfp4_dw_wholeloop)(*operands, bounds)
+    selected = jax.jit(
+        functools.partial(grouped_mxfp4_dw_wholeloop, schedule_rows=outside)
+    )(*operands, bounds)
+    np.testing.assert_array_equal(_bits(tabled), _bits(selected))
+    _assert_dw_matches_reference(tabled, operands, sizes)
+
+
 def test_wholeloop_rejects_unsupported_shapes():
     def forward_operands(rows, contraction, output, experts):
         return (
