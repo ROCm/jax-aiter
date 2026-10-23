@@ -430,25 +430,31 @@ def _compile_module(
     devices = jax.local_devices(backend="gpu")
     if not devices:
         raise RuntimeError("FlyDSL compilation requires a local ROCm device")
-    if [device.local_hardware_id for device in devices] != list(range(len(devices))):
-        raise RuntimeError(
-            "FlyDSL bridge currently requires contiguous local GPU ordinals"
-        )
+    hardware_ids = [device.local_hardware_id for device in devices]
+    if len(set(hardware_ids)) != len(hardware_ids) or min(hardware_ids) < 0:
+        raise RuntimeError("FlyDSL bridge requires distinct local GPU ordinals")
 
     saved_device = hip_get_device()
-    function_ptrs: list[int] = []
+    pointers_by_id: dict[int, int] = {}
     try:
-        for device in devices:
-            hip_set_device(device.local_hardware_id)
+        for hardware_id in hardware_ids:
+            hip_set_device(hardware_id)
             artifact = CompiledArtifact(compiled, function_name, source_ir)
             function_executable = artifact._get_func_exe()
             pointer = ctypes.cast(function_executable, ctypes.c_void_p).value
             if pointer is None:
                 raise RuntimeError("FlyDSL returned a null compiled function")
-            function_ptrs.append(pointer)
+            pointers_by_id[hardware_id] = pointer
             _ARTIFACTS.append(artifact)
     finally:
         hip_set_device(saved_device)
+    # The bridge indexes functions by device ordinal and rejects null entries.
+    # A process with one GPU per rank never launches on the ordinals it does
+    # not own, so those slots reuse an owned entry.
+    owned = pointers_by_id[hardware_ids[0]]
+    function_ptrs = [
+        pointers_by_id.get(ordinal, owned) for ordinal in range(max(hardware_ids) + 1)
+    ]
 
     stable_key = int(key[:16], 16) & ((1 << 63) - 1)
     compile_index = register_compile(
