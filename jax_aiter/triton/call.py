@@ -16,7 +16,7 @@ from jax.extend.core import Primitive
 from jax.interpreters import mlir
 from jax.interpreters import xla as _xla
 
-from .bridge import ensure_target_registered, max_devices, register_kernel
+from .bridge import ensure_target_registered, register_kernel
 from .compile import abi_kind, compile_hsaco, compile_key, prepare_aiter_triton
 
 _INPUT_BUFFER = 0
@@ -75,11 +75,11 @@ def _ensure_compiled(fn, launch: TritonLaunch) -> tuple[int, int]:
         hsaco = kernel.asm.get("hsaco") or kernel.kernel
         key = compile_key(bytes(hsaco), kernel.name)
         abi = [abi_kind(typ) for _name, typ in launch.runtime_types]
-        devices = min(len(jax.local_devices()), max_devices())
+        ordinals = [d.local_hardware_id for d in jax.local_devices(backend="gpu")]
         index = register_kernel(
             bytes(hsaco),
             kernel.name,
-            devices,
+            ordinals,
             int(kernel.metadata.num_warps),
             int(kernel.metadata.num_ctas),
             int(kernel.metadata.shared),

@@ -13,6 +13,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -91,17 +92,28 @@ int32_t AbiSize(int32_t kind) {
 
 }  // namespace
 
+// Loads the module only on the listed HIP ordinals. With one GPU per process,
+// XLA dispatches on the physical ordinal, and touching other GPUs would create
+// HIP state there; unlisted slots stay null and dispatch rejects them.
 extern "C" __attribute__((visibility("default"))) int32_t
-TritonBridgeRegister(const uint8_t* hsaco, uint64_t hsaco_len,
-                     const char* kernel_name, int32_t num_devices,
-                     int32_t num_warps, int32_t num_ctas, int32_t shared,
-                     int32_t warp_size, int64_t compile_key,
-                     const int32_t* abi_kinds, int32_t num_params) {
+TritonBridgeRegisterOrdinals(const uint8_t* hsaco, uint64_t hsaco_len,
+                             const char* kernel_name, const int32_t* ordinals,
+                             int32_t num_ordinals, int32_t num_warps,
+                             int32_t num_ctas, int32_t shared,
+                             int32_t warp_size, int64_t compile_key,
+                             const int32_t* abi_kinds, int32_t num_params) {
   if (hsaco == nullptr || hsaco_len == 0 || kernel_name == nullptr) {
     return -1;
   }
-  if (num_devices < 1 || num_devices > kMaxDevices) {
+  if (ordinals == nullptr || num_ordinals < 1 || num_ordinals > kMaxDevices) {
     return -1;
+  }
+  int32_t num_devices = 0;
+  for (int32_t i = 0; i < num_ordinals; ++i) {
+    if (ordinals[i] < 0 || ordinals[i] >= kMaxDevices) {
+      return -1;
+    }
+    num_devices = std::max(num_devices, ordinals[i] + 1);
   }
   if (num_params < 0 || num_params > kMaxArgs - 2) {
     return -1;
@@ -143,7 +155,8 @@ TritonBridgeRegister(const uint8_t* hsaco, uint64_t hsaco_len,
     return -3;
   }
 
-  for (int32_t device = 0; device < num_devices; ++device) {
+  for (int32_t i = 0; i < num_ordinals; ++i) {
+    const int32_t device = ordinals[i];
     status = hipSetDevice(device);
     if (status != hipSuccess) {
       (void)hipSetDevice(saved);
