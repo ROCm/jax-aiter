@@ -23,6 +23,17 @@ _COL_TILE = 128  # rows and columns of the column-wise cast's tiles
 _WHOLELOOP_ALIGNMENT = 256
 _INT32_MAX = (1 << 31) - 1
 
+# dW schedules (group_m, num_xcds, group_n, streaming_store, wg_tiles) keyed by
+# (out_rows, out_cols, experts), for shapes whose best schedule follows the
+# output aspect rather than the kernel selector's per-group-rows threshold.
+# Each entry holds only over the measured per-expert token rows below; other
+# rows fall back to the selector.
+_DW_SCHEDULES = {
+    (1024, 4096, 64): (2, 1, 0, True, 1),
+    (4096, 1024, 64): (4, 1, 6, True, 1),
+}
+_DW_SCHEDULE_ROWS = (5376, 15616)
+
 
 def _row_chunks(
     rows: int,
@@ -646,6 +657,18 @@ def grouped_mxfp4_fwd_da_wholeloop(
     return jnp.concatenate(outputs, axis=0)
 
 
+def _dw_schedule(token_rows, experts, out_rows, out_cols):
+    from ..flydsl.kernels.primus_turbo.grouped_gemm import grouped_gemm_mxfp4_kernel
+
+    schedule = _DW_SCHEDULES.get((out_rows, out_cols, experts))
+    low, high = _DW_SCHEDULE_ROWS
+    if schedule is not None and low <= token_rows // experts <= high:
+        return schedule
+    return grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(
+        token_rows, experts, out_rows, out_cols
+    )
+
+
 def grouped_mxfp4_dw_wholeloop(
     grad_output_transposed,
     grad_output_scales,
@@ -706,9 +729,7 @@ def grouped_mxfp4_dw_wholeloop(
         "grouped dW output", experts * out_rows * out_cols
     )
 
-    from ..flydsl.kernels.primus_turbo.grouped_gemm import grouped_gemm_mxfp4_kernel
-
-    schedule = grouped_gemm_mxfp4_kernel._select_gmxfp4_wgrad_cfg(
+    schedule = _dw_schedule(
         token_rows if schedule_rows is None else int(schedule_rows),
         experts,
         out_rows,
