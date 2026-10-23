@@ -13,6 +13,7 @@ from typing import Any
 _IMPORT_LOCK = threading.Lock()
 _AITER_READY = False
 _TRITON_VERSION = "3.8.0"
+_GFX950_SHARED_BYTES = 160 * 1024
 
 
 def _project_deps_triton() -> Path | None:
@@ -174,6 +175,11 @@ def compile_hsaco(
         )
     if kernel.metadata.launch_cooperative_grid:
         raise RuntimeError("Cooperative grid launches are not supported")
+    if kernel.metadata.shared > _GFX950_SHARED_BYTES:
+        raise RuntimeError(
+            f"{kernel.name} needs {kernel.metadata.shared} B of shared memory; "
+            f"gfx950 has {_GFX950_SHARED_BYTES} B"
+        )
     hsaco = kernel.asm.get("hsaco") or kernel.kernel
     if not hsaco:
         raise RuntimeError(f"Compilation produced no HSACO for {fn}")

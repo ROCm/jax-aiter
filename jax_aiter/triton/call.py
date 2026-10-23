@@ -120,7 +120,7 @@ def _lowering(
     packed: list[int] = []
     input_index = 0
     output_index = 0
-    output_set = set(launch.output_positions)
+    output_slot = {pos: slot for slot, pos in enumerate(launch.output_positions)}
     aliased_inputs = {src for src, _ in input_output_aliases}
     logical_inputs = [
         index for index in range(len(array_args)) if index not in aliased_inputs
@@ -134,9 +134,9 @@ def _lowering(
             arg_indices.append(0)
             packed.append(_scalar_to_int64(triton_type, next(scalar_iter)))
             continue
-        if position in output_set:
+        if position in output_slot:
             arg_kinds.append(_OUTPUT_BUFFER)
-            arg_indices.append(output_index)
+            arg_indices.append(output_slot[position])
             packed.append(0)
             output_index += 1
         else:
