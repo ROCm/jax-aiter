@@ -60,6 +60,7 @@ coverage.xml
 build/
 third_party/*
 !third_party/aiter
+!third_party/flash-linear-attention
 
 # Python cache.
 __pycache__/
