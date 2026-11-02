@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MXFP4 FMHA v4 producers and the dense ASM launch, checked against aiter."""
+"""MXFP4/MXFP6 FMHA v4 producers and dense ASM launches, checked against aiter."""
 
 import os
 import sys
@@ -15,6 +15,7 @@ from jax_aiter.ops.mha_v4 import (
     mha_v4_mxfp4_quantize_k,
     mha_v4_mxfp4_quantize_q,
     mha_v4_mxfp4_quantize_v,
+    mha_v4_mxfp6,
 )
 
 _AITER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "third_party", "aiter"))
@@ -312,3 +313,47 @@ def test_mxfp4_hd256_seqlens_k_and_lse_match_aiter():
         )
         torch.cuda.synchronize()
         assert _cosine(got_np[index : index + 1], truncated.float().cpu().numpy()) > 0.999
+
+
+@pytest.mark.parametrize(
+    ("batch", "sequence_q", "sequence_k", "heads_q", "heads_k"),
+    [(1, 256, 256, 1, 1), (2, 512, 384, 4, 2), (1, 257, 320, 16, 4)],
+)
+def test_mxfp6_hd256_dense_matches_aiter(batch, sequence_q, sequence_k, heads_q, heads_k):
+    """The HD256 MXFP6 JAX FFI matches AITER's new native HD256 row."""
+    torch = _torch()
+    from aiter.ops.mha_v4 import AttentionFormat, mha_v4
+
+    q, k, v = _pair_hd(batch, sequence_q, sequence_k, heads_q, heads_k, 256, 61)
+    got = np.asarray(mha_v4_mxfp6(q, k, v), dtype=np.float32)
+    fmt = AttentionFormat.MXFP6
+    ref = mha_v4(_to_torch(torch, q), _to_torch(torch, k), _to_torch(torch, v), fmt, fmt, fmt)
+    torch.cuda.synchronize()
+    ref_np = ref.float().cpu().numpy()
+    assert got.shape == q.shape
+    assert _cosine(got, ref_np) > 0.995
+    assert np.allclose(got, ref_np, rtol=3e-2, atol=3e-2)
+
+
+def test_mxfp6_hd256_jit_and_seqlens_k():
+    """The custom-call producers trace and the ASM row reads per-batch lengths."""
+    torch = _torch()
+    from aiter.ops.mha_v4 import AttentionFormat, mha_v4
+
+    lengths = (96, 160)
+    q, k, v = _pair_hd(2, 256, 192, 4, 2, 256, 67)
+    seqlens = jnp.asarray(lengths, dtype=jnp.int32)
+    launch = jax.jit(lambda q, k, v, seqlens: mha_v4_mxfp6(q, k, v, seqlens_k=seqlens))
+    got = np.asarray(launch(q, k, v, seqlens), dtype=np.float32)
+    fmt = AttentionFormat.MXFP6
+    ref = mha_v4(
+        _to_torch(torch, q),
+        _to_torch(torch, k),
+        _to_torch(torch, v),
+        fmt,
+        fmt,
+        fmt,
+        seqlens_k=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+    )
+    torch.cuda.synchronize()
+    assert _cosine(got, ref.float().cpu().numpy()) > 0.995

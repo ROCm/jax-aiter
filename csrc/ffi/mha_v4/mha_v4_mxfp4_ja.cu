@@ -44,10 +44,22 @@ constexpr int64_t kQueryTile = 256;
 constexpr int64_t kKvTile = 128;
 constexpr int64_t kKvLookahead = 2 * kKvTile;
 constexpr int kMxfp4Format = 9;
+constexpr int kMxfp6Format = 7;
 constexpr int kBf16Format = 2;
 constexpr int kMxScale = 5;
 constexpr int kScaleNone = 0;
 constexpr int kMaxDevices = 16;
+constexpr int64_t kMxfp6HeadDim = 256;
+constexpr int64_t kMxfp6QRowBytes = 192;
+constexpr int64_t kMxfp6QBlocks = 8;
+constexpr int64_t kMxfp6KTileBytes = 13312;
+constexpr int64_t kMxfp6KTileTokens = 128;
+constexpr int64_t kMxfp6KRowBytes = 208;
+constexpr int64_t kMxfp6KSlack = 256;
+constexpr int64_t kMxfp6KScaleSlack = 64;
+constexpr int64_t kMxfp6VTileBytes = 24576;
+constexpr int64_t kMxfp6VScaleTileBytes = 1024;
+constexpr int64_t kMxfp6VSlack = 256;
 
 struct PointerSlot {
   void* value;
@@ -225,6 +237,25 @@ ffi::Error bf16_bshd(const ffi::AnyBuffer& buf, const char* name, int64_t* b, in
   return ffi::Error::Success();
 }
 
+ffi::Error bf16_bshd256(const ffi::AnyBuffer& buf, const char* name, int64_t* b, int64_t* s,
+                        int64_t* h) {
+  auto dims = buf.dimensions();
+  if (buf.element_type() != ffi::DataType::BF16 || dims.size() != 4 || dims[3] != kMxfp6HeadDim) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                      std::string(name) + " must be bfloat16 [B, S, H, 256]");
+  }
+  const int64_t numel = dims[0] * dims[1] * dims[2] * dims[3];
+  if (static_cast<int64_t>(buf.size_bytes()) != numel * 2 || dims[0] <= 0 || dims[1] <= 0 ||
+      dims[2] <= 0) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument,
+                      std::string(name) + " must be a non-empty contiguous BSHD tensor");
+  }
+  *b = dims[0];
+  *s = dims[1];
+  *h = dims[2];
+  return ffi::Error::Success();
+}
+
 aiter_tensor_t tensor_from(void* ptr, std::initializer_list<int64_t> dims, AiterDtype dtype,
                            int device) {
   aiter_tensor_t tensor{};
@@ -280,6 +311,21 @@ const fmha_v4_fwdConfig* find_mxfp4(const std::string& arch, int64_t head_dim) {
         cfg.q_scale_mode == kMxScale && cfg.k_scale_mode == kMxScale &&
         cfg.v_scale_mode == kMxScale && cfg.o_scale_mode == kScaleNone && cfg.hdim_q == head_dim &&
         cfg.hdim_v == head_dim && cfg.mask == 0 && cfg.mode == 0) {
+      return &cfg;
+    }
+  }
+  return nullptr;
+}
+
+const fmha_v4_fwdConfig* find_mxfp6(const std::string& arch) {
+  for (const auto& entry : cfg_fmha_v4_fwd) {
+    const auto& cfg = entry.second;
+    if (cfg.arch == arch && cfg.q_format == kMxfp6Format && cfg.k_format == kMxfp6Format &&
+        cfg.v_format == kMxfp6Format && cfg.v_pack == 1 && cfg.o_format == kBf16Format &&
+        cfg.q_scale_mode == kMxScale && cfg.k_scale_mode == kMxScale &&
+        cfg.v_scale_mode == kMxScale && cfg.o_scale_mode == kScaleNone &&
+        cfg.hdim_q == kMxfp6HeadDim && cfg.hdim_v == kMxfp6HeadDim && cfg.mask == 0 &&
+        cfg.mode == 0) {
       return &cfg;
     }
   }
@@ -560,6 +606,220 @@ ffi::Error MhaV4Mxfp4Fwd_Bridge(hipStream_t stream, ffi::AnyBuffer q, ffi::AnyBu
   return ffi::Error::Success();
 }
 
+ffi::Error MhaV4Mxfp6QuantQ_Bridge(hipStream_t stream, ffi::AnyBuffer q,
+                                   ffi::Result<ffi::AnyBuffer> packed,
+                                   ffi::Result<ffi::AnyBuffer> scale, float multiplier) {
+  int64_t b = 0, s = 0, h = 0;
+  if (auto err = bf16_bshd256(q, "Q", &b, &s, &h); !err.success()) return err;
+  const int64_t packed_n = b * s * h * kMxfp6QRowBytes;
+  const int64_t scale_n = b * s * h * kMxfp6QBlocks;
+  auto dims = packed->dimensions();
+  if (packed->element_type() != ffi::DataType::U8 || dims.size() != 4 || dims[0] != b ||
+      dims[1] != s || dims[2] != h || dims[3] != kMxfp6QRowBytes) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "MXFP6 Q must be uint8 [B, S, H, 192]");
+  }
+  if (auto err = u8_bytes(*scale, "Q scale", scale_n); !err.success()) return err;
+  const int dev = device_from_ptr(q.untyped_data());
+  hipError_t derr = hipSetDevice(dev);
+  if (derr != hipSuccess) return ffi::Error(ffi::ErrorCode::kInternal, hipGetErrorString(derr));
+  auto input = tensor_from(const_cast<void*>(q.untyped_data()), {b, s, h * 2, kHeadDim},
+                           AITER_DTYPE_bf16, dev);
+  // The AITER Q producer is unchanged hd128 code. Its two logical heads are
+  // contiguous in the JAX HD256 output, which is therefore a reshape only.
+  auto out = tensor_from(packed->untyped_data(), {b, s, h * 2, 96}, AITER_DTYPE_u8, dev);
+  auto scales = tensor_from(scale->untyped_data(), {b, s, h * 2, 4}, AITER_DTYPE_u8, dev);
+  StreamGuard guard(stream);
+  return call_quant("MXFP6 Q", [&] {
+    aiter::torch_itfs::rotate_activation_mxfp6_quant(out, scales, input, multiplier);
+  });
+}
+
+ffi::Error MhaV4Mxfp6QuantK_Bridge(hipStream_t stream, ffi::AnyBuffer k, ffi::AnyBuffer mean,
+                                   ffi::Result<ffi::AnyBuffer> raw,
+                                   ffi::Result<ffi::AnyBuffer> scale) {
+  int64_t b = 0, s = 0, h = 0;
+  if (auto err = bf16_bshd256(k, "K", &b, &s, &h); !err.success()) return err;
+  const int64_t tiles = ceil_div(s, kMxfp6KTileTokens);
+  const int64_t payload = b * h * 2 * tiles * kMxfp6KTileBytes;
+  const int64_t raw_n = payload + kMxfp6KSlack;
+  const int64_t scale_n = b * s * h * kMxfp6QBlocks + kMxfp6KScaleSlack;
+  if (auto err = u8_bytes(*raw, "K", raw_n); !err.success()) return err;
+  if (auto err = u8_bytes(*scale, "K scale", scale_n); !err.success()) return err;
+  const int dev = device_from_ptr(k.untyped_data());
+  hipError_t derr = hipSetDevice(dev);
+  if (derr != hipSuccess) return ffi::Error(ffi::ErrorCode::kInternal, hipGetErrorString(derr));
+  if (auto err = zero_suffix(stream, raw->untyped_data(), payload, raw_n); !err.success()) return err;
+  if (auto err = zero_suffix(stream, scale->untyped_data(), b * s * h * kMxfp6QBlocks, scale_n);
+      !err.success())
+    return err;
+  aiter_tensor_t mean_tensor{};
+  if (mean.size_bytes() == 0 || mean.untyped_data() == nullptr) {
+    mean_tensor = tensor_from(nullptr, {0}, AITER_DTYPE_fp32, dev);
+  } else {
+    auto dims = mean.dimensions();
+    if (mean.element_type() != ffi::DataType::F32 || dims.size() != 3 || dims[0] != b ||
+        dims[1] != h || dims[2] != kMxfp6HeadDim) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "K mean must be float32 [B, H, 256]");
+    }
+    mean_tensor = tensor_from(const_cast<void*>(mean.untyped_data()), {b, h * 2, kHeadDim},
+                              AITER_DTYPE_fp32, dev);
+  }
+  auto input = tensor_from(const_cast<void*>(k.untyped_data()), {b, s, h * 2, kHeadDim},
+                           AITER_DTYPE_bf16, dev);
+  auto out = tensor_from(raw->untyped_data(), {raw_n}, AITER_DTYPE_u8, dev);
+  auto scales = tensor_from(scale->untyped_data(), {scale_n}, AITER_DTYPE_u8, dev);
+  StreamGuard guard(stream);
+  return call_quant("MXFP6 K", [&] {
+    aiter::torch_itfs::rotate_activation_mxfp6_quant_k(out, scales, input, mean_tensor, 2);
+  });
+}
+
+ffi::Error MhaV4Mxfp6QuantV_Bridge(hipStream_t stream, ffi::AnyBuffer v,
+                                   ffi::Result<ffi::AnyBuffer> raw,
+                                   ffi::Result<ffi::AnyBuffer> scale) {
+  int64_t b = 0, s = 0, h = 0;
+  if (auto err = bf16_bshd256(v, "V", &b, &s, &h); !err.success()) return err;
+  const int64_t tiles = ceil_div(s, kMxfp6KTileTokens);
+  const int64_t raw_n = b * h * tiles * kMxfp6VTileBytes + kMxfp6VSlack;
+  const int64_t scale_n = b * h * tiles * kMxfp6VScaleTileBytes;
+  if (auto err = u8_bytes(*raw, "V", raw_n); !err.success()) return err;
+  if (auto err = u8_bytes(*scale, "V scale", scale_n); !err.success()) return err;
+  const int dev = device_from_ptr(v.untyped_data());
+  hipError_t derr = hipSetDevice(dev);
+  if (derr != hipSuccess) return ffi::Error(ffi::ErrorCode::kInternal, hipGetErrorString(derr));
+  auto input = tensor_from(const_cast<void*>(v.untyped_data()), {b, s, h * 2, kHeadDim},
+                           AITER_DTYPE_bf16, dev);
+  auto out = tensor_from(raw->untyped_data(), {raw_n}, AITER_DTYPE_u8, dev);
+  auto scales = tensor_from(scale->untyped_data(), {b, h, tiles * kMxfp6VScaleTileBytes},
+                            AITER_DTYPE_u8, dev);
+  StreamGuard guard(stream);
+  return call_quant("MXFP6 V", [&] {
+    aiter::torch_itfs::quantize_v_mxfp6_fp6_p(out, scales, input, 2);
+  });
+}
+
+ffi::Error MhaV4Mxfp6Fwd_Bridge(hipStream_t stream, ffi::AnyBuffer q, ffi::AnyBuffer k,
+                                ffi::AnyBuffer v, ffi::AnyBuffer q_scale, ffi::AnyBuffer k_scale,
+                                ffi::AnyBuffer v_scale, ffi::AnyBuffer seqlens_k,
+                                ffi::Result<ffi::AnyBuffer> out, ffi::Result<ffi::AnyBuffer> lse,
+                                int seq_k, int heads_k, float softmax_scale) {
+  auto q_dims = q.dimensions();
+  if (q.element_type() != ffi::DataType::U8 || q_dims.size() != 4 ||
+      q_dims[3] != kMxfp6QRowBytes) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "packed MXFP6 Q must be [B, Sq, Hq, 192]");
+  }
+  const int64_t b = q_dims[0], sq = q_dims[1], hq = q_dims[2], sk = seq_k, hk = heads_k;
+  if (b <= 0 || sq <= 0 || hq <= 0 || sk <= 0 || hk <= 0 || hq % hk != 0) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "MXFP6 MHA shape is empty or GQA is invalid");
+  }
+  const int64_t gqa = hq / hk;
+  if (gqa > 16 || (gqa & (gqa - 1)) != 0) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "GQA ratio must be a power of two <= 16");
+  }
+  const int64_t tiles = ceil_div(sk, kMxfp6KTileTokens);
+  if (auto err = u8_bytes(k, "K", b * hk * 2 * tiles * kMxfp6KTileBytes + kMxfp6KSlack);
+      !err.success())
+    return err;
+  if (auto err = u8_bytes(v, "V", b * hk * tiles * kMxfp6VTileBytes + kMxfp6VSlack);
+      !err.success())
+    return err;
+  if (auto err = u8_bytes(q_scale, "Q scale", b * sq * hq * kMxfp6QBlocks); !err.success())
+    return err;
+  if (auto err = u8_bytes(k_scale, "K scale", b * sk * hk * kMxfp6QBlocks + kMxfp6KScaleSlack);
+      !err.success())
+    return err;
+  if (auto err = u8_bytes(v_scale, "V scale", b * hk * tiles * kMxfp6VScaleTileBytes);
+      !err.success())
+    return err;
+  auto out_dims = out->dimensions();
+  if (out->element_type() != ffi::DataType::BF16 || out_dims.size() != 4 || out_dims[0] != b ||
+      out_dims[1] != sq || out_dims[2] != hq || out_dims[3] != kMxfp6HeadDim) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "out must be bfloat16 [B, Sq, Hq, 256]");
+  }
+  const int dev = device_from_ptr(q.untyped_data());
+  hipError_t derr = hipSetDevice(dev);
+  if (derr != hipSuccess) return ffi::Error(ffi::ErrorCode::kInternal, hipGetErrorString(derr));
+  const fmha_v4_fwdConfig* cfg = find_mxfp6(get_gpu_arch());
+  if (cfg == nullptr) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "no HD256 MXFP6 fmha_v4_fwd code object");
+  }
+  FmhaV4Kernarg args{};
+  std::memset(&args, 0, sizeof(args));
+  args.ptr_o.value = out->untyped_data();
+  args.ptr_q.value = q.untyped_data();
+  args.ptr_k.value = k.untyped_data();
+  args.ptr_v.value = v.untyped_data();
+  args.ptr_q_descale.value = q_scale.untyped_data();
+  args.ptr_k_descale.value = k_scale.untyped_data();
+  args.ptr_v_descale.value = v_scale.untyped_data();
+  std::memcpy(&args.scalar.value, &softmax_scale, sizeof(softmax_scale));
+  const int64_t q_stride_s = hq * kMxfp6QRowBytes;
+  const int64_t q_stride_b = sq * q_stride_s;
+  const int64_t k_stride_h = 2 * tiles * kMxfp6KTileBytes;
+  const int64_t k_stride_b = hk * k_stride_h;
+  const int64_t v_stride_h = tiles * kMxfp6VTileBytes;
+  const int64_t v_stride_b = hk * v_stride_h;
+  const int64_t o_stride_h = kMxfp6HeadDim * 2;
+  const int64_t o_stride_s = hq * o_stride_h;
+  const int64_t o_stride_b = sq * o_stride_s;
+  uint32_t sq_u = 0, sk_u = 0, gqa_u = 0, hq_u = 0, tile_u = 0;
+  if (!fits_u32(sq, &sq_u) || !fits_u32(sk, &sk_u) || !fits_u32(gqa, &gqa_u) ||
+      !fits_u32(hq, &hq_u) || !fits_u32(cfg->ts_qo * q_stride_s, &tile_u) ||
+      !fits_u32(q_stride_b, &args.s_Bs.value) || !fits_u32(q_stride_s, &args.s_Seqs.value) ||
+      !fits_u32(k_stride_b, &args.s_k_Bs.value) ||
+      !fits_u32(kMxfp6KRowBytes, &args.s_k_Seqs.value) ||
+      !fits_u32(k_stride_h, &args.s_k_Hs.value) || !fits_u32(v_stride_b, &args.s_v_Bs.value) ||
+      !fits_u32(kMxfp6QRowBytes, &args.s_v_Seqs.value) ||
+      !fits_u32(v_stride_h, &args.s_v_Hs.value) || !fits_u32(o_stride_b, &args.s_o_Bs.value) ||
+      !fits_u32(o_stride_s, &args.s_o_Seqs.value) || !fits_u32(o_stride_h, &args.s_o_Hs.value) ||
+      !fits_u32(sq * hq * kMxfp6QBlocks, &args.s_descale_q_Bs.value) ||
+      !fits_u32(kMxfp6QBlocks, &args.s_descale_q_Hs.value) ||
+      !fits_u32(sk * hk * kMxfp6QBlocks, &args.s_descale_k_Bs.value) ||
+      !fits_u32(kMxfp6QBlocks, &args.s_descale_k_Hs.value) ||
+      !fits_u32(hk * tiles * kMxfp6VScaleTileBytes, &args.s_descale_v_Bs.value) ||
+      !fits_u32(tiles * kMxfp6VScaleTileBytes, &args.s_descale_v_Hs.value)) {
+    return ffi::Error(ffi::ErrorCode::kInvalidArgument, "MXFP6 MHA shape does not fit kernarg");
+  }
+  args.s_seq_len.value = sq_u;
+  args.s_Ts.value = tile_u;
+  args.s_Hs.value = kMxfp6QRowBytes;
+  args.s_gqa.value = gqa_u;
+  args.s_kv_seq_len.value = sk_u;
+  args.s_qk_head_dim.value = kMxfp6HeadDim;
+  args.s_v_head_dim.value = kMxfp6HeadDim;
+  args.s_q_head_num.value = hq_u;
+  args.s_opt.value = 5;
+  if (nonempty(seqlens_k)) {
+    if (seqlens_k.element_type() != ffi::DataType::S32 || seqlens_k.dimensions().size() != 1 ||
+        seqlens_k.dimensions()[0] < b) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "seqlens_k must be int32 [batch]");
+    }
+    args.ptr_kseq.value = seqlens_k.untyped_data();
+  }
+  if (nonempty(*lse)) {
+    auto dims = lse->dimensions();
+    if (lse->element_type() != ffi::DataType::F32 || dims.size() != 3 || dims[0] != b ||
+        dims[1] != hq || dims[2] != sq) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "lse must be float32 [B, Hq, Sq]");
+    }
+    args.ptr_lse.value = lse->untyped_data();
+    args.s_lse.value = 1;
+    if (!fits_u32(sq * static_cast<int64_t>(sizeof(float)), &args.s_lse_Hs.value)) {
+      return ffi::Error(ffi::ErrorCode::kInvalidArgument, "lse stride does not fit");
+    }
+  }
+  AiterAsmKernel* kernel = nullptr;
+  if (auto err = load_kernel(dev, *cfg, &kernel); !err.success()) return err;
+  size_t arg_size = sizeof(args);
+  try {
+    kernel->launch_kernel({&args, &arg_size, static_cast<int>(ceil_div(sq, cfg->ts_qo)),
+                           static_cast<int>(hq), static_cast<int>(b), 512, 1, 1, stream});
+  } catch (const std::exception& ex) {
+    return ffi::Error(ffi::ErrorCode::kInternal, ex.what());
+  }
+  return ffi::Error::Success();
+}
+
 }  // namespace jax_aiter
 
 #pragma GCC visibility push(default)
@@ -610,6 +870,53 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int>("heads_k")
         .Attr<float>("softmax_scale")
         .Attr<int>("head_dim"),
+    {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    MhaV4Mxfp6QuantQJA, jax_aiter::MhaV4Mxfp6QuantQ_Bridge,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<hipStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Attr<float>("multiplier"),
+    {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    MhaV4Mxfp6QuantKJA, jax_aiter::MhaV4Mxfp6QuantK_Bridge,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<hipStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>(),
+    {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    MhaV4Mxfp6QuantVJA, jax_aiter::MhaV4Mxfp6QuantV_Bridge,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<hipStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>(),
+    {xla::ffi::Traits::kCmdBufferCompatible});
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    MhaV4Mxfp6FwdJA, jax_aiter::MhaV4Mxfp6Fwd_Bridge,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<hipStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::AnyBuffer>()
+        .Attr<int>("seq_k")
+        .Attr<int>("heads_k")
+        .Attr<float>("softmax_scale"),
     {xla::ffi::Traits::kCmdBufferCompatible});
 
 #pragma GCC visibility pop

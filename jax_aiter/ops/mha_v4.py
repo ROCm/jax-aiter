@@ -4,12 +4,13 @@
 
 The code objects live in ``hsa/<arch>/fmha_v4_fwd``. jax-aiter's other MHA
 entry points (``flash_attn_func``) still go through CK / ASM v3. This module
-launches the BF16 dense and sorted-sparse rows, and the MXFP4 dense row
-at head dims 128 and 256. MXFP4 accepts per-batch key lengths and can return
-the log-sum-exp of the quantized scores, with the K-smoothing shift restored.
+launches the BF16 dense and sorted-sparse rows, plus the MXFP4 and MXFP6 dense
+rows at head dims 128 and 256. The MX rows accept per-batch key lengths and
+can return the log-sum-exp of the quantized scores, with the K-smoothing shift
+restored.
 
-MXFP4 uses the FMHA producers (Hadamard Q, coalesced K, FP6-P V), not the
-GEMM ``cast_mxfp4`` layout. FP8, MXFP6, and INT8 rows are still not launched.
+MXFP4 and MXFP6 use the FMHA producers (Hadamard Q, coalesced K, FP6-P V), not
+the GEMM quantization layouts. FP8 and INT8 rows are still not launched.
 """
 
 from __future__ import annotations
@@ -345,6 +346,65 @@ def _mxfp4_fwd_call(batch, sequence, heads, head_dim, lse_shape):
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _mxfp6_q_call(shape):
+    batch, sequence, heads, _ = shape
+    _ensure("MhaV4Mxfp6QuantQJA")
+    return jax.ffi.ffi_call(
+        "MhaV4Mxfp6QuantQJA",
+        (
+            jax.ShapeDtypeStruct((batch, sequence, heads, 192), jnp.uint8),
+            jax.ShapeDtypeStruct((batch, sequence, heads, 8), jnp.uint8),
+        ),
+        has_side_effect=False,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _mxfp6_k_call(batch, sequence, heads):
+    _ensure("MhaV4Mxfp6QuantKJA")
+    tiles = (sequence + 127) // 128
+    raw_bytes = batch * heads * 2 * tiles * 13312 + 256
+    scale_bytes = batch * sequence * heads * 8 + 64
+    return jax.ffi.ffi_call(
+        "MhaV4Mxfp6QuantKJA",
+        (
+            jax.ShapeDtypeStruct((raw_bytes,), jnp.uint8),
+            jax.ShapeDtypeStruct((scale_bytes,), jnp.uint8),
+        ),
+        has_side_effect=False,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _mxfp6_v_call(batch, sequence, heads):
+    _ensure("MhaV4Mxfp6QuantVJA")
+    tiles = (sequence + 127) // 128
+    raw_bytes = batch * heads * tiles * 24576 + 256
+    scale_bytes = batch * heads * tiles * 1024
+    return jax.ffi.ffi_call(
+        "MhaV4Mxfp6QuantVJA",
+        (
+            jax.ShapeDtypeStruct((raw_bytes,), jnp.uint8),
+            jax.ShapeDtypeStruct((scale_bytes,), jnp.uint8),
+        ),
+        has_side_effect=False,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _mxfp6_fwd_call(batch, sequence, heads, lse_shape):
+    _ensure("MhaV4Mxfp6FwdJA")
+    return jax.ffi.ffi_call(
+        "MhaV4Mxfp6FwdJA",
+        (
+            jax.ShapeDtypeStruct((batch, sequence, heads, 256), jnp.bfloat16),
+            jax.ShapeDtypeStruct(lse_shape, jnp.float32),
+        ),
+        has_side_effect=False,
+    )
+
+
 def mha_v4_k_smooth(k):
     """Per-(batch, head, channel) K mean used by the MXFP4 K producer.
 
@@ -503,6 +563,38 @@ def mha_v4_mxfp4(q, k, v, *, softmax_scale=None, return_lse=False, seqlens_k=Non
         heads_k=np.int32(k.shape[2]),
         softmax_scale=np.float32(scale),
         head_dim=np.int32(q.shape[-1]),
+    )
+    if return_lse:
+        return out, _restore_k_mean_in_lse(lse, q, k_mean, scale)
+    return out
+
+
+def mha_v4_mxfp6(q, k, v, *, softmax_scale=None, return_lse=False, seqlens_k=None):
+    """Dense non-causal HD256 MXFP6 FMHA v4. Output is bfloat16 BSHD.
+
+    This launches AITER's gfx950 ``fwd_hd256_mxfp6.co`` row. Its Q/K/V
+    producers operate on a two-half-head HD128 view with ``head_split=2``,
+    which writes the HD256 kernel's native 64-token records directly.
+    """
+    q, k, v = _check_qkv(q, k, v, head_dims=(256,))
+    scale = _scale_of(q, softmax_scale)
+    seqlens = _seqlens_arg(seqlens_k, q.shape[0])
+    k_mean = mha_v4_k_smooth(k)
+    packed_q, q_scale = _mxfp6_q_call(tuple(q.shape))(q, multiplier=np.float32(scale * _LOG2E))
+    raw_k, k_scale = _mxfp6_k_call(q.shape[0], k.shape[1], k.shape[2])(k, k_mean)
+    raw_v, v_scale = _mxfp6_v_call(q.shape[0], v.shape[1], v.shape[2])(v)
+    lse_shape = (q.shape[0], q.shape[2], q.shape[1]) if return_lse else (0,)
+    out, lse = _mxfp6_fwd_call(q.shape[0], q.shape[1], q.shape[2], lse_shape)(
+        packed_q,
+        raw_k,
+        raw_v,
+        q_scale,
+        k_scale,
+        v_scale,
+        seqlens,
+        seq_k=np.int32(k.shape[1]),
+        heads_k=np.int32(k.shape[2]),
+        softmax_scale=np.float32(scale),
     )
     if return_lse:
         return out, _restore_k_mean_in_lse(lse, q, k_mean, scale)
