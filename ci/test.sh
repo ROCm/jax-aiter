@@ -45,11 +45,11 @@ export XLA_FLAGS="--xla_gpu_force_compilation_parallelism=1 --xla_gpu_enable_ncc
 # nothing ships on top of this. See docs/perf/ and the kernels area note.
 PREFILL=tests/test_paged_prefill_ja.py
 if [ -n "$MARKS" ]; then
-  python3 -m pytest -v --reruns 2 -m "$MARKS" --ignore="$PREFILL"
-  python3 -m pytest -v --reruns 2 -m "$MARKS" "$PREFILL"
+  python3 -m pytest -v  -m "$MARKS" --ignore="$PREFILL"
+  python3 -m pytest -v  -m "$MARKS" "$PREFILL"
 else
-  python3 -m pytest -v --reruns 2 --ignore="$PREFILL"
-  python3 -m pytest -v --reruns 2 "$PREFILL"
+  python3 -m pytest -v  --ignore="$PREFILL"
+  python3 -m pytest -v  "$PREFILL"
 fi
 
 echo "[ci/test] smoke + '$TIER' tier passed."

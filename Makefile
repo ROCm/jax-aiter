@@ -61,6 +61,7 @@ RMSNORM_INCLUDES := $(JA_INCLUDES) \
 GEMM_CONFIG_DIR  := build/generated
 GEMM_BF16_CFG    := $(GEMM_CONFIG_DIR)/asm_bf16gemm_configs.hpp
 GEMM_FP4_CFG     := $(GEMM_CONFIG_DIR)/asm_f4gemm_configs.hpp
+FMHA_V4_CFG      := $(GEMM_CONFIG_DIR)/asm_fmha_v4_fwd_configs.hpp
 GEMM_INCLUDES    := $(JA_INCLUDES) -I$(GEMM_CONFIG_DIR)
 
 # Core (non-MHA) FFI shims: shipped in both the lite and full wheels.
@@ -71,8 +72,11 @@ JA_CORE_MODULES := $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
                    $(JA_BUILD_DIR)/cast_mxfp4_ja.so
 
 # MHA FFI shims: full wheel only (the heavy libmha_*.so JIT libs back these).
+# mha_v4_fwd_ja.so launches the fmha_v4_fwd ASM code objects directly and does
+# not need libmha_*.so.
 JA_MHA_MODULES := $(JA_BUILD_DIR)/mha_fwd_ja.so \
-                  $(JA_BUILD_DIR)/mha_bwd_ja.so
+                  $(JA_BUILD_DIR)/mha_bwd_ja.so \
+                  $(JA_BUILD_DIR)/mha_v4_fwd_ja.so
 
 # Full set (unchanged target for `make ja_mods`): core + MHA.
 JA_MODULES := $(JA_CORE_MODULES) $(JA_MHA_MODULES)
@@ -101,6 +105,20 @@ $(JA_BUILD_DIR)/mha_fwd_ja.so: csrc/ffi/mha_fwd/mha_fwd_ja.cu | $(JA_BUILD_DIR)/
 
 $(JA_BUILD_DIR)/mha_bwd_ja.so: csrc/ffi/mha_bwd/mha_bwd_ja.cu | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(JA_INCLUDES) $< -o $@
+
+FMHA_V4_CSVS     := $(wildcard $(AITER_SRC_DIR)/hsa/*/fmha_v4_fwd/fmha_v4_fwd.csv)
+$(FMHA_V4_CFG): $(AITER_SRC_DIR)/hsa/codegen.py $(FMHA_V4_CSVS) | $(GEMM_CONFIG_DIR)/
+	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m fmha_v4_fwd -o $(CURDIR)/$(GEMM_CONFIG_DIR)
+
+# Torch-free launcher for the fmha_v4_fwd ASM objects. ENABLE_CK stays off:
+# this shim only needs AiterAsmKernel, not the CK headers.
+$(JA_BUILD_DIR)/mha_v4_fwd_ja.so: csrc/ffi/mha_v4/mha_v4_fwd_ja.cu \
+		csrc/ffi/mha_v4/mha_v4_mxfp4_ja.cu \
+		$(AITER_SRC_DIR)/csrc/kernels/mha_v4_quant.cu $(FMHA_V4_CFG) | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(filter-out -DENABLE_CK=1,$(JA_CXXFLAGS)) -DENABLE_CK=0 \
+		$(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) \
+		csrc/ffi/mha_v4/mha_v4_fwd_ja.cu csrc/ffi/mha_v4/mha_v4_mxfp4_ja.cu \
+		$(AITER_SRC_DIR)/csrc/kernels/mha_v4_quant.cu -o $@
 
 $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so: csrc/ffi/rmsnorm/rmsnorm_fwd_ja.cu | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(RMSNORM_INCLUDES) $< -o $@
