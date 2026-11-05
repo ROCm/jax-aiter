@@ -153,56 +153,20 @@ __device__ __forceinline__ float ds_swizzle_xor2(float val) {
 // REDUCTION OPERATIONS - Finding Maximum Absolute Value
 // ============================================================================
 
-__device__ __forceinline__ float dpp_max_xor2(float val) {
-    float out;
-    asm volatile(
-        "s_nop 1\n\t"
-        "v_max_f32 %0, %1, %2 "
-        "quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(out)
-        : "v"(val), "v"(val));
-    return out;
-}
-
-__device__ __forceinline__ float dpp_max_xor1(float val) {
-    float out;
-    asm volatile(
-        "s_nop 1\n\t"
-        "v_max_f32 %0, %1, %2 "
-        "quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(out)
-        : "v"(val), "v"(val));
-    return out;
-}
-
 /*
  * Warp Reduction for Max Absolute Value
  * --------------------------------------
- * Reduces 8 values (one per thread in a group) to a single maximum using
- * ds_swizzle for efficient intra-wavefront communication.
- * 
- * Pattern:
- *   Step 1: XOR 4 - reduce 8 values to 4 (threads 0-3, 4-7)
- *   Step 2: XOR 2 - reduce 4 values to 2 (threads 0-1, 2-3)
- *   Step 3: XOR 1 - reduce 2 values to 1 (thread 0)
+ * Reduces 8 values (one per thread in a group) to a single maximum with an
+ * XOR butterfly: lane^4, then lane^2, then lane^1.
  */
 __device__ __forceinline__ float warp_reduce_max_8_dpp(float val) {
-    uint32_t v = float_as_uint(val);
-    uint32_t tmp;
-
-    // Step 1: XOR-4 exchange (cross-quad). Stays on ds_swizzle_b32 —
-    // gfx950 / CDNA4 (gfx9-family) does not support DPP `row_xmask:4`,
-    // and the gfx9-available DPP modifiers (row_shr/row_shl/row_ror/
-    // row_mirror/row_half_mirror) do not produce XOR-4 swap semantics.
-    asm volatile("ds_swizzle_b32 %0, %1 offset:0x101F" : "=v"(tmp) : "v"(v));
-    asm volatile("s_waitcnt lgkmcnt(0)" :::);
-    val = fmaxf(val, uint_as_float(tmp));
-    // Steps 2-3 fuse each DPP exchange with its dependent maximum. The explicit
-    // s_nop supplies the two VALU-write -> DPP-read wait states required by
-    // CDNA4 when inline assembly bypasses LLVM's hazard recognizer.
-    val = dpp_max_xor2(val);
-    val = dpp_max_xor1(val);
-
+    // XOR butterfly within each aligned group of 8 lanes. __shfl_xor is a
+    // compiler builtin, so LLVM inserts the CDNA4 VALU/LDS waits. The previous
+    // raw ds_swizzle_b32 had no memory clobber: the columnwise shared-memory
+    // loads were interleaved with it and came back nondeterministic.
+    val = fmaxf(val, __shfl_xor(val, 4, 8));
+    val = fmaxf(val, __shfl_xor(val, 2, 8));
+    val = fmaxf(val, __shfl_xor(val, 1, 8));
     return val;
 }
 
@@ -858,10 +822,15 @@ void cast_transpose_mxfp4_shuffled(
                 }
             }
 
+            // The rowwise reduction uses the LDS pipe. Drain it before the
+            // columnwise shared-memory loads so those loads cannot observe a
+            // permute still in flight. Every thread in the block reaches here.
+            __syncthreads();
+
             // ================================================================
             // Phase 3: Columnwise Quantization (Vertical Processing)
             // ================================================================
-            
+
             if constexpr (USE_COLWISE) {
                 int local_col = warp_id * 8 + row_in_warp;
                 int global_col = tile_n + local_col;
