@@ -61,7 +61,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 1
@@ -178,7 +178,7 @@ jobs:
       - name: Hand artifacts back to the runner user
         run: sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/dist"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: jax-aiter-alpha2-wheels
           path: dist/jax_aiter-0.1.0a2*.whl
@@ -201,12 +201,12 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Verify validation checkout matches wheel build
         run: test "$(git rev-parse HEAD)" = "${{ needs.build.outputs.built_sha }}"
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: jax-aiter-alpha2-wheels
           path: dist

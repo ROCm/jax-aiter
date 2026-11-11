@@ -62,7 +62,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 1
@@ -127,7 +127,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 1
@@ -170,7 +170,7 @@ jobs:
             "build/aiter_build/${{ matrix.module }}.so"
           ls -lh "build/aiter_build/${{ matrix.module }}.so"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: jit-raw-${{ matrix.module }}
           path: build/aiter_build/${{ matrix.module }}.so
@@ -195,11 +195,11 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: jit-raw-*
           path: build/aiter_build

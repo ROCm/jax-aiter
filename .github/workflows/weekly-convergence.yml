@@ -105,7 +105,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 1
@@ -189,7 +189,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/ci_conv_out"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: weekly-convergence-${{ matrix.arm }}

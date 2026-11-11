@@ -96,7 +96,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           # A shallow superproject cannot be pushed from, and the bump commit
@@ -171,7 +171,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
@@ -213,7 +213,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "build/aiter_build/${{ matrix.module }}.so"
           ls -lh "build/aiter_build/${{ matrix.module }}.so"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nightly-jit-${{ matrix.module }}
           path: build/aiter_build/${{ matrix.module }}.so
@@ -239,13 +239,13 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: nightly-jit-*
           path: build/aiter_build
@@ -337,7 +337,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" dist
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nightly-wheel
           path: dist/*+full-*.whl
@@ -363,12 +363,12 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: nightly-wheel
           path: dist
@@ -516,7 +516,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: nightly-perf-8b-fp4-fsdp8
@@ -546,7 +546,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
@@ -609,7 +609,7 @@ jobs:
     runs-on: build-only-jax-aiter
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           fetch-depth: 0
