@@ -9,6 +9,7 @@
 #   DOCKER_BUILDKIT=1 docker build --progress=plain \
 #     -f docker/mxfp4/Dockerfile \
 #     --build-arg BUILD_JOBS=32 \
+#     --build-arg JAX_AITER_REF="$(git rev-parse HEAD)" \
 #     -t jax-aiter-mxfp4:local .
 #
 # The MXFP4 MoE kernels are the Primus-Turbo kernels vendored in JAX-AITER.
@@ -20,11 +21,15 @@
 # take hours and needs substantial host memory and disk.
 
 ARG BASE_IMAGE=ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0@sha256:8f9cbffd91f7923caf2ee720ba009a61cc1dd50870e77e315673ab9c667cc3f3
-ARG JAX_AITER_REF=95a4323253d8151a6a279f1137808e95a4ffc3bd
+ARG JAX_AITER_REF=
 ARG AITER_REPO=https://github.com/ROCm/aiter.git
-ARG AITER_REF=e4ceb9dd95e12595dc9d87a06eaef79dfd6cdb8c
+ARG AITER_REF=a3158e4800b6080e3adb25eb58bc48686bc1859c
+ARG FLA_REPO=https://github.com/fla-org/flash-linear-attention.git
+# JAX-AITER's third_party/flash-linear-attention submodule commit.
+ARG FLA_REF=c92725e6a4b24c88bdb98b47d90c081f3b966d3b
 ARG MAXTEXT_REPO=https://github.com/ROCm/maxtext.git
-ARG MAXTEXT_REF=5c52aa6d3294100eae94ec68557d1d2e08b51c06
+# Tag mxfp4-moe-blog-20261025-gptoss of ROCm/maxtext.
+ARG MAXTEXT_REF=c886bb4e81ff976d63c4a6c961b69d0d9540d852
 
 FROM ${BASE_IMAGE} AS system
 
@@ -150,6 +155,8 @@ FROM system AS sources
 
 ARG AITER_REPO
 ARG AITER_REF
+ARG FLA_REPO
+ARG FLA_REF
 ARG MAXTEXT_REPO
 ARG MAXTEXT_REF
 
@@ -160,6 +167,12 @@ RUN git init /opt/aiter \
  && git -C /opt/aiter checkout --detach FETCH_HEAD \
  && test "$(git -C /opt/aiter rev-parse HEAD)" = "${AITER_REF}" \
  && git -C /opt/aiter submodule update --init --recursive --depth=1
+
+RUN git init /opt/flash-linear-attention \
+ && git -C /opt/flash-linear-attention remote add origin "${FLA_REPO}" \
+ && git -C /opt/flash-linear-attention fetch --depth=1 --filter=blob:none origin "${FLA_REF}" \
+ && git -C /opt/flash-linear-attention checkout --detach FETCH_HEAD \
+ && test "$(git -C /opt/flash-linear-attention rev-parse HEAD)" = "${FLA_REF}"
 
 RUN git init /opt/maxtext \
  && git -C /opt/maxtext remote add origin "${MAXTEXT_REPO}" \
@@ -174,6 +187,7 @@ COPY . /opt/jax-aiter
 RUN test ! -e /opt/jax-aiter/jax_aiter/flydsl/kernels/mxfp4 \
  && mkdir -p /opt/jax-aiter/third_party \
  && ln -s /opt/aiter /opt/jax-aiter/third_party/aiter \
+ && ln -s /opt/flash-linear-attention /opt/jax-aiter/third_party/flash-linear-attention \
  && python3 - "${AITER_REF}" <<'PY'
 import ast
 from pathlib import Path
@@ -221,14 +235,23 @@ RUN case "${BUILD_JOBS}" in \
 # libmha_bwd.so. build_jit.py streams periodic progress in non-interactive
 # Docker builds. Separate layers preserve completed work if a later module
 # fails.
-RUN unset CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT \
- && python3 jax_aiter/jit/build_jit.py --module librmsnorm_fwd --verbose
+#
+# AITER_JIT_LIBS_TAG, a jit-libs-* release of ROCm/jax-aiter built from the
+# pinned AITER for gfx950, installs these three libraries from that release
+# instead. The blog runs used jit-libs-26a4ef9da0d91247.
+ARG AITER_JIT_LIBS_TAG=
+RUN if [ -n "${AITER_JIT_LIBS_TAG}" ]; then \
+      python3 docker/mxfp4/fetch_aiter_jit_libs.py "${AITER_JIT_LIBS_TAG}" build/aiter_build; \
+    fi
 
-RUN unset CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT \
- && python3 jax_aiter/jit/build_jit.py --module libmha_fwd --verbose
+RUN [ -n "${AITER_JIT_LIBS_TAG}" ] || { unset CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT \
+ && python3 jax_aiter/jit/build_jit.py --module librmsnorm_fwd --verbose; }
 
-RUN unset CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT \
- && python3 jax_aiter/jit/build_jit.py --module libmha_bwd --verbose
+RUN [ -n "${AITER_JIT_LIBS_TAG}" ] || { unset CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT \
+ && python3 jax_aiter/jit/build_jit.py --module libmha_fwd --verbose; }
+
+RUN [ -n "${AITER_JIT_LIBS_TAG}" ] || { unset CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT \
+ && python3 jax_aiter/jit/build_jit.py --module libmha_bwd --verbose; }
 
 RUN make -j"${BUILD_JOBS}" ja_mods \
  && make -f Makefile.flydsl -j"${BUILD_JOBS}" bridge \
@@ -269,18 +292,21 @@ RUN find /opt/jax-aiter/build/aiter_build \
  && find /opt/jax-aiter/build/jax_aiter_build \
       -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + \
  && rm -rf /opt/jax-aiter/build/hipified_aiter \
- && find /opt/aiter /opt/maxtext \
+ && find /opt/aiter /opt/flash-linear-attention /opt/maxtext \
       -name .git -exec rm -rf {} + \
- && find /opt/aiter /opt/maxtext /opt/jax-aiter \
+ && find /opt/aiter /opt/flash-linear-attention /opt/maxtext /opt/jax-aiter \
       -type d -name __pycache__ -prune -exec rm -rf {} +
 
 FROM system AS runtime
 
 ARG JAX_AITER_REF
 ARG AITER_REF
+ARG FLA_REF
 ARG MAXTEXT_REF
+ARG AITER_JIT_LIBS_TAG=
 
 COPY --from=builder /opt/aiter /opt/aiter
+COPY --from=builder /opt/flash-linear-attention /opt/flash-linear-attention
 COPY --from=builder /opt/maxtext /opt/maxtext
 COPY --from=builder /opt/jax-aiter /opt/jax-aiter
 
@@ -306,13 +332,15 @@ ENV LD_LIBRARY_PATH=/opt/jax-aiter/build/jax_aiter_build:/opt/jax-aiter/build/ai
 LABEL org.opencontainers.image.title="jax-aiter-mxfp4-source-build"
 LABEL org.opencontainers.image.jax-aiter="${JAX_AITER_REF}"
 LABEL org.opencontainers.image.aiter="${AITER_REF}"
+LABEL org.opencontainers.image.flash-linear-attention="${FLA_REF}"
 LABEL org.opencontainers.image.maxtext="${MAXTEXT_REF}"
+LABEL org.opencontainers.image.aiter-jit-libs="${AITER_JIT_LIBS_TAG:-source}"
 
 RUN mkdir -p \
       "${XDG_CACHE_HOME}" \
       "${FLYDSL_RUNTIME_CACHE_DIR}" \
       "${TF_XLA_HSACO_CACHE_DIR}" \
- && python3 - <<'PY'
+ && JAX_PLATFORMS=cpu python3 - <<'PY'
 from importlib import metadata
 from pathlib import Path
 
@@ -322,6 +350,10 @@ import jax_aiter
 import jaxlib
 import maxtext
 import triton
+
+# The training entry point imports orbax-checkpoint and pathwaysutils APIs
+# that `import maxtext` alone does not reach.
+import maxtext.trainers.pre_train.train
 
 assert jax.__version__ == "0.11.2", jax.__version__
 assert jax_aiter.__version__ == "0.1.0a2", jax_aiter.__version__
@@ -355,6 +387,12 @@ required = (
 missing = [str(path) for path in required if not path.is_file()]
 if missing:
     raise SystemExit(f"missing JAX-AITER libraries: {missing}")
+
+# gdn_kernel=jax_aiter_fla loads FLA's Triton kernels from this checkout.
+from jax_aiter.triton.gdn.fla import _find_fla_python
+
+fla_root = _find_fla_python()
+assert (fla_root / "fla/ops/gated_delta_rule").is_dir(), fla_root
 
 print(
     "source-build image ready:",
