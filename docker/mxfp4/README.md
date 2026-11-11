@@ -50,7 +50,7 @@ datasets, tokenizers, or model checkpoints.
 
 MaxText's Transformer Engine attention (`attention=cudnn_flash_te`) and its
 BF16 grouped-GEMM experts need Transformer Engine; the MoE recipes also need
-Primus-Turbo's intranode DeepEP dispatch. Clusters with AMD Pollara (AINIC)
+Primus-Turbo's intranode DeepEP dispatch. Clusters with AMD AI NIC (AINIC)
 RoCE adapters need the matching `libionic` userspace. Build the layers on top
 of the image above:
 
@@ -62,9 +62,9 @@ docker build --progress=plain \
   --build-arg BUILD_JOBS=32 \
   -t jax-aiter-mxfp4:local-te .
 
-# Only for Pollara RoCE adapters; the version must match the hosts' nicctl.
+# Only for AINIC RoCE adapters; the version must match the hosts' nicctl.
 docker build --progress=plain \
-  -f docker/mxfp4/Dockerfile.tensorwave \
+  -f docker/mxfp4/Dockerfile.ainic \
   --build-arg BASE_IMAGE=jax-aiter-mxfp4:local-te \
   --build-arg AINIC_VERSION=1.117.5-a-77 \
   -t jax-aiter-mxfp4:local-te-ainic .
@@ -76,7 +76,7 @@ docker build --progress=plain \
   -t jax-aiter-mxfp4:local-moe .
 ```
 
-Without Pollara adapters, skip the second build and use
+Without AINIC adapters, skip the second build and use
 `BASE_IMAGE=jax-aiter-mxfp4:local-te` for the third. The images contain no
 RDMA user-space libraries, so multi-node runs over other RoCE or InfiniBand
 adapters need their libraries added at the same point. Transformer Engine is

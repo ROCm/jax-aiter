@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1.7
-# Thin TensorWave Pollara networking layer over the validated ROCm 10 image.
+# Adds the RDMA user-space libraries of AMD AI NIC (AINIC) RoCE adapters to an
+# MXFP4 image.
 #
 # Build from the JAX-AITER repository root:
 #
 #   docker build --progress=plain \
-#     -f docker/mxfp4/Dockerfile.tensorwave \
+#     -f docker/mxfp4/Dockerfile.ainic \
 #     --build-arg BASE_IMAGE=<MXFP4 image> \
 #     -t jax-aiter-mxfp4:local-ainic .
 
@@ -19,8 +20,9 @@ ARG AINIC_REPO=https://repo.radeon.com
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# TensorWave reports nicctl 1.117.5-a-77. Pollara's libionic userspace must
-# match that host stack; generic rdma-core alone is not sufficient.
+# AINIC's libionic userspace must match the hosts' AINIC version (nicctl);
+# generic rdma-core alone is not sufficient. The default is the version of the
+# MXFP4 MoE blog's runs.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gnupg \
  && install -d -m 0755 /etc/apt/keyrings \
@@ -60,5 +62,4 @@ RUN ldconfig \
  && dpkg-query -W -f='${Package}=${Version}\n' \
       libibverbs1 libionic1 rdma-core
 
-LABEL org.opencontainers.image.tensorwave.ainic="${AINIC_VERSION}"
-LABEL org.opencontainers.image.tensorwave.network="Pollara RoCE"
+LABEL org.opencontainers.image.ainic="${AINIC_VERSION}"

@@ -3,7 +3,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # Adds Primus-Turbo's intranode DeepEP JAX module, built from source, to an
-# MXFP4 image (docker/mxfp4/Dockerfile, optionally plus Dockerfile.tensorwave).
+# MXFP4 image (docker/mxfp4/Dockerfile, optionally plus Dockerfile.ainic).
 #
 # Build from the JAX-AITER repository root:
 #
