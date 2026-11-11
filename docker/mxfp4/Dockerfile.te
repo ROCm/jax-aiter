@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Adds ROCm Transformer Engine for JAX, built from source, to an MXFP4 image
+# (docker/mxfp4/Dockerfile). MaxText uses it for attention=cudnn_flash_te and
+# for the BF16 grouped GEMM of use_te_grouped_gemm=true.
+#
+# Build from the JAX-AITER repository root:
+#
+#   docker build --progress=plain \
+#     -f docker/mxfp4/Dockerfile.te \
+#     --build-arg BASE_IMAGE=<MXFP4 image> \
+#     --build-arg BUILD_JOBS=32 \
+#     -t jax-aiter-mxfp4:te .
+#
+# TE 2.17.1 asserts when a grouped GEMM has more rows than sum(group_sizes),
+# which MaxText's dropless expert buffers produce; this revision zero-fills
+# them. The AOTriton attention backend is not built, so runs must set
+# NVTE_FUSED_ATTN_AOTRITON=0.
+
+ARG BASE_IMAGE
+ARG TE_REPO=https://github.com/ROCm/TransformerEngine.git
+ARG TE_REF=9d36d5051fd61fb267c7e49ad79625069f6d463d
+
+FROM ${BASE_IMAGE} AS te
+
+ARG TE_REPO
+ARG TE_REF
+ARG BUILD_JOBS=32
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN git init /src/TransformerEngine \
+ && git -C /src/TransformerEngine remote add origin "${TE_REPO}" \
+ && git -C /src/TransformerEngine fetch --depth=1 origin "${TE_REF}" \
+ && git -C /src/TransformerEngine checkout --detach FETCH_HEAD \
+ && test "$(git -C /src/TransformerEngine rev-parse HEAD)" = "${TE_REF}" \
+ && git -C /src/TransformerEngine submodule update --init --recursive --depth=1
+
+# The requirements lock of the base image already holds TE's build and
+# runtime dependencies; --no-deps keeps it authoritative. TE checks out and
+# builds its own AITER, so the base image's AITER, Triton, and JAX-AITER
+# packages are kept off PYTHONPATH.
+RUN case "${BUILD_JOBS}" in \
+      ""|*[!0-9]*|0) echo "BUILD_JOBS must be a positive integer" >&2; exit 2 ;; \
+    esac \
+ && cd /src/TransformerEngine \
+ && rocm="$(env -u PYTHONPATH python3 -c \
+      'from rocm_sdk._devel import get_devel_root; print(get_devel_root())')" \
+ && env -u PYTHONPATH \
+    ROCM_PATH="${rocm}" \
+    HIP_PLATFORM=amd \
+    HIP_DEVICE_LIB_PATH="${rocm}/llvm/amdgcn/bitcode/" \
+    CMAKE_PREFIX_PATH="${rocm}/lib/cmake/" \
+    NVTE_FRAMEWORK=jax \
+    NVTE_USE_ROCM=1 \
+    NVTE_ROCM_ARCH=gfx950 \
+    NVTE_FUSED_ATTN_AOTRITON=0 \
+    NVTE_BUILD_MAX_JOBS="${BUILD_JOBS}" \
+    MAX_JOBS="${BUILD_JOBS}" \
+    python3 -m pip install --no-build-isolation --no-deps \
+      --target /opt/transformer-engine . \
+ && cp LICENSE /opt/transformer-engine/ \
+ && find /opt/transformer-engine -type d -name __pycache__ -prune -exec rm -rf {} + \
+ && cd / && rm -rf /src/TransformerEngine
+
+FROM ${BASE_IMAGE}
+
+ARG TE_REF
+
+COPY --from=te /opt/transformer-engine /opt/transformer-engine
+
+ENV PYTHONPATH=/opt/transformer-engine:${PYTHONPATH}
+ENV NVTE_FRAMEWORK=jax
+ENV NVTE_FUSED_ATTN_AOTRITON=0
+
+LABEL org.opencontainers.image.transformer-engine="${TE_REF}"
+
+RUN set -eu; \
+    for library in $(find /opt/transformer-engine -name '*.so' -type f); do \
+      LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/transformer-engine:/opt/transformer-engine/transformer_engine/lib" \
+        ldd "${library}" | awk -v lib="${library}" \
+          '/not found/ { print lib ": " $0; bad=1 } END { exit bad }'; \
+    done \
+ && cd / && python3 - <<'PY'
+import importlib.metadata as md
+import importlib.util
+
+version = md.version("transformer_engine")
+assert version.startswith("2.18.0.dev0+9d36d50"), version
+origin = importlib.util.find_spec("transformer_engine").origin
+assert origin.startswith("/opt/transformer-engine/"), origin
+for distribution, expected in (("jax", "0.11.2"), ("jaxlib", "0.11.2")):
+    assert md.version(distribution) == expected, (distribution, md.version(distribution))
+print("transformer_engine", version, origin)
+PY
