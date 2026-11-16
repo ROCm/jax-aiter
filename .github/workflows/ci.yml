@@ -10,7 +10,9 @@ name: JAX-AITER CI
 #
 # The JIT libraries are FETCHED, never built: jit-libs.yml is the only producer.
 # JA_SKIP_JIT_BUILD makes a cache miss fail in seconds rather than silently
-# starting a multi-hour build on a shared runner.
+# starting a multi-hour build on a shared runner. A PR that changes the JIT
+# recipe or ROCm version reuses the newest libraries built from the same AITER
+# commit, so it is tested before its exact libraries are published.
 
 on:
   workflow_dispatch:
@@ -103,6 +105,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          JA_FETCH_SAME_AITER: "1"
         run: |
           mkdir -p build/aiter_build
           bash ci/fetch_jit_libs.sh
@@ -111,7 +114,7 @@ jobs:
         # Building them here would occupy a shared GPU runner for hours.
         if: steps.fetch_jit.outputs.rebuild == 'true'
         run: |
-          echo "::error::No JIT libs matched this AITER pin / arch / JIT recipe." >&2
+          echo "::error::No usable JIT libs were found for this AITER pin and arch." >&2
           echo "Run the 'JIT libs (build + publish)' workflow, then re-run this job." >&2
           exit 1
 

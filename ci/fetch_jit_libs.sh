@@ -24,6 +24,9 @@
 #   AITER_BUILD_DIR (default build/aiter_build)   GPU_ARCHS (default gfx950)
 #   JA_MANIFEST_NAME (default manifest.json)
 #   ROCM_VERSION + JA_FETCH_STRICT_ROCM=1 -> make the ROCm check a hard gate too
+#   JA_FETCH_SAME_AITER=1 -> if the exact release is missing, use the newest
+#                            release built from the same AITER commit and GPU
+#                            archs; its JIT recipe and ROCm may differ
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -71,6 +74,43 @@ download() {  # $1=asset-name $2=dest-path ; 0 on success
   return 1
 }
 
+find_same_aiter_release() {  # sets TAG/BASE_URL + $TMP/manifest.json ; 0 on success
+  local releases="" candidate
+  if command -v gh >/dev/null 2>&1; then
+    releases="$(gh api "repos/${REPO}/releases?per_page=100" 2>/dev/null)" || releases=""
+  fi
+  if [[ -z "$releases" ]]; then
+    releases="$(curl -fsSL --retry 3 --retry-delay 2 \
+      "https://api.github.com/repos/${REPO}/releases?per_page=100")" || return 1
+  fi
+  while read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    curl -fsSL --retry 3 --retry-delay 2 -o "$TMP/candidate.json" \
+      "https://github.com/${REPO}/releases/download/${candidate}/${MANIFEST_NAME}" || continue
+    if python3 - "$TMP/candidate.json" "$REPO_ROOT" "$GPU_ARCHS" <<'PYEOF'
+import importlib.util, sys
+manifest_path, root, archs = sys.argv[1:4]
+spec = importlib.util.spec_from_file_location("jlm", f"{root}/ci/jit_libs_manifest.py")
+jlm = importlib.util.module_from_spec(spec); spec.loader.exec_module(jlm)
+m = jlm.load_manifest(manifest_path)
+same = (m.get("aiter_sha") == jlm.compute_aiter_sha(root)
+        and jlm.normalize_archs(m.get("gpu_archs")) == jlm.normalize_archs(archs))
+sys.exit(0 if same else 1)
+PYEOF
+    then
+      TAG="$candidate"
+      BASE_URL="https://github.com/${REPO}/releases/download/${TAG}"
+      mv -f "$TMP/candidate.json" "$TMP/manifest.json"
+      return 0
+    fi
+  done < <(python3 -c '
+import json, sys
+rs = [r for r in json.load(sys.stdin) if r["tag_name"].startswith("jit-libs-") and not r["draft"]]
+rs.sort(key=lambda r: r.get("published_at") or "", reverse=True)
+print("\n".join(r["tag_name"] for r in rs))' <<<"$releases" 2>/dev/null)
+  return 1
+}
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -78,8 +118,17 @@ echo "[fetch] release=$REPO tag=$TAG  ->  $AITER_BUILD_DIR"
 mkdir -p "$AITER_BUILD_DIR"
 
 # --- 1. manifest ---
+FALLBACK_PATCH_HASH=""
 if ! download "$MANIFEST_NAME" "$TMP/manifest.json"; then
-  rebuild "could not download $MANIFEST_NAME from release '$TAG' (asset missing?)"
+  EXACT_TAG="$TAG"
+  if [[ "${JA_FETCH_SAME_AITER:-0}" == "1" ]] && find_same_aiter_release; then
+    FALLBACK_PATCH_HASH="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['patch_hash'])" "$TMP/manifest.json")"
+    CHECKOUT_PATCH_HASH="$(python3 -c "import sys;sys.path.insert(0,'ci');import jit_libs_manifest as m;print(m.compute_patch_hash('.'))")"
+    echo "[fetch] FALLBACK: release '$EXACT_TAG' is missing; using '$TAG', built from the same AITER commit and GPU archs"
+    echo "[fetch]   JIT recipe: release=$FALLBACK_PATCH_HASH checkout=$CHECKOUT_PATCH_HASH"
+  else
+    rebuild "could not download $MANIFEST_NAME from release '$EXACT_TAG' (asset missing?)"
+  fi
 fi
 
 # --- 2. verify the manifest keys vs the current checkout ---
@@ -92,6 +141,7 @@ if GITHUB_OUTPUT="" python3 ci/jit_libs_manifest.py verify \
      --manifest "$TMP/manifest.json" \
      --gpu-archs "$GPU_ARCHS" \
      ${ROCM_VERSION:+--rocm-version "$ROCM_VERSION"} \
+     ${FALLBACK_PATCH_HASH:+--patch-hash "$FALLBACK_PATCH_HASH"} \
      $STRICT_ROCM_FLAG; then
   echo "[fetch] manifest verify: PASS"
 else
