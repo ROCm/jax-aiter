@@ -75,3 +75,6 @@ from primus_turbo.jax.lax.moe import moe_combine, moe_dispatch, setup
 
 print("deepep registrations:", sorted(registrations()))
 PY
+
+# trivy:ignore:AVD-DS-0002 the MXFP4 training images run as root
+USER root

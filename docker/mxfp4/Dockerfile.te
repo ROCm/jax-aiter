@@ -95,3 +95,6 @@ for distribution, expected in (("jax", "0.11.2"), ("jaxlib", "0.11.2")):
     assert md.version(distribution) == expected, (distribution, md.version(distribution))
 print("transformer_engine", version, origin)
 PY
+
+# trivy:ignore:AVD-DS-0002 the MXFP4 training images run as root
+USER root

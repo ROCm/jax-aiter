@@ -44,3 +44,6 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
 WORKDIR /test
 
 # Nothing else is COPY-ed in: the wheel + smoke test are bind-mounted at run time.
+
+# validate_wheel.sh runs as the calling user; without --user, run as nobody.
+USER 65534:65534

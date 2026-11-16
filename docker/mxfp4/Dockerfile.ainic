@@ -12,6 +12,7 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+# trivy:ignore:AVD-DS-0002 the MXFP4 training images run as root
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 

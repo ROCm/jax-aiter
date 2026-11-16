@@ -33,6 +33,7 @@ ARG MAXTEXT_REF=c886bb4e81ff976d63c4a6c961b69d0d9540d852
 
 FROM ${BASE_IMAGE} AS system
 
+# trivy:ignore:AVD-DS-0002 the MXFP4 training images run as root
 USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -320,6 +321,7 @@ ENV XDG_CACHE_HOME=/var/cache/mxfp4
 ENV FLYDSL_RUNTIME_CACHE_DIR=/var/cache/mxfp4/flydsl030
 ENV TF_XLA_HSACO_CACHE_DIR=/var/cache/mxfp4/xla-hsaco
 ENV JAX_AITER_FLYDSL_REPORT=1
+# trivy:ignore:AVD-DS-0031 a JAX cache-key setting, not a secret
 ENV JAX_REMOVE_CUSTOM_PARTITIONING_PTR_FROM_CACHE_KEY=1
 ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
 ENV DECOUPLE_GCLOUD=TRUE
