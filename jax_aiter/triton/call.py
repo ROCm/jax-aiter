@@ -49,7 +49,7 @@ def _scalar_to_int64(triton_type: str, value: Any) -> int:
         return int(struct.unpack("<I", packed)[0])
     if triton_type in ("fp64", "f64"):
         packed = struct.pack("<d", float(value))
-        return int(struct.unpack("<Q", packed)[0])
+        return int(struct.unpack("<q", packed)[0])
     return int(value)
 
 
@@ -184,12 +184,23 @@ def triton_call(
     input_output_aliases: dict[int, int] | None = None,
 ):
     """Launch one compiled Triton kernel through TritonDispatchJA."""
+    kernel_id = _kernel_id(fn)
+    runtime_items = tuple(runtime_types.items())
+    # compile_hsaco orders the kernel signature by fn.arg_names, and the launch
+    # packs arguments in runtime_types order; a mismatch swaps arguments.
+    signature_order = [
+        name for name in fn.arg_names if name in runtime_types and name not in constexprs
+    ]
+    if [name for name, _ in runtime_items] != signature_order:
+        raise ValueError(
+            f"runtime_types for {kernel_id} must follow its signature order "
+            f"{signature_order}, got {list(runtime_types)}"
+        )
+
     prepare_aiter_triton()
     ensure_target_registered()
-    kernel_id = _kernel_id(fn)
     _KERNELS[kernel_id] = fn
 
-    runtime_items = tuple(runtime_types.items())
     kind_tuple = tuple(kinds)
     if len(kind_tuple) != len(runtime_items):
         raise ValueError("kinds must match runtime_types")
