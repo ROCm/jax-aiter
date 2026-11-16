@@ -29,15 +29,15 @@ set -euxo pipefail
 
 JA_ROOT_DIR="${JA_ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-JAX_VERSION="${JA_JAX_VERSION:-0.11.0}"
-ROCM_PLUGIN_VERSION="${JA_ROCM_PLUGIN_VERSION:-0.11.0}"
+JAX_VERSION="${JA_JAX_VERSION:-0.11.2}"
+ROCM_PLUGIN_VERSION="${JA_ROCM_PLUGIN_VERSION:-0.11.2}"
 
 # Not --no-deps: a bare runtime container has no numpy, and the verify step
 # below imports jax.
 python3 -m pip install --break-system-packages \
   "jax==${JAX_VERSION}" "jaxlib==${JAX_VERSION}"
 python3 -m pip install --break-system-packages \
-  "jax-rocm7-plugin==${ROCM_PLUGIN_VERSION}" "jax-rocm7-pjrt==${ROCM_PLUGIN_VERSION}"
+  "jax-rocm10-plugin==${ROCM_PLUGIN_VERSION}" "jax-rocm10-pjrt==${ROCM_PLUGIN_VERSION}"
 
 git config --global --add safe.directory "$JA_ROOT_DIR" || true
 git config --global --add safe.directory "$JA_ROOT_DIR/third_party/aiter" || true
@@ -55,8 +55,8 @@ assert jax.__version__ == expected_jax, (jax.__version__, expected_jax)
 assert jaxlib.__version__ == expected_jax, (jaxlib.__version__, expected_jax)
 
 for distribution, module in (
-    ("jax-rocm7-plugin", "jax_rocm7_plugin"),
-    ("jax-rocm7-pjrt", "jax_plugins.xla_rocm7"),
+    ("jax-rocm10-plugin", "jax_rocm10_plugin"),
+    ("jax-rocm10-pjrt", "jax_plugins.xla_rocm10"),
 ):
     version = metadata.version(distribution)
     assert version == expected_rocm, (distribution, version, expected_rocm)

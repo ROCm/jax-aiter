@@ -37,11 +37,11 @@ permissions:
   contents: read
 
 env:
-  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
-  ROCM_VERSION: "7.14.0"
+  ROCM_VERSION: "10.0.0"
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
   # Override at the repo/runner level once the corpus is staged somewhere else.
   JA_DATA_ROOT: /data/aiter_proj/datasets
@@ -105,7 +105,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: recursive
           fetch-depth: 1
@@ -156,7 +156,7 @@ jobs:
             'bash scripts/wait_for_idle_gpu.sh' || true
 
       - name: Install tooling and JAX
-        run: docker exec -u 0 "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+        run: docker exec -u 0 "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       - name: Build against the current pin
         run: |
@@ -169,8 +169,14 @@ jobs:
             bash -lc 'JA_MAXTEXT_ONLY=1 bash ci/perf/run_8b_fp4.sh'
 
       - name: Run the ${{ matrix.arm }} convergence leg
+        # Both arms use JAX-AITER attention: the image has no Transformer
+        # Engine, which the BF16 arm's cudnn_flash_te default would need.
+        env:
+          CONVERGENCE_STEPS: ${{ inputs.steps || 6000 }}
         run: |
           docker exec -u 0 \
+            -e CONVERGENCE_STEPS \
+            -e ATTENTION=aiter_flash \
             -e PROJECT_ROOT=/ \
             -e JAX_AITER_ROOT=/jax-aiter \
             -e MAXTEXT_ROOT=/maxtext_conv \
@@ -179,7 +185,7 @@ jobs:
             "$CONTAINER_NAME" bash -lc '
               bash scripts/recipes/run_mlperf_ttc_8b.sh \
                 weekly_${{ matrix.arm }} ${{ matrix.arm }} \
-                /jax-aiter/ci_conv_out "${{ inputs.steps || 6000 }}"
+                /jax-aiter/ci_conv_out "$CONVERGENCE_STEPS"
             '
 
       - name: Hand output back to the runner user
@@ -189,7 +195,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/ci_conv_out"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: weekly-convergence-${{ matrix.arm }}

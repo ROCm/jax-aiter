@@ -1,0 +1,21 @@
+.git
+.github
+.cursor
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.rocprofv3
+**/__pycache__
+**/*.py[cod]
+**/*.o
+**/*.so
+
+build
+dist
+*.egg-info
+third_party
+hlo_dumps
+ci_perf_out
+
+# Rights-gated, absent from Git and unused: no image may contain them.
+jax_aiter/flydsl/kernels/mxfp4
