@@ -399,6 +399,8 @@ MhaFwdUnified_Bridge(
       head_size_q == 192 && head_size_v == 128 &&
       seqstart_q_ptr != nullptr && seqstart_k_ptr != nullptr &&
       max_seqlen_q > 0 && max_seqlen_k > 0 &&
+      // The OPUS launcher replaces a nonpositive scale with 1/sqrt(hdim_q).
+      softmax_scale > 0.0f &&
       dropout_p == 0.0f && !return_dropout_randval &&
       !has_bias && !has_alibi && logits_soft_cap == 0.0f &&
       q_descale_ptr == nullptr && k_descale_ptr == nullptr &&
