@@ -65,7 +65,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0
@@ -83,6 +83,8 @@ jobs:
     name: bump AITER pin
     runs-on: build-only-jax-aiter
     timeout-minutes: 30
+    permissions:
+      contents: write
     outputs:
       aiter_sha: ${{ steps.bump.outputs.aiter_sha }}
       previous_sha: ${{ steps.bump.outputs.previous_sha }}
@@ -96,7 +98,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: recursive
           # A shallow superproject cannot be pushed from, and the bump commit
@@ -105,8 +107,10 @@ jobs:
 
       - name: Move the pin to AITER tip
         id: bump
+        env:
+          REQUESTED_AITER_REF: ${{ inputs.aiter_ref || 'main' }}
         run: |
-          bash ci/bump_aiter_pin.sh --ref "${{ inputs.aiter_ref || 'main' }}"
+          bash ci/bump_aiter_pin.sh --ref "$REQUESTED_AITER_REF"
 
       - name: Publish the candidate branch
         id: push
@@ -171,7 +175,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
@@ -213,7 +217,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "build/aiter_build/${{ matrix.module }}.so"
           ls -lh "build/aiter_build/${{ matrix.module }}.so"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nightly-jit-${{ matrix.module }}
           path: build/aiter_build/${{ matrix.module }}.so
@@ -230,6 +234,8 @@ jobs:
     needs: [bump, jit]
     runs-on: build-only-jax-aiter
     timeout-minutes: 180
+    permissions:
+      contents: write
     env:
       CONTAINER_NAME: ja_nightly_wheel_${{ github.run_id }}
     steps:
@@ -239,13 +245,13 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: nightly-jit-*
           path: build/aiter_build
@@ -337,7 +343,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" dist
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nightly-wheel
           path: dist/*+full-*.whl
@@ -363,12 +369,12 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: nightly-wheel
           path: dist
@@ -516,7 +522,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: nightly-perf-8b-fp4-fsdp8
@@ -546,7 +552,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
@@ -608,8 +614,10 @@ jobs:
       && (github.event_name == 'schedule' || inputs.promote)
     runs-on: build-only-jax-aiter
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           fetch-depth: 0

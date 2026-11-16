@@ -105,7 +105,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: recursive
           fetch-depth: 1
@@ -171,8 +171,11 @@ jobs:
       - name: Run the ${{ matrix.arm }} convergence leg
         # Both arms use JAX-AITER attention: the image has no Transformer
         # Engine, which the BF16 arm's cudnn_flash_te default would need.
+        env:
+          CONVERGENCE_STEPS: ${{ inputs.steps || 6000 }}
         run: |
           docker exec -u 0 \
+            -e CONVERGENCE_STEPS \
             -e ATTENTION=aiter_flash \
             -e PROJECT_ROOT=/ \
             -e JAX_AITER_ROOT=/jax-aiter \
@@ -182,7 +185,7 @@ jobs:
             "$CONTAINER_NAME" bash -lc '
               bash scripts/recipes/run_mlperf_ttc_8b.sh \
                 weekly_${{ matrix.arm }} ${{ matrix.arm }} \
-                /jax-aiter/ci_conv_out "${{ inputs.steps || 6000 }}"
+                /jax-aiter/ci_conv_out "$CONVERGENCE_STEPS"
             '
 
       - name: Hand output back to the runner user
@@ -192,7 +195,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}/ci_conv_out"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: weekly-convergence-${{ matrix.arm }}

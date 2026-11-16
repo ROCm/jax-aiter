@@ -32,7 +32,7 @@ on:
       - csrc/common/**
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: jit-libs
@@ -62,7 +62,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: recursive
           fetch-depth: 1
@@ -127,7 +127,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: recursive
           fetch-depth: 1
@@ -170,7 +170,7 @@ jobs:
             "build/aiter_build/${{ matrix.module }}.so"
           ls -lh "build/aiter_build/${{ matrix.module }}.so"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: jit-raw-${{ matrix.module }}
           path: build/aiter_build/${{ matrix.module }}.so
@@ -188,6 +188,8 @@ jobs:
     if: needs.preflight.outputs.exists != 'true' && needs.build.result == 'success'
     runs-on: build-only-jax-aiter
     timeout-minutes: 180
+    permissions:
+      contents: write
     steps:
       - name: Fix permissions from a previous container run
         run: |
@@ -195,11 +197,11 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: jit-raw-*
           path: build/aiter_build
