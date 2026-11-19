@@ -17,6 +17,38 @@ import logging
 
 logger = logging.getLogger("JAX_AITER")
 
+# AITER builds these modules without hipify; JAX-AITER hipifies them, and
+# hipify rewrites `std::max(` to `::max(`, whose HIP overloads return int.
+# Keyed by hipified file name: (text hipify produces, text that compiles).
+# Sources without the broken text (older or fixed AITER) are left as they are.
+HIPIFIED_SOURCE_FIXES = {
+    "mha_bwd.hip": [
+        (
+            "std::clamp(want, 1u, ::max(kv_blocks, 1u))",
+            "std::clamp<uint32_t>(want, 1u, std::max<uint32_t>(kv_blocks, 1u))",
+        ),
+    ],
+}
+
+
+def fix_hipified_sources(sources):
+    """Apply HIPIFIED_SOURCE_FIXES to the build copies; return the files changed."""
+    changed = []
+    for source in sources:
+        fixes = HIPIFIED_SOURCE_FIXES.get(os.path.basename(source))
+        if not fixes:
+            continue
+        path = Path(source)
+        original = path.read_text()
+        text = original
+        for broken, fixed in fixes:
+            text = text.replace(broken, fixed)
+        if text != original:
+            path.write_text(text)
+            changed.append(source)
+            logger.info(f"Fixed hipified source {source}")
+    return changed
+
 
 def setup_environment():
     """Setup environment variables for JAX-AITER and AITER."""
@@ -326,6 +358,7 @@ def patch_aiter_core(core_module, jax_aiter_root):
             torch_exclude: bool = False,
             extra_cuda_cflags_per_source=None,
         ) -> None:
+            fix_hipified_sources(sources)
             cpp_extension.verify_ninja_availability()
 
             compiler = cpp_extension.get_cxx_compiler()

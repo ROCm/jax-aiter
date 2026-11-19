@@ -10,6 +10,8 @@
 import jax
 import ctypes
 import logging
+import os
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..ja_compat import config as ja_config
@@ -45,6 +47,8 @@ SYMBOL_TO_MODULE_MAP = {
     "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualJA": "cast_mxfp4_ja.so",
     "CastMxfp4DualKeyedSrJA": "cast_mxfp4_ja.so",
+    "FlydslDispatchJA": "flydsl_bridge_ja.so",
+    "TritonDispatchJA": "triton_bridge_ja.so",
     "KvAliasProbeJA": "kv_alias_probe_ja.so",
     "AppendKvJA": "append_kv_ja.so",
     "PagedAttentionJA": "paged_attention_ja.so",
@@ -62,7 +66,21 @@ STANDALONE_SYMBOLS = {
     "AppendKvJA",
     "PagedAttentionJA",
     "PagedPrefillJA",
+    "FlydslDispatchJA",
+    "TritonDispatchJA",
 }
+
+# Environment variables that point a module at a file outside the build tree.
+# The bridge keeps its kernel table in the loaded library, so registration and
+# dispatch must resolve to the same file.
+MODULE_PATH_ENV = {
+    "triton_bridge_ja.so": "JA_TRITON_BRIDGE_LIB",
+}
+
+
+def _module_override(module_name: str) -> Optional[Path]:
+    override = os.environ.get(MODULE_PATH_ENV.get(module_name, ""))
+    return Path(override) if override else None
 
 
 def ensure_jax_backend_ready():
@@ -124,8 +142,9 @@ def load_thin_modules():
                 continue
             if module_so.name in skip_names or module_so.name in _module_handles:
                 continue
+            path = _module_override(module_so.name) or module_so
             try:
-                module_handle = ctypes.CDLL(str(module_so), mode=ctypes.RTLD_GLOBAL)
+                module_handle = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
                 _module_handles[module_so.name] = module_handle
                 loaded.append(module_so.name)
                 logger.debug(f"Loaded {module_so.name}")
@@ -167,6 +186,9 @@ def _standalone_search_dirs():
 
 def find_standalone_module(module_name: str):
     """Return the path to a standalone module, or None if it is not built."""
+    override = _module_override(module_name)
+    if override is not None:
+        return override if override.exists() else None
     for directory in _standalone_search_dirs():
         candidate = directory / module_name
         if candidate.exists():
@@ -210,6 +232,12 @@ def load_standalone_module(module_name: str):
 
     _module_handles[module_name] = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
     logger.info(f"Loaded standalone module: {module_name}")
+
+
+def standalone_module_handle(module_name: str) -> ctypes.CDLL:
+    """The registry's handle for a standalone module, loading it if needed."""
+    load_standalone_module(module_name)
+    return _module_handles[module_name]
 
 
 def resolve_symbol(target_name: str) -> int:

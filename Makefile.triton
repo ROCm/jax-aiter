@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+# First-party Triton-to-JAX HSACO trampoline. Independent of third_party/aiter
+# sources at link time and never builds jaxlib.
+
+PYTHON3 ?= python3
+HIPCC ?= /usr/local/bin/hipcc
+
+JAX_FFI_INC := $(shell $(PYTHON3) -c 'from jax import ffi; print(ffi.include_dir())')
+OUT_DIR := build/jax_aiter_build
+BRIDGE_SO := $(OUT_DIR)/triton_bridge_ja.so
+BRIDGE_SRC := csrc/ffi/triton/triton_bridge_ja.cc
+
+CXXFLAGS := -std=c++20 -shared -fPIC -O3 \
+	-DUSE_ROCM -D__HIP_PLATFORM_AMD__ \
+	-I$(JAX_FFI_INC) -fvisibility-inlines-hidden -fvisibility=hidden
+LDFLAGS := -lamdhip64 -pthread
+
+.PHONY: all bridge clean-triton
+
+all: bridge
+
+bridge: $(BRIDGE_SO)
+
+$(OUT_DIR):
+	mkdir -p $@
+
+$(BRIDGE_SO): $(BRIDGE_SRC) | $(OUT_DIR)
+	$(HIPCC) $(CXXFLAGS) $< $(LDFLAGS) -o $@
+
+clean-triton:
+	rm -f $(BRIDGE_SO)

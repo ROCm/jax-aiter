@@ -2,22 +2,22 @@
 
 ## Environment
 
-The supported alpha2 build environment is:
+The supported build environment is:
 
 ```text
-ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
+ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0
 Python 3.12
-JAX / jaxlib 0.11.0; ROCm plugin / PJRT 0.11.0.post1
+JAX / jaxlib 0.11.2; jax-rocm10-plugin / jax-rocm10-pjrt 0.11.2
 GPU_ARCHS=gfx950
 ```
 
-`ci/setup_jax.sh` still defaults `ROCM_PLUGIN_VERSION` to `0.11.0`. That
-default is deliberate: the script is a `compute_patch_hash()` input, so
-editing it rekeys the immutable JIT library identity for a version that
-cannot change their bytes. Pass the override instead, as CI does:
+`ci/setup_jax.sh` installs exactly that stack. The script is a
+`compute_patch_hash()` input, so editing it rekeys the immutable JIT library
+identity: update `jax_aiter/jit_assets.py` in the same change and publish the
+new release with the `JIT libs (build + publish)` workflow.
 
 ```bash
-JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh
+bash ci/setup_jax.sh
 ```
 
 TheRock has no `/opt/rocm`. The Makefile uses `/opt/rocm` in legacy images and
@@ -123,7 +123,7 @@ GPU_ARCHS=gfx950 JA_WHEEL_ARCH=gfx950 \
 ```
 
 Release wheels are built inside
-`ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14` with:
+`ghcr.io/rocm/jax-manylinux_2_28-therock-10.0:10.0` with:
 
 ```bash
 export JA_WHEEL_PLAT_NAME=manylinux_2_39_x86_64
