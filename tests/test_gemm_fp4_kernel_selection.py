@@ -222,12 +222,22 @@ def test_persistent_kernels_are_refused():
         pytest.skip("this AITER pin has no ps=1 f4gemm kernels")
     if not _gpu_available():
         pytest.skip("no ROCm GPU visible to JAX")
-    for name in names:
+
+    def forced(name):
         env = os.environ.copy()
         env["AITER_FORCE_KERNEL_NAME"] = name
         env.pop("AITER_FP4_DISPATCH", None)
-        proc = subprocess.run([sys.executable, "-c", _FORCED_GEMM], env=env,
+        return subprocess.run([sys.executable, "-c", _FORCED_GEMM], env=env,
                               capture_output=True, text=True, timeout=600)
+
+    # Control: forcing by name works at all here. Without it, "not in cache"
+    # below would also be what a device with no f4gemm kernels reports.
+    control = forced(EXPECTED_KERNEL)
+    if control.returncode != 0:
+        pytest.skip("the ordinary 256x256 f4gemm kernel does not run on this "
+                    "device, so a refusal would prove nothing")
+    for name in names:
+        proc = forced(name)
         assert proc.returncode != 0, f"{name} ran instead of being refused"
         assert "not in cache" in proc.stderr, proc.stderr[-1500:]
 
