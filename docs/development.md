@@ -127,7 +127,12 @@ Release wheels are built inside
 
 ```bash
 export JA_WHEEL_PLAT_NAME=manylinux_2_39_x86_64
+source ci/manylinux_toolchain.sh
 ```
+
+`ci/manylinux_toolchain.sh` makes hipcc use the image's gcc-toolset libstdc++.
+Left alone, ROCm clang picks the base distribution's GCC 8 headers, and the
+MHA forward shim fails to compile with `'bit' file not found`.
 
 The tag is `2_39` even though the image is `2_28`, because the bundled AITER JIT
 libraries come from `jit-libs.yml`, which builds them on Ubuntu 24.04; they need
