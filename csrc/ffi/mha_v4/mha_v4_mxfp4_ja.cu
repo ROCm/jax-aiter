@@ -14,6 +14,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -333,6 +334,7 @@ const fmha_v4_fwdConfig* find_mxfp6(const std::string& arch) {
 }
 
 struct KernelCache {
+  std::mutex mutex;
   std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> kernels;
 };
 
@@ -342,6 +344,7 @@ ffi::Error load_kernel(int dev, const fmha_v4_fwdConfig& cfg, AiterAsmKernel** o
   }
   static KernelCache caches[kMaxDevices];
   auto& cache = caches[dev];
+  std::lock_guard<std::mutex> lock(cache.mutex);
   const std::string key = cfg.arch + "|" + cfg.knl_name + "|" + cfg.co_name;
   auto it = cache.kernels.find(key);
   if (it == cache.kernels.end()) {
@@ -811,6 +814,7 @@ ffi::Error MhaV4Mxfp6Fwd_Bridge(hipStream_t stream, ffi::AnyBuffer q, ffi::AnyBu
   AiterAsmKernel* kernel = nullptr;
   if (auto err = load_kernel(dev, *cfg, &kernel); !err.success()) return err;
   size_t arg_size = sizeof(args);
+  aiter_detail::AiterThrowGuard guard;
   try {
     kernel->launch_kernel({&args, &arg_size, static_cast<int>(ceil_div(sq, cfg->ts_qo)),
                            static_cast<int>(hq), static_cast<int>(b), 512, 1, 1, stream});
