@@ -128,6 +128,9 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
+            # Without this, ROCm clang takes the libstdc++ headers of GCC 8,
+            # which has no <bit>. The sourced file explains why.
+            source ci/manylinux_toolchain.sh
             make
             make ja_mods
             test -s build/jax_aiter_build/libjax_aiter.so
@@ -135,15 +138,18 @@ jobs:
             test -s build/jax_aiter_build/mha_bwd_ja.so
           '
 
+      # build_wheel.sh runs make again in the two steps below. It is a no-op
+      # after the step above, but if it ever does compile it must use the same
+      # toolchain.
       - name: Package default/PyPI-shaped wheel
         run: |
           docker exec "$CONTAINER_NAME" bash -lc \
-            'bash scripts/build_wheel.sh --variant lite'
+            'source ci/manylinux_toolchain.sh && bash scripts/build_wheel.sh --variant lite'
 
       - name: Build GitHub-only full wheel
         run: |
           docker exec "$CONTAINER_NAME" bash -lc \
-            'bash scripts/build_wheel.sh --variant full'
+            'source ci/manylinux_toolchain.sh && bash scripts/build_wheel.sh --variant full'
 
       - name: Audit wheel policy and contents
         run: |

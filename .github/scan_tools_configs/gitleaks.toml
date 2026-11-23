@@ -80,3 +80,23 @@ regexes = [
   '''[A-Z][A-Z0-9_]*SHA512\s*[=:]''',
   '''[A-Z][A-Z0-9_]*MD5\s*[=:]''',
 ]
+
+[[allowlists]]
+description = "JAX FFI symbol names containing 'Keyed' (not credentials)"
+# generic-api-key keys on the substring "key" in an identifier. Two shapes in
+# this repository trip it, and neither can hold a credential:
+#
+#   jax_aiter/ffi/registry.py     "CastMxfp4KeyedSrJA": "cast_mxfp4_ja.so"
+#       an FFI target name mapped to the shared library that defines it
+#   jax_aiter/gemm_fp4/gemm_fp4.py  _gemm_fp4_bf16_keyed_fwd, _gemm_fp4_bf16_keyed_bwd
+#       the forward/backward function pair passed to defvjp
+#
+# Both regexes anchor on the whole match (identifier and value), so a real
+# secret assigned to a key-like name is still reported. They are patterns
+# rather than .gitleaksignore fingerprints because a PR scan can attribute
+# these lines to different commits from one run to the next.
+regexTarget = "match"
+regexes = [
+  '''\b[A-Za-z0-9]*Keyed[A-Za-z0-9]*JA"\s*:\s*"[a-z0-9_]+_ja\.so"''',
+  '''\b_[a-z0-9_]+_keyed_fwd,\s*_[a-z0-9_]+_keyed_bwd\b''',
+]

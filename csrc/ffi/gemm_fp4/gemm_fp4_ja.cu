@@ -4,6 +4,7 @@
 // FP4 GEMM FFI handler using AITER ASM kernels.
 // Out[M,N] bf16 = A[M,K/2] fp4x2 @ B[N,K/2] fp4x2 with e8m0 block scales.
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <hip/hip_runtime.h>
@@ -50,6 +51,30 @@ struct __attribute__((packed)) Fp4GemmKernelArgs {
   unsigned int stride_ScaleB1; p3 _p22;
   int log2_k_split;
 };
+// The prebuilt kernels read these offsets.
+static_assert(offsetof(Fp4GemmKernelArgs, log2_k_split) == 368 &&
+                  sizeof(Fp4GemmKernelArgs) == 372,
+              "f4gemm kernarg layout");
+
+// AITER's f4gemm manifest marks some kernels ps=1 ("persistent"). Such a kernel
+// has a different calling convention from the rest of the table: it reads a CU
+// count just past the arguments above, and it expects a grid of at most one
+// workgroup per CU, each looping over its own tiles. Launched the way this file
+// launches every kernel, its output is wrong. A persistent kernel has the same
+// tile and split-K attributes as its ordinary twin, so the selection heuristic
+// cannot tell the two apart and would pick either. This shim therefore does not
+// load persistent kernels.
+//
+// Older AITER manifests have no ps column, and the generated config struct then
+// has no such member, hence the requires-expression.
+template <typename Cfg>
+static bool is_persistent_kernel(const Cfg& cfg) {
+  if constexpr (requires { cfg.ps; }) {
+    return cfg.ps != 0;
+  } else {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Per-device kernel cache with thread-safe eager loading (same pattern as BF16).
@@ -77,6 +102,9 @@ static Fp4KernelMap& get_fp4_kernel_cache(int dev_id) {
     for (const auto& el : *cfgs) {
       if (el.first.find(arch_id) != 0) continue;
       const auto& cfg = el.second;
+      // Not loaded, so naming one in AITER_FORCE_KERNEL_NAME fails with
+      // "not in cache" instead of running it with the wrong arguments.
+      if (is_persistent_kernel(cfg)) continue;
       if (caches[dev_id].count(cfg.knl_name)) continue;
 
       Fp4KernelEntry entry;
@@ -115,6 +143,7 @@ select_fp4_kernel(int M, int N, int K, int dev_id, CFG* cfgs) {
     if (el.first.find(arch_id) != 0) continue;
     const auto& cfg = el.second;
     if (cfg.bpreshuffle != 1) continue;
+    if (is_persistent_kernel(cfg)) continue;
 
     if (cfg.tile_M != 128 || cfg.tile_N != 512 || (N % cfg.tile_N) == 0) {
       std::vector<int> splitK_list = cfg.splitK
