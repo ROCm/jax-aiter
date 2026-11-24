@@ -188,6 +188,35 @@ def _cosine(a, b):
     return float(np.dot(af, bf) / (np.linalg.norm(af) * np.linalg.norm(bf) + 1e-12))
 
 
+def _numpy_attention(q, k, v):
+    q_np = np.asarray(q, dtype=np.float32)
+    k_np = np.asarray(k, dtype=np.float32)
+    v_np = np.asarray(v, dtype=np.float32)
+    if q_np.shape[2] != k_np.shape[2]:
+        repeats = q_np.shape[2] // k_np.shape[2]
+        k_np = np.repeat(k_np, repeats, axis=2)
+        v_np = np.repeat(v_np, repeats, axis=2)
+    scores = np.einsum("bqhd,bkhd->bhqk", q_np, k_np) * (q_np.shape[-1] ** -0.5)
+    scores -= scores.max(axis=-1, keepdims=True)
+    probs = np.exp(scores)
+    probs /= probs.sum(axis=-1, keepdims=True)
+    return np.einsum("bhqk,bkhd->bqhd", probs, v_np)
+
+
+@pytest.mark.parametrize(
+    ("kind", "head_dim", "min_cosine"),
+    [("mxfp4", 128, 0.95), ("mxfp6", 256, 0.98)],
+)
+def test_mx_dense_matches_numpy_reference(kind, head_dim, min_cosine):
+    """Exercise both quantized paths in CI without requiring PyTorch AITER."""
+    q, k, v = _pair_hd(1, 64, 96, 4, 2, head_dim, 37)
+    launch = mha_v4_mxfp4 if kind == "mxfp4" else mha_v4_mxfp6
+    got = np.asarray(launch(q, k, v), dtype=np.float32)
+    ref = _numpy_attention(q, k, v)
+    assert np.isfinite(got).all()
+    assert _cosine(got, ref) > min_cosine
+
+
 @pytest.mark.parametrize(
     ("head_dim", "lengths", "padded", "heads"),
     [

@@ -65,15 +65,15 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
-  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-7.14:7.14
-  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-7.14:7.14
+  IMAGE: ghcr.io/rocm/jax-dev-ubu24.therock-10.0:10.0
+  BUILD_IMAGE: ghcr.io/rocm/jax-manylinux_2_28-therock-10.0:10.0
   JA_ROOT_DIR: /jax-aiter
   AITER_SYMBOL_VISIBLE: 1
   GPU_ARCHS: gfx950
-  ROCM_VERSION: "7.14.0"
+  ROCM_VERSION: "10.0.0"
   AITER_ASM_DIR: /jax-aiter/third_party/aiter/hsa/
   JA_WHEEL_PLAT_NAME: manylinux_2_39_x86_64
   BUMP_BRANCH: nightly/aiter-auto-bump
@@ -83,6 +83,8 @@ jobs:
     name: bump AITER pin
     runs-on: build-only-jax-aiter
     timeout-minutes: 30
+    permissions:
+      contents: write
     outputs:
       aiter_sha: ${{ steps.bump.outputs.aiter_sha }}
       previous_sha: ${{ steps.bump.outputs.previous_sha }}
@@ -96,7 +98,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           submodules: recursive
           # A shallow superproject cannot be pushed from, and the bump commit
@@ -105,8 +107,10 @@ jobs:
 
       - name: Move the pin to AITER tip
         id: bump
+        env:
+          REQUESTED_AITER_REF: ${{ inputs.aiter_ref || 'main' }}
         run: |
-          bash ci/bump_aiter_pin.sh --ref "${{ inputs.aiter_ref || 'main' }}"
+          bash ci/bump_aiter_pin.sh --ref "$REQUESTED_AITER_REF"
 
       - name: Publish the candidate branch
         id: push
@@ -171,7 +175,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
@@ -192,7 +196,7 @@ jobs:
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       - name: Build umbrella library
         run: |
@@ -213,7 +217,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "build/aiter_build/${{ matrix.module }}.so"
           ls -lh "build/aiter_build/${{ matrix.module }}.so"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nightly-jit-${{ matrix.module }}
           path: build/aiter_build/${{ matrix.module }}.so
@@ -230,6 +234,8 @@ jobs:
     needs: [bump, jit]
     runs-on: build-only-jax-aiter
     timeout-minutes: 180
+    permissions:
+      contents: write
     env:
       CONTAINER_NAME: ja_nightly_wheel_${{ github.run_id }}
     steps:
@@ -239,13 +245,13 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: nightly-jit-*
           path: build/aiter_build
@@ -307,7 +313,7 @@ jobs:
             # provide the JAX runtime requirements first.
             python3 -m pip install --break-system-packages \
               numpy ml_dtypes scipy opt_einsum
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh --jax-only
+            bash ci/setup_jax.sh --jax-only
             python3 -m pip install --break-system-packages pandas auditwheel
             # build_wheel.sh runs pip wheel --no-build-isolation, so the PEP 517
             # backend must already be importable. wheel is capped because
@@ -320,6 +326,9 @@ jobs:
         run: |
           docker exec "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
+            # Without this, ROCm clang takes the libstdc++ headers of GCC 8,
+            # which has no <bit>. The sourced file explains why.
+            source ci/manylinux_toolchain.sh
             make
             make ja_mods
             test -s build/jax_aiter_build/libjax_aiter.so
@@ -329,15 +338,17 @@ jobs:
 
       - name: Package the full wheel
         run: |
+          # build_wheel.sh runs make again. It is a no-op after the step above,
+          # but if it ever does compile it must use the same toolchain.
           docker exec "$CONTAINER_NAME" bash -lc \
-            'bash scripts/build_wheel.sh --variant full'
+            'source ci/manylinux_toolchain.sh && bash scripts/build_wheel.sh --variant full'
 
       - name: Hand the wheel back to the runner user
         run: |
           sudo chown -R "$(id -u):$(id -g)" dist
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nightly-wheel
           path: dist/*+full-*.whl
@@ -363,12 +374,12 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           fetch-depth: 1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: nightly-wheel
           path: dist
@@ -423,7 +434,7 @@ jobs:
           # chown step below.
           docker exec -u 0 "$CONTAINER_NAME" bash -lc '
             set -euo pipefail
-            JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax_runtime.sh
+            bash ci/setup_jax_runtime.sh
             shopt -s nullglob
             wheels=(dist/jax_aiter-*+full-*.whl)
             test "${#wheels[@]}" -eq 1
@@ -516,7 +527,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: nightly-perf-8b-fp4-fsdp8
@@ -546,7 +557,7 @@ jobs:
             sudo chown -R "$(id -u):$(id -g)" "${{ github.workspace }}" || true
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           submodules: recursive
@@ -575,7 +586,7 @@ jobs:
             -w /jax-aiter "$IMAGE" tail -f /dev/null
 
       - name: Install tooling and JAX
-        run: docker exec "$CONTAINER_NAME" bash -lc 'JA_ROCM_PLUGIN_VERSION=0.11.0.post1 bash ci/setup_jax.sh'
+        run: docker exec "$CONTAINER_NAME" bash -lc 'bash ci/setup_jax.sh'
 
       - name: Build against the candidate pin
         run: |
@@ -608,8 +619,10 @@ jobs:
       && (github.event_name == 'schedule' || inputs.promote)
     runs-on: build-only-jax-aiter
     timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.bump.outputs.branch_sha }}
           fetch-depth: 0

@@ -176,6 +176,72 @@ def test_force_kernel_dispatches_via_rocprof_trace(tmp_path):
         f"{proc.stdout[-1500:]}\n{proc.stderr[-800:]}")
 
 
+# --------------------------------------------------------------------------
+# Persistent (ps=1) kernels have a different calling convention; the handler
+# must not run them.
+# --------------------------------------------------------------------------
+def _persistent_kernel_names():
+    """Symbols that AITER's f4gemm manifest marks ps=1. Empty on AITER pins
+    whose manifest has no ps column."""
+    hsa = Path(os.environ.get("AITER_ASM_DIR") or REPO / "third_party/aiter/hsa")
+    manifest = hsa / "gfx950/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
+    if not manifest.is_file():
+        return None
+    rows = [ln.strip() for ln in manifest.read_text().splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+    header = [c.strip() for c in rows[0].split(",")]
+    if "ps" not in header:
+        return []
+    ps, name = header.index("ps"), header.index("knl_name")
+    return [cols[name].strip() for cols in (r.split(",") for r in rows[1:])
+            if cols[ps].strip() == "1"]
+
+
+_FORCED_GEMM = """
+import jax, jax.numpy as jnp
+from jax_aiter.gemm_fp4 import gemm_fp4_bf16
+a = jnp.ones((256, 4096), jnp.bfloat16)
+b = jnp.ones((4096, 4096), jnp.bfloat16)
+jax.block_until_ready(gemm_fp4_bf16(a, b))
+"""
+
+
+def test_persistent_kernels_are_refused():
+    """Naming a ps=1 kernel must fail, not run it with the ordinary arguments.
+
+    The heuristic used to pick f4gemm_..._256x256_ps for the gate/up weight
+    gradient (M=14336, N=4096, K=512) once AITER added it, and the gradient came
+    back as garbage. The handler now leaves ps=1 kernels out of its cache, so
+    the heuristic cannot pick one and a forced one is rejected by name. Runs in
+    a subprocess so the expected runtime error cannot leak into later tests.
+    """
+    names = _persistent_kernel_names()
+    if names is None:
+        pytest.skip("f4gemm manifest not found")
+    if not names:
+        pytest.skip("this AITER pin has no ps=1 f4gemm kernels")
+    if not _gpu_available():
+        pytest.skip("no ROCm GPU visible to JAX")
+
+    def forced(name):
+        env = os.environ.copy()
+        env["AITER_FORCE_KERNEL_NAME"] = name
+        env.pop("AITER_FP4_DISPATCH", None)
+        return subprocess.run([sys.executable, "-c", _FORCED_GEMM], env=env,
+                              capture_output=True, text=True, timeout=600)
+
+    # Control: forcing by name works at all here. Without it, "not in cache"
+    # below would also be what a device with no f4gemm kernels reports.
+    control = forced(EXPECTED_KERNEL)
+    if control.returncode != 0:
+        pytest.skip("the ordinary 256x256 f4gemm kernel does not run on this "
+                    "device, so a refusal would prove nothing")
+    for name in names:
+        proc = forced(name)
+        assert proc.returncode != 0, f"{name} ran instead of being refused"
+        assert "not in cache" in proc.stderr, proc.stderr[-1500:]
+
+
 def test_expected_kernel_name_is_pinned_canonical():
     """Guard the legacy FORCE-pin kernel string (still a supported fallback)."""
     assert EXPECTED_KERNEL == (

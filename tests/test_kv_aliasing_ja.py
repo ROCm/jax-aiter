@@ -151,9 +151,11 @@ def test_reusing_a_donated_buffer_is_an_error():
     with pytest.raises(Exception) as excinfo:
         with donation_warnings_as_errors():
             # `pool` is still referenced here, so the second call is invalid.
-            _ = fn(pool, row_idx, vals)
-            _ = fn(pool, row_idx, vals)
-    assert "donat" in str(excinfo.value).lower(), (
+                _ = fn(pool, row_idx, vals)
+                _ = fn(pool, row_idx, vals)
+    # JAX 0.11.0 names the donation; 0.11.2 reports the donated array as deleted.
+    message = str(excinfo.value).lower()
+    assert "donat" in message or "array has been deleted" in message, (
         f"expected a donation-related failure, got: {excinfo.value!r}"
     )
 

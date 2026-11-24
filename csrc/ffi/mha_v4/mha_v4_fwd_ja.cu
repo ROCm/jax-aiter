@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <unordered_map>
@@ -179,6 +180,7 @@ const fmha_v4_fwdConfig* find_bf16(const std::string& arch, int mode) {
 }
 
 struct KernelCache {
+  std::mutex mutex;
   std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> kernels;
 };
 
@@ -192,6 +194,7 @@ ffi::Error load_kernel(int dev, const fmha_v4_fwdConfig& cfg, AiterAsmKernel** o
     return ffi::Error(ffi::ErrorCode::kInvalidArgument, "device id out of range");
   }
   auto& cache = cache_for(dev);
+  std::lock_guard<std::mutex> lock(cache.mutex);
   const std::string key = cfg.arch + "|" + cfg.knl_name + "|" + cfg.co_name;
   auto it = cache.kernels.find(key);
   if (it == cache.kernels.end()) {

@@ -250,17 +250,22 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/ROCm/jax-aiter.git",
     license="MIT",
-    packages=find_packages(include=["jax_aiter", "jax_aiter.*"]),
+    # The MXFP4 MoE kernel sources are license-gated and must never ship in a
+    # wheel or sdist, even when a local copy is installed in the source tree.
+    packages=find_packages(
+        include=["jax_aiter", "jax_aiter.*"],
+        exclude=["jax_aiter.flydsl.kernels.mxfp4", "jax_aiter.flydsl.kernels.mxfp4.*"],
+    ),
     include_package_data=True,  # picks up MANIFEST.in entries for sdist.
     python_requires="==3.12.*",
     # Alpha2 supports one tested runtime. Pin all four distributions so a bare
     # `pip install jax-aiter` cannot silently resolve a future incompatible JAX
     # frontend/backend combination.
     install_requires=[
-        "jax==0.11.0",
-        "jaxlib==0.11.0",
-        "jax-rocm7-plugin==0.11.0.post1",
-        "jax-rocm7-pjrt==0.11.0.post1",
+        "jax==0.11.2",
+        "jaxlib==0.11.2",
+        "jax-rocm10-plugin==0.11.2",
+        "jax-rocm10-pjrt==0.11.2",
         "zstandard",
     ],
     extras_require={
@@ -280,7 +285,10 @@ setup(
             "_hsa/**/*.co",
             "_hsa/**/*.csv",
             "_hsa/**/*.py",
+            "THIRD_PARTY_NOTICES.md",
+            "licenses/*.txt",
         ],
+        "jax_aiter.flydsl.kernels.primus_turbo": ["LICENSE*", "ORIGIN.md"],
     },
     cmdclass={
         "build_py": build_py,

@@ -276,13 +276,14 @@ def test_mha_v4_sparse_skipping_lut_holds_as_tile_count_grows():
 
 def test_mha_v4_rejects_bad_block_mask():
     q = jnp.zeros((1, 256, 2, 128), dtype=jnp.bfloat16)
-    k = jnp.zeros((1, mha_v4_kv_tile(), 2, 128), dtype=jnp.bfloat16)
+    kv_tile = mha_v4_kv_tile()
+    k = jnp.zeros((1, kv_tile, 2, 128), dtype=jnp.bfloat16)
     bad = jnp.ones((1, 2, 1, 1), dtype=jnp.int32)
     with pytest.raises(ValueError, match="bool"):
         mha_v4(q, k, k, block_mask=bad)
     wrong = jnp.ones((1, 2, 2, 1), dtype=jnp.bool_)
     with pytest.raises(ValueError, match="block_mask shape"):
         mha_v4(q, k, k, block_mask=wrong)
-    short = jnp.zeros((1, 64, 2, 128), dtype=jnp.bfloat16)
+    short = jnp.zeros((1, kv_tile // 2, 2, 128), dtype=jnp.bfloat16)
     with pytest.raises(ValueError, match="multiple"):
         mha_v4(q, short, short, block_mask=jnp.ones((1, 2, 1, 1), dtype=jnp.bool_))

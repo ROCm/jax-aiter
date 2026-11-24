@@ -15,9 +15,22 @@ from .gemm_mxfp6 import gemm_mxfp6, gemm_mxfp6_packed, quantize_mxfp6_gemm
 from .gemm_a6w4 import gemm_a6w4, gemm_a6w4_packed, quantize_mxfp4_gemm
 from .gemm_bf16 import gemm_bf16
 from .mha import mha_fwd, mha_bwd, MhaFwdConfig, MhaBwdConfig
-from .mha_v4 import mha_v4, mha_v4_kv_tile, mha_v4_mxfp4, mha_v4_sparse_work_table
+from .mha_v4 import (
+    mha_v4,
+    mha_v4_kv_tile,
+    mha_v4_mxfp4,
+    mha_v4_mxfp6,
+    mha_v4_sparse_work_table,
+)
 from .rmsnorm import rmsnorm_fwd
 from .activation import silu_and_mul
+from .buffers import uninitialized
+from .moe_mxfp4 import (
+    grouped_mxfp4_dw_wholeloop,
+    grouped_mxfp4_fwd_da_wholeloop,
+    quantize_mxfp4_dim0,
+    quantize_mxfp4_dim1,
+)
 
 __all__ = [
     "gemm_fp4",
@@ -35,9 +48,15 @@ __all__ = [
     "mha_v4",
     "mha_v4_kv_tile",
     "mha_v4_mxfp4",
+    "mha_v4_mxfp6",
     "mha_v4_sparse_work_table",
     "MhaFwdConfig",
     "MhaBwdConfig",
     "rmsnorm_fwd",
     "silu_and_mul",
+    "uninitialized",
+    "quantize_mxfp4_dim0",
+    "quantize_mxfp4_dim1",
+    "grouped_mxfp4_fwd_da_wholeloop",
+    "grouped_mxfp4_dw_wholeloop",
 ]
