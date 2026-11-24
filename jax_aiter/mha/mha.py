@@ -1024,18 +1024,35 @@ def _favr_fwd(q, k, v, cu_q, cu_k, cu_q_log, cu_k_log, max_sq, max_sk,
         max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk), min_seqlen_q=0,
         logits_soft_cap=0.0, zero_tensors=_zero_pad(cu_q_log),
         cp_axis=None, cp_size=1, cp_load_balanced=True)
-    cu_q_log = _empty(jnp.int32) if cu_q_log is None else cu_q_log
-    cu_k_log = _empty(jnp.int32) if cu_k_log is None else cu_k_log
     out, lse, _p, rng = _mha_fwd_raw(
         q, k, v, cu_q, cu_k, _empty(q.dtype), _empty(q.dtype),
-        _empty(jnp.float32), _empty(jnp.int64), cu_q_log, cu_k_log, cfg)
+        _empty(jnp.float32), _empty(jnp.int64),
+        _logical_or_empty(cu_q_log), _logical_or_empty(cu_k_log), cfg)
     out, lse, rng = _tag_context(out, lse, rng)
-    return out, (q, k, v, out, lse, rng, cu_q, cu_k, cu_q_log, cu_k_log)
+    # An absent logical array is ``None`` in the residuals. This function runs
+    # inside ``shard_map``, so every array residual is an output of the forward
+    # shard_map and an input of the backward one. A zero-length array there
+    # segfaults XLA's Shardy import in JAX 0.11.2 (the tensor is folded to a
+    # constant and the shard_map loses its input shardings); ``None`` is an
+    # empty pytree and never crosses the boundary.
+    return out, (q, k, v, out, lse, rng, cu_q, cu_k,
+                 _logical_or_none(cu_q_log), _logical_or_none(cu_k_log))
+
+
+def _logical_or_none(cu_logical):
+    return cu_logical if _has_padding(cu_logical) else None
+
+
+def _logical_or_empty(cu_logical):
+    """The FFI's encoding of an absent logical-length array."""
+    return cu_logical if _has_padding(cu_logical) else _empty(jnp.int32)
 
 
 def _favr_bwd(max_sq, max_sk, dropout_p, softmax_scale, causal, window_size,
               res, dout):
     q, k, v, out, lse, rng, cu_q, cu_k, cu_q_log, cu_k_log = res
+    zero_tensors = _zero_pad(cu_q_log)
+    cu_q_log, cu_k_log = _logical_or_empty(cu_q_log), _logical_or_empty(cu_k_log)
     wl, wr = window_size
     swa = (wl > 0) or (wr >= 0 and wr != -1)
     hard_block = dropout_p > 0 or swa
@@ -1052,7 +1069,7 @@ def _favr_bwd(max_sq, max_sk, dropout_p, softmax_scale, causal, window_size,
         is_causal=causal, wl=int(wl), wr=int(wr), deterministic=False,
         use_asm_v3=use_v3, is_v3_atomic_fp32=bwd_atomic, how_v3_bf16_cvt=int(bf16_cvt),
         max_seqlen_q=int(max_sq), max_seqlen_k=int(max_sk),
-        zero_tensors=_zero_pad(cu_q_log),
+        zero_tensors=zero_tensors,
         cp_axis=None, cp_size=1, cp_load_balanced=True)
     dq, dk, dv, _sd, _db = _mha_bwd_raw(
         dout, q, k, v, out, lse, cu_q, cu_k,
