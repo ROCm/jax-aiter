@@ -61,6 +61,8 @@ RMSNORM_INCLUDES := $(JA_INCLUDES) \
 GEMM_CONFIG_DIR  := build/generated
 GEMM_BF16_CFG    := $(GEMM_CONFIG_DIR)/asm_bf16gemm_configs.hpp
 GEMM_FP4_CFG     := $(GEMM_CONFIG_DIR)/asm_f4gemm_configs.hpp
+GEMM_FP6_CFG     := $(GEMM_CONFIG_DIR)/asm_f6gemm_configs.hpp
+GEMM_F6F4_CFG    := $(GEMM_CONFIG_DIR)/asm_f6f4gemm_configs.hpp
 FMHA_V4_CFG      := $(GEMM_CONFIG_DIR)/asm_fmha_v4_fwd_configs.hpp
 GEMM_INCLUDES    := $(JA_INCLUDES) -I$(GEMM_CONFIG_DIR)
 
@@ -69,6 +71,8 @@ JA_CORE_MODULES := $(JA_BUILD_DIR)/rmsnorm_fwd_ja.so \
                    $(JA_BUILD_DIR)/silu_and_mul_ja.so \
                    $(JA_BUILD_DIR)/gemm_fwd_ja.so \
                    $(JA_BUILD_DIR)/gemm_fp4_ja.so \
+                   $(JA_BUILD_DIR)/gemm_mxfp6_ja.so \
+                   $(JA_BUILD_DIR)/gemm_a6w4_ja.so \
                    $(JA_BUILD_DIR)/cast_mxfp4_ja.so
 
 # MHA FFI shims: full wheel only (the heavy libmha_*.so JIT libs back these).
@@ -132,11 +136,33 @@ $(GEMM_BF16_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 $(GEMM_FP4_CFG): $(AITER_SRC_DIR)/hsa/codegen.py | $(GEMM_CONFIG_DIR)/
 	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m f4gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
 
+# The manifest CSV names every kernel. codegen.py itself does not change
+# when AITER adds or renames kernels, so the CSV has to be a prerequisite or
+# a submodule update leaves the old table compiled into gemm_mxfp6_ja.so.
+F6GEMM_CSVS := $(wildcard $(AITER_SRC_DIR)/hsa/*/f6gemm/*.csv)
+$(GEMM_FP6_CFG): $(AITER_SRC_DIR)/hsa/codegen.py $(F6GEMM_CSVS) | $(GEMM_CONFIG_DIR)/
+	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m f6gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
+
 $(JA_BUILD_DIR)/gemm_fwd_ja.so: csrc/ffi/gemm_fwd/gemm_fwd_ja.cu $(GEMM_BF16_CFG) | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) $< -o $@
 
 $(JA_BUILD_DIR)/gemm_fp4_ja.so: csrc/ffi/gemm_fp4/gemm_fp4_ja.cu $(GEMM_FP4_CFG) | $(JA_BUILD_DIR)/
 	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) $< -o $@
+
+$(JA_BUILD_DIR)/gemm_mxfp6_ja.so: csrc/ffi/gemm_mxfp6/gemm_mxfp6_ja.cu \
+		$(AITER_SRC_DIR)/csrc/kernels/quant_mxfp6_gemm.cu $(GEMM_FP6_CFG) | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) \
+		$< $(AITER_SRC_DIR)/csrc/kernels/quant_mxfp6_gemm.cu -o $@
+
+# Same rule as the f6gemm table above: the manifest CSV names every kernel.
+F6F4GEMM_CSVS := $(wildcard $(AITER_SRC_DIR)/hsa/*/f6f4gemm/*.csv)
+$(GEMM_F6F4_CFG): $(AITER_SRC_DIR)/hsa/codegen.py $(F6F4GEMM_CSVS) | $(GEMM_CONFIG_DIR)/
+	cd $(AITER_SRC_DIR) && AITER_GPU_ARCHS="$(GPU_ARCHS)" $(PYTHON3) hsa/codegen.py -m f6f4gemm -o $(CURDIR)/$(GEMM_CONFIG_DIR)
+
+$(JA_BUILD_DIR)/gemm_a6w4_ja.so: csrc/ffi/gemm_a6w4/gemm_a6w4_ja.cu \
+		$(AITER_SRC_DIR)/csrc/kernels/quant_mxfp4_gemm.cu $(GEMM_F6F4_CFG) | $(JA_BUILD_DIR)/
+	$(HIPCC) -shared -fPIC $(JA_CXXFLAGS) $(AMDGPU_TARGET_FLAGS) $(GEMM_INCLUDES) \
+		$< $(AITER_SRC_DIR)/csrc/kernels/quant_mxfp4_gemm.cu -o $@
 
 CAST_MXFP4_SRC := csrc/ffi/cast_mxfp4/cast_mxfp4_ja.cu
 CAST_MXFP4_KERNEL := csrc/ffi/cast_mxfp4/cast_transpose_mxfp4_kernel_shuffled.cu

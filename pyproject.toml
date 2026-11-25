@@ -12,6 +12,9 @@ build-backend = "setuptools.build_meta"
 # Pytest configuration only. Package metadata stays in setup.py (see above).
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# pytest 9 imports tests without putting the checkout on sys.path. This lets
+# `pytest tests/...` use the source tree when jax-aiter is not installed.
+pythonpath = ["."]
 # Without this, pytest's default `*_test.py` glob also collects the smoke
 # scripts, which import jax_aiter and initialise the backend just to report
 # zero tests.
