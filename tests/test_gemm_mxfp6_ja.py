@@ -159,9 +159,8 @@ def _aiter_mxfp6():
 
 def _reference_gemm(a, b):
     """Quantize, dequantize, then multiply, as AITER's ``run_torch`` does."""
-    import torch
-
     gemm_op = _aiter_mxfp6()
+    import torch
 
     def convert(value):
         array = np.asarray(value, dtype=np.float32)
@@ -290,9 +289,10 @@ def test_mxfp6_specialized_kernel_rejects_incompatible_shape():
 
 @pytest.mark.parametrize("m,n,k", [(257, 513, 129), (513, 784, 1152)])
 def test_mxfp6_gemm_matches_aiter(m, n, k):
+    # The helper skips the test when torch is missing; import torch only after it.
+    gemm_op = _aiter_mxfp6()
     import torch
 
-    gemm_op = _aiter_mxfp6()
     a, b = _operands(m, n, k)
     kernel = default_mxfp6_gemm_kernel(m, n, k)
     jax_out = gemm_mxfp6(a, b, kernel_name=kernel)

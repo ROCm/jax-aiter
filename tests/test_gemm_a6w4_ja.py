@@ -269,10 +269,10 @@ def _to_torch(value):
 
 def _quantized_reference(x, w, round_mode):
     """AITER's reference: dequantized MXFP6 activation by rotated, dequantized MXFP4 weight."""
+    _, a6w6, per_1x32_f4_quant, dtypes, fp4_utils = _aiter_a6w4()
     import torch
     import torch.nn.functional as F
 
-    _, a6w6, per_1x32_f4_quant, dtypes, fp4_utils = _aiter_a6w4()
     padded_k = (x.shape[1] + 127) // 128 * 128
     x = F.pad(x, (0, padded_k - x.shape[1]))
     w = F.pad(w, (0, padded_k - w.shape[1]))
@@ -349,10 +349,11 @@ def test_a6w4_gemm_rejects_invalid_operands():
     ],
 )
 def test_a6w4_gemm_matches_quantized_reference(shape, kernel_name, round_mode):
+    # The helper skips the test when torch is missing; import torch only after it.
+    _aiter_a6w4()
     import torch
     import torch.nn.functional as F
 
-    _aiter_a6w4()
     m, n, k = shape
     a, b = _operands(m, n, k)
     out = gemm_a6w4(a, b, round_mode=round_mode, kernel_name=kernel_name)
